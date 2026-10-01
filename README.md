@@ -1,6 +1,6 @@
 # LibCore - Campus Library Management System
 
-A comprehensive desktop application for managing campus library operations, including book catalog management, user administration, circulation tracking, and detailed reporting. Built with Python and PyQt6 with SQLite database backend.
+A comprehensive desktop application for managing campus library operations, including book catalog management, user administration, circulation tracking, and detailed reporting. Built with Python and PyQt6 for a native desktop experience.
 
 ## Features
 
@@ -104,6 +104,168 @@ python main.py
 ```
 
 3. Enter the default admin password: **`admin123`**
+
+## Building a Windows EXE and Installer (PyInstaller + Inno Setup)
+
+This project can be packaged into a standalone Windows executable using PyInstaller and distributed with an installer created by Inno Setup. Below are step-by-step instructions using a provided `main.spec` and an Inno Setup `.iss` file.
+
+Prerequisites
+- Windows machine (for Inno Setup compilation)
+- Python 3.x and required packages installed in your environment
+- PyInstaller (pip install pyinstaller)
+- Inno Setup (https://jrsoftware.org/) — install Inno Setup Compiler (ISCC.exe)
+- Optional: code signing tools (signtool) if you need signed binaries
+
+1) Create the executable with PyInstaller
+
+- If you already have a `main.spec` in the repo (customized to include data files and icon), use it directly:
+
+```bash
+# From the project root
+pyinstaller main.spec
+```
+
+- If you need to generate a `.spec` automatically, you can run a PyInstaller command and then tweak the generated spec:
+
+```bash
+# One-file, windowed (no console), with icon and assets folder included
+pyinstaller --name "LibCore" --onefile --windowed --icon=assets/library_icon.ico \
+  --add-data "assets;assets" main.py
+```
+
+Notes about the spec file (main.spec)
+- A spec file controls how PyInstaller bundles your app (one-file vs one-folder, data files, binaries, hiddenimports, etc.).
+- If your app uses dynamic imports or Qt plugins, ensure `hiddenimports` and `datas` include those files.
+- Example minimal adjustments you may need in main.spec:
+
+```python
+# main.spec (snippet)
+# -*- mode: python ; coding: utf-8 -*-
+
+block_cipher = None
+
+a = Analysis([
+    'main.py',
+],
+    pathex=['.'],
+    binaries=[],
+    datas=[('assets', 'assets')],
+    hiddenimports=[],
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+exe = EXE(pyz,
+    a.scripts,
+    exclude_binaries=True,
+    name='LibCore',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    icon='assets/library_icon.ico',
+)
+
+coll = COLLECT( ... )  # for one-folder builds
+```
+
+- After running `pyinstaller main.spec`, look in the `dist/` directory. For a one-file build you'll have `dist/LibCore.exe`. For a one-folder build you'll have `dist/LibCore/` containing the executable and supporting files.
+
+2) Create an Inno Setup installer (.iss)
+
+- Create an installer script (e.g., `installer.iss`) that references the produced EXE (or the one-folder `dist` directory).
+- Example `.iss` for a one-file EXE:
+
+```ini
+; installer.iss
+[Setup]
+AppName=LibCore - Campus Library
+AppVersion=1.0
+DefaultDirName={pf}\LibCore
+DefaultGroupName=LibCore
+OutputBaseFilename=LibCore_Installer
+Compression=lzma
+SolidCompression=yes
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Files]
+; For one-file build
+Source: "dist\LibCore.exe"; DestDir: "{app}"; Flags: ignoreversion
+; If you have additional files (README, LICENSE), add them too:
+Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{group}\LibCore"; Filename: "{app}\LibCore.exe"
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop icon"; GroupDescription: "Additional icons:"; Flags: unchecked
+
+[Run]
+Filename: "{app}\LibCore.exe"; Description: "Launch LibCore"; Flags: nowait postinstall skipifsilent
+```
+
+- Example `.iss` adjustments for a one-folder build (use Source: "dist\LibCore\*"; Flags: recursesubdirs createallsubdirs)
+
+```ini
+[Files]
+Source: "dist\LibCore\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+```
+
+3) Compile the Inno Setup script
+
+- Open `installer.iss` in Inno Setup Compiler and press Compile, or use the command-line compiler:
+
+```powershell
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" path\to\installer.iss
+```
+
+- The resulting installer (e.g., `LibCore_Installer.exe`) will be created in the same folder as the .iss or the configured OutputDir.
+
+4) Test the installer
+
+- Run the generated installer on a clean Windows VM or test machine.
+- Verify installation path, shortcuts, application launch, and that all assets (icons, images, config files) are present and working.
+
+5) Notes and Troubleshooting
+
+- PyInstaller and Qt: PyQt6 apps sometimes require adding Qt plugins (platforms, imageformats). If the app fails to start, check the PyInstaller warnings and ensure Qt plugins are bundled (use `--add-data` or add to `datas` in the spec).
+- Data files path: When bundling with one-file, files are extracted to a temporary folder at runtime; use runtime-safe file access (e.g., use sys._MEIPASS to locate bundled data when frozen).
+
+Example helper in Python to load bundled asset paths:
+
+```python
+import sys
+import os
+
+def resource_path(relative_path):
+    # Get absolute path to resource, works for dev and for PyInstaller bundle
+    base_path = getattr(sys, '_MEIPASS', os.path.abspath('.'))
+    return os.path.join(base_path, relative_path)
+
+# Usage: icon_path = resource_path('assets/library_icon.ico')
+```
+
+- If your build uses native extensions (cv2) ensure the correct DLLs are included; check the `binaries` section in the spec.
+
+- Code signing: For distribution, consider signing the executable and installer using signtool (Windows) to avoid SmartScreen warnings.
+
+6) Cleanup
+
+Use these commands to clean PyInstaller build artifacts before rebuilding:
+
+```bash
+rm -rf build dist __pycache__
+# On Windows PowerShell:
+Remove-Item -Recurse -Force build,dist,__pycache__
+```
 
 ## Default Configuration
 
