@@ -1,0 +1,13 @@
+__pycache__/
+
+pages/__pycache__/
+
+build/
+
+OutputInstaller
+
+dist/
+
+*.pyc
+
+.vscode/
