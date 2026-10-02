@@ -16,7 +16,7 @@ if __name__ == "__main__":
     icon_path = os.path.join(base_dir, "assets/library_icon.ico")
     app.setWindowIcon(QIcon(icon_path))
 
-    image_path = os.path.join(base_dir, "assets/library_icon.png")
+    image_path = os.path.join(base_dir, "assets/library_icon.jpeg")
     splash = CustomSplashScreen(image_path)
     splash.show()
     app.processEvents()

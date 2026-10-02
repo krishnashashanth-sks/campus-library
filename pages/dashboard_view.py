@@ -1,8 +1,9 @@
 from PyQt6.QtWidgets import(
-    QWidget,QVBoxLayout,QHBoxLayout,QFrame,QPushButton,QLabel
+    QWidget,QVBoxLayout,QHBoxLayout,QFrame,QPushButton,QLabel,QStyleOption,QStyle
 )
 from dialogs import NewUserDialog,NewBookDialog,BarcodeGeneratorDialog,QuickScanDialog
 from utils import clear_layout
+from PyQt6.QtGui import QPainter
 
 class DashboardView(QWidget):
     def __init__(self,db):
@@ -20,7 +21,24 @@ class DashboardView(QWidget):
         bottom_layout.addStretch()
         bottom_layout.addWidget(self.create_quickactions())
         layout.addLayout(bottom_layout)
+
+        self.setObjectName("DashboardView")
+        
+        self.setStyleSheet("""
+            #DashboardView {
+                background-color: #f5f6fa;
+                background-image: url('assets/dashboard_background.jpg');
+            }
+        """)
+
         self.init_ui()
+
+    def paintEvent(self, event):
+        opt = QStyleOption()
+        opt.initFrom(self)
+        painter = QPainter(self)
+        self.style().drawPrimitive(QStyle.PrimitiveElement.PE_Widget, opt, painter, self)
+
     def init_ui(self):
         (
             total_students, 
@@ -33,7 +51,7 @@ class DashboardView(QWidget):
         ) = self.db.get_dashboard_details()
 
         # Core Stats
-        self.tiles_layout.addWidget(self.create_tile("Total Students", str(total_students), "Active Users", "#3b82f6"))
+        self.tiles_layout.addWidget(self.create_tile("Total Users", str(total_students), "Active Users", "#3b82f6"))
         self.tiles_layout.addWidget(self.create_tile("Total Books", str(total_books), "Total Titles", "#f59e0b"))
         self.tiles_layout.addWidget(self.create_tile("Available Books", str(available_books), "On Shelf", "#06b6d4"))
         

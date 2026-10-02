@@ -1,11 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # 1. BUNDLE YOUR ASSETS FOLDER (Source directory, Destination directory in build)
+    datas=[('assets', 'assets')], 
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -21,17 +21,18 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='main',
+    name='Library',
+    console=False,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/library_icon.ico', 
 )
 coll = COLLECT(
     exe,

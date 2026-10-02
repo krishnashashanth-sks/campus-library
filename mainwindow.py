@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame, QStackedWidget, QPushButton, QLabel
 )
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QFont
 from pages.bookcatalog_view import CatalogView
 from pages.circulation_view import CirculationView
 from pages.reports_view import ReportsView
@@ -12,9 +12,9 @@ from pages.dashboard_view import DashboardView
 class MainWindow(QMainWindow):
     def __init__(self,db):
         super().__init__()
-        self.setWindowTitle("LibCore")
+        self.setWindowTitle("Library Management System")
         self.setMinimumSize(900, 600)
-        self.setWindowIcon(QIcon("assets/library_icon.png"))
+        self.setWindowIcon(QIcon("assets/library_icon.jpeg"))
         self.db=db
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -43,7 +43,10 @@ class MainWindow(QMainWindow):
             """
         )
         top_layout = QHBoxLayout(topbar)
-        top_layout.addWidget(QLabel("LibCore"))
+        custom_font = QFont("Arial", 16, QFont.Weight.Bold)
+        title_label=QLabel("Library Management System")
+        title_label.setFont(custom_font)
+        top_layout.addWidget(title_label)
         main_layout.addWidget(topbar)
 
         # 2. Content Area (Sidebar + Stacked Pages)

@@ -714,7 +714,7 @@ class LoginDialog(QDialog):
         self.db = db
         self.setWindowTitle("Library System Security")
         self.setFixedSize(320, 200)
-        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint)
+        # self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint)
         
         main_layout = QVBoxLayout(self)
 
@@ -760,7 +760,7 @@ class CustomSplashScreen(QDialog):
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.icon_label)
 
-        self.text_label = QLabel("LibCore")
+        self.text_label = QLabel("Library Management System")
         self.text_label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.text_label.setStyleSheet("color: black;")
