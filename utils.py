@@ -3,7 +3,7 @@ from PIL import Image
 
 def get_appdata_db_path():
     # Gets C:\Users\<Username>\AppData\Roaming\LibraryApp
-    app_data_dir = os.path.join(os.getenv('APPDATA'), 'LibCore')
+    app_data_dir = os.path.join(os.getenv('APPDATA'), 'Library')
     
     # Create folder if it doesn't exist
     if not os.path.exists(app_data_dir):

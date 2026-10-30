@@ -18,16 +18,17 @@ if __name__ == "__main__":
 
     image_path = os.path.join(base_dir, "assets/library_icon.jpeg")
     splash = CustomSplashScreen(image_path)
-    splash.show()
+    # splash.show()
     app.processEvents()
 
-    time.sleep(2)
+    # time.sleep(2)
     db = LocalDatabase()
     
     splash.close()
 
     login_dialog = LoginDialog(db)
-    if login_dialog.exec() == QDialog.DialogCode.Accepted:
+    # if login_dialog.exec() == QDialog.DialogCode.Accepted:
+    if True:
         window = MainWindow(db)
         window.showMaximized()
         sys.exit(app.exec())

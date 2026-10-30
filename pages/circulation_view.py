@@ -93,11 +93,20 @@ class CirculationView(QWidget):
             self.table.setItem(row_idx, 6, QTableWidgetItem(str(return_date or "N/A")))
             self.table.setItem(row_idx, 7, QTableWidgetItem(fine_str))
 
-    def issue_book(self):
-        book_id = self.input_book_id.text().strip()
-        user_id = self.input_user_id.text().strip()
-        default_days=self.db.get_setting("default_fine_days",14)
-        days_allowed, ok = QInputDialog.getInt(
+    def handle_issue_book(self, book_id, book_title):
+        """Quick action to issue the selected book with a custom loan duration."""
+        # 1. Prompt for User ID
+        user_id, ok = QInputDialog.getText(
+            self, 
+            "Issue Book", 
+            f"Enter User ID to issue '{book_title}':"
+        )
+        if not ok or not user_id.strip():
+            return
+
+        # 2. Prompt for Allowed Days (using your precise configuration)
+        default_days = 14  # Standard default loan period (e.g., 2 weeks)
+        days_allowed, ok_days = QInputDialog.getInt(
             self,
             "Issue Duration",
             "Enter the number of days allowed?",
@@ -106,20 +115,23 @@ class CirculationView(QWidget):
             365,
             1
         )
-        if not ok:
+        if not ok_days:
             return
-        if not book_id or not user_id:
-            QMessageBox.warning(self, "Validation Error", "All fields are required.")
-            return
-        success, message = self.db.issue_book(book_id, user_id, days_allowed)
 
+        # 3. Call backend database method (passing days_allowed)
+        # Note: Ensure your db.issue_book method accepts `days_allowed` as an argument.
+        success, msg = self.db.issue_book(book_id, user_id.strip(), days_allowed)
+        
         if success:
-            QMessageBox.information(self, "Success", message)
-            self.input_book_id.clear()
-            self.input_user_id.clear()
-            self.load_circulation()  # Refresh the QTableWidget
+            QMessageBox.information(
+                self, 
+                "Success", 
+                f"Book successfully issued for {days_allowed} days!"
+            )
+            self.load_books_to_table()
+            self.show_default_inspector()
         else:
-            QMessageBox.critical(self, "Error", message)
+            QMessageBox.warning(self, "Action Failed", msg)
 
     def return_book(self):
         book_id = self.input_book_id.text().strip()

@@ -122,7 +122,7 @@ class LocalDatabase:
 
     def insert_user(self, user_id, full_name, phone_number, role, department):
         cursor = self.conn.cursor()
-        created_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        created_at = datetime.datetime.now().strftime("%Y-%m-%d")
 
         try:
             cursor.execute("""
@@ -184,15 +184,15 @@ class LocalDatabase:
 
     # --- BOOK MANAGEMENT ---
 
-    def insert_book(self, book_id, title, author, publisher, copies=1):
+    def insert_book(self, book_id, title, author, publisher, total, available):
         cursor = self.conn.cursor()
-        created_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        created_at = datetime.datetime.now().strftime("%Y-%m-%d")
 
         try:
             cursor.execute("""
                 INSERT INTO books (id, title, author, publisher, total_copies, available_copies, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (book_id, title, author, publisher, copies, copies, created_at))
+            """, (book_id, title, author, publisher, total, available, created_at))
             self.conn.commit()
             return True, "Book added successfully."
         except Exception as e:
@@ -397,32 +397,83 @@ class LocalDatabase:
             return []
 
     def get_dashboard_details(self):
+        """Returns counts for all dashboard metric tiles: 
+           (total_users, total_books, today_issued, today_due, today_returned, available_books, unpaid_fines)
+        """
         cursor = self.conn.cursor()
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-
         try:
-            total_students = cursor.execute("SELECT COUNT(id) FROM users").fetchone()[0] or 0
-            total_books = cursor.execute("SELECT COUNT(id) FROM books").fetchone()[0] or 0
-            
-            today_issued_books = cursor.execute("SELECT COUNT(*) FROM circulation_logs WHERE checkout_date LIKE ?", (f"{today_str}%",)).fetchone()[0] or 0
-            today_return_books = cursor.execute("SELECT COUNT(*) FROM circulation_logs WHERE status = 'RETURNED' AND return_date LIKE ?", (f"{today_str}%",)).fetchone()[0] or 0
-            
-            today_due_books = cursor.execute("SELECT COUNT(*) FROM circulation_logs WHERE status = 'ISSUED' AND due_date < ?", (now_str,)).fetchone()[0] or 0
-            available_books = cursor.execute("SELECT SUM(available_copies) FROM books").fetchone()[0] or 0
-            
-            unpaid_fines = cursor.execute("SELECT SUM(fine_amount) FROM circulation_logs WHERE status = 'RETURNED' AND fine_amount > 0").fetchone()[0] or 0.0
+            # 1. Total Users
+            cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = cursor.fetchone()[0] or 0
+
+            # 2. Total Books Titles
+            cursor.execute("SELECT COUNT(*) FROM books")
+            total_books = cursor.fetchone()[0] or 0
+
+            # 3. Available Books (sum of available copies on shelf)
+            cursor.execute("SELECT SUM(available_copies) FROM books")
+            available_books = cursor.fetchone()[0] or 0
+
+            # 4. Issued Today (status = 'Issued' or similar on current date)
+            cursor.execute("""
+                SELECT COUNT(*) FROM circulation_logs 
+                WHERE status = 'Issued' AND date(checkout_date) = date('now')
+            """)
+            today_issued = cursor.fetchone()[0] or 0
+
+            # 5. Returned Today
+            cursor.execute("""
+                SELECT COUNT(*) FROM circulation_logs 
+                WHERE status = 'Returned' AND date(return_date) = date('now')
+            """)
+            today_returned = cursor.fetchone()[0] or 0
+
+            # 6. Overdue Books (status = 'Issued' and due_date < current date)
+            cursor.execute("""
+                SELECT COUNT(*) FROM circulation_logs 
+                WHERE status = 'Issued' AND date(due_date) < date('now')
+            """)
+            today_due = cursor.fetchone()[0] or 0
+
+            # 7. Unpaid Fines (sum of fine amounts where status isn't paid or pending collection)
+            cursor.execute("""
+                SELECT SUM(fine_amount) FROM circulation_logs 
+                WHERE fine_amount > 0 AND status != 'Paid'
+            """)
+            unpaid_fines = cursor.fetchone()[0] or 0.0
 
             return (
-                total_students, 
+                total_users, 
                 total_books, 
-                today_issued_books, 
-                today_due_books, 
-                today_return_books,
-                available_books,
-                unpaid_fines
+                today_issued, 
+                today_due, 
+                today_returned, 
+                available_books, 
+                float(unpaid_fines)
             )
-
         except Exception as e:
-            logging.error(f"Error fetching dashboard metrics: {e}")
+            logging.error(f"Error fetching dashboard details: {e}")
             return 0, 0, 0, 0, 0, 0, 0.0
+
+    def get_recent_activity_logs(self, limit=10):
+        """Fetches recent circulation logs with pre-formatted book and user info."""
+        cursor = self.conn.cursor()
+        try:
+            query = """
+                SELECT 
+                    COALESCE(c.status, 'Activity') AS action_type,
+                    COALESCE(b.title, 'Unknown Book') || ' [ID: ' || COALESCE(c.book_id, 'N/A') || ']' AS book_details,
+                    COALESCE(u.full_name, 'Unknown User') AS user_name,
+                    COALESCE(c.checkout_date, 'N/A') AS timestamp
+                FROM circulation_logs c
+                LEFT JOIN books b ON c.book_id = b.id
+                LEFT JOIN users u ON c.user_id = u.id
+                ORDER BY c.id DESC
+                LIMIT ?
+            """
+            cursor.execute(query, (limit,))
+            rows = cursor.fetchall()
+            return True, rows
+        except Exception as e:
+            print(f"Error fetching recent logs: {e}")
+            return False, []

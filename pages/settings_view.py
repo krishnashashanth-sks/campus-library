@@ -111,7 +111,7 @@ class SettingsView(QWidget):
         main_layout.addStretch()
 
         # Save Settings Action Button
-        bottom_layout=QHBoxLayout()
+        bottom_layout = QHBoxLayout()
         self.btn_reset = QPushButton("Reset All Settings")
         self.btn_reset.setStyleSheet("background-color: #10b981; color: white; min-height: 38px; font-size: 14px;")
         self.btn_reset.clicked.connect(self.reset_settings)
@@ -142,12 +142,14 @@ class SettingsView(QWidget):
         self.db.set_setting("default_days", days_val)
 
         QMessageBox.information(self, "Settings Saved", "Your settings have been saved successfully!")
+
     def reset_settings(self):
-        self.db.set_setting("daily_fine",10.00)
-        self.db.set_setting("default_days",14)
+        self.db.set_setting("daily_fine", 10.00)
+        self.db.set_setting("default_days", 14)
 
         QMessageBox.information(self, "Settings Reset", "Your settings have been reset successfully!")
         self.load_settings()
+
     def database_backup(self):
         path, _ = QFileDialog.getSaveFileName(self, "Database Backup", "library_backup.db", "Database Files (*.db)")
         if path:

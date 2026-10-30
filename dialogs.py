@@ -1,57 +1,108 @@
 from PyQt6.QtWidgets import (
     QDialog, QPushButton, QLineEdit, QMessageBox, QVBoxLayout, QComboBox, QLabel, QSpinBox,
-    QFileDialog, QHBoxLayout, QCheckBox, QFrame, QScrollArea, QGridLayout, QWidget
+    QFileDialog, QHBoxLayout, QCheckBox, QFrame, QScrollArea, QTableWidget, QWidget, QSizePolicy,
+    QHeaderView, QFormLayout, QTableWidgetItem
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer,QRegularExpression
-from PyQt6.QtGui import QPixmap, QImage, QFont,QRegularExpressionValidator
+from PyQt6.QtGui import QPixmap, QImage, QFont,QRegularExpressionValidator, QIntValidator, QValidator
 import cv2
 import io
 import barcode
 from barcode.writer import ImageWriter
 from PIL import Image, ImageQt
 
-class NewBookDialog(QDialog):
+from PyQt6.QtCore import pyqtSignal, QRegularExpression
+from PyQt6.QtGui import QIntValidator, QRegularExpressionValidator
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QLineEdit, QPushButton, 
+    QComboBox, QMessageBox
+)
+from utils import clear_layout
+
+class BookDialog(QDialog):
     data_updated = pyqtSignal()
 
-    def __init__(self, db, parent=None):
+    def __init__(self, db, book_id=None, parent=None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("New Book")
-        self.setFixedSize(400, 300)
+        self.book_id = book_id
+        self.setWindowTitle("New Book" if book_id is None else "Edit Book")
+        self.setFixedSize(400, 350)
         layout = QVBoxLayout(self)
 
         self.input_id = QLineEdit()
         self.input_id.setPlaceholderText("Book ID")
+        self.input_id.setValidator(QIntValidator(1, 99999, self.input_id))
 
+        if book_id is not None:
+            self.input_id.setText(str(book_id))
+            self.input_id.setReadOnly(True)
+
+        title_regex = QRegularExpression(r"^[A-Za-z0-9][A-Za-z0-9\s.,:;!?()'&+\-/]{0,199}$")
         self.input_title = QLineEdit()
         self.input_title.setPlaceholderText("Title")
+        self.input_title.setValidator(QRegularExpressionValidator(title_regex, self.input_title))
 
+        author_regex = QRegularExpression(r"^[A-Za-z][A-Za-z .'-]{0,99}$")
         self.input_author = QLineEdit()
         self.input_author.setPlaceholderText("Author")
+        self.input_author.setValidator(QRegularExpressionValidator(author_regex, self.input_author))
 
+        publisher_regex = QRegularExpression(r"^[A-Za-z0-9][A-Za-z0-9\s.,&()\-]{0,99}$")
         self.input_publisher = QLineEdit()
         self.input_publisher.setPlaceholderText("Publisher")
+        self.input_publisher.setValidator(QRegularExpressionValidator(publisher_regex, self.input_publisher))
 
-        self.add_btn = QPushButton("New Book")
-        self.add_btn.clicked.connect(self.add_book)
+        # Total & Available Copies
+        self.input_total = QLineEdit()
+        self.input_total.setPlaceholderText("Total Copies")
+        self.input_total.setValidator(QIntValidator(0, 99999, self.input_total))
+
+        self.input_available = QLineEdit()
+        self.input_available.setPlaceholderText("Available Copies")
+        self.input_available.setValidator(QIntValidator(0, 99999, self.input_available))
+
+        # Populate data if editing (after widgets are created)
+        if book_id is not None:
+            book_data = self.get_book_data(book_id)
+            self.input_title.setText(book_data.get("title", ""))
+            self.input_author.setText(book_data.get("author", ""))
+            self.input_publisher.setText(book_data.get("publisher", ""))
+            self.input_total.setText(str(book_data.get("total", 1)))
+            self.input_available.setText(str(book_data.get("available", 1)))
+        else:
+            self.input_total.setText("1")
+            self.input_available.setText("1")
+
+        self.btn = QPushButton("New Book" if book_id is None else "Update Book")
+        self.btn.clicked.connect(self.add_book if book_id is None else self.edit_book)
 
         layout.addWidget(self.input_id)
         layout.addWidget(self.input_title)
         layout.addWidget(self.input_author)
         layout.addWidget(self.input_publisher)
-        layout.addWidget(self.add_btn)
+        layout.addWidget(self.input_total)
+        layout.addWidget(self.input_available)
+        layout.addWidget(self.btn)
 
     def add_book(self):
         book_id = self.input_id.text().strip()
         title = self.input_title.text().strip()
         author = self.input_author.text().strip()
         publisher = self.input_publisher.text().strip()
+        
+        try:
+            total = int(self.input_total.text().strip() or 1)
+            available = int(self.input_available.text().strip() or 1)
+        except ValueError:
+            QMessageBox.warning(self, "Validation Error", "Copies count must be numeric.")
+            return
 
         if not book_id or not title or not author or not publisher:
             QMessageBox.warning(self, "Validation Error", "All fields are required")
             return
 
-        success, message = self.db.insert_book(book_id, title, author, publisher)
+        success, message = self.db.insert_book(book_id, title, author, publisher, total, available)
         if success:
             self.data_updated.emit()
             QMessageBox.information(self, "Success", message)
@@ -59,50 +110,136 @@ class NewBookDialog(QDialog):
         else:
             QMessageBox.warning(self, "Error", message)
 
+    def edit_book(self):
+        title = self.input_title.text().strip()
+        author = self.input_author.text().strip()
+        publisher = self.input_publisher.text().strip()
+        
+        try:
+            total = int(self.input_total.text().strip())
+            available = int(self.input_available.text().strip())
+        except ValueError:
+            QMessageBox.warning(self, "Validation Error", "Copies count must be numeric.")
+            return
 
-class NewUserDialog(QDialog):
+        if not title or not author or not publisher:
+            QMessageBox.warning(self, "Validation Error", "All fields are required.")
+            return
+
+        success, message = self.db.edit_book(self.book_id, title, author, publisher, total, available)
+        if success:
+            self.data_updated.emit()
+            QMessageBox.information(self, "Success", message)
+            self.accept()
+        else:
+            QMessageBox.critical(self, "Error", message)
+
+    def get_book_data(self, book_id):
+        success, row = self.db.get_book_details(book_id)
+        if success and row:
+            return {
+                "title": row[1] or "",
+                "author": row[2] or "",
+                "publisher": row[3] or "",
+                "total": row[4] or 1,
+                "available": row[5] or 1
+            }
+        return {}
+
+
+class UserDialog(QDialog):
     data_updated = pyqtSignal()
 
-    def __init__(self, db, parent=None):
+    def __init__(self, db, user_id=None, parent=None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("New User")
-        self.setFixedSize(350, 300)
+        self.user_id = user_id
+        self.setWindowTitle("New User" if user_id is None else "Edit User")
+        self.setFixedSize(350, 320)
         layout = QVBoxLayout(self)
 
-        self.input_id = QLineEdit()
-        self.input_id.setPlaceholderText("User ID:")
+        # 1. Role Selection comes first
+        self.combo_role = QComboBox()
+        self.combo_role.addItems([
+            "Select Role", "Student", "Faculty", "Librarian", "Admin"
+        ])
+        self.combo_role.currentTextChanged.connect(self.set_id_validator)
 
-        self.input_name = QLineEdit()
-        self.input_name.setPlaceholderText("Full Name")
-
-        self.input_phoneno = QLineEdit()
-        self.input_phoneno.setPlaceholderText("Phone Number")
-
-        phone_regex=QRegularExpression(r"^\+?[1-9]\d{6,14}$")
-        validator=QRegularExpressionValidator(phone_regex,self)
-        self.input_phoneno.setValidator(validator)
-
+        # 2. Department Selection
         self.combo_department = QComboBox()
         self.combo_department.addItems([
             "Select Department", "CSE", "ECE", "EEE", "CE", 
             "ME", "AU", "PH", "EV", "ET"
         ])
 
-        self.combo_role = QComboBox()
-        self.combo_role.addItems([
-            "Select Role", "Student", "Faculty", "Librarian", "Admin"
-        ])
+        # 3. User ID field (depends on Role)
+        self.input_id = QLineEdit()
+        self.input_id.setEnabled(False)  # Disabled until role is chosen
+        self.input_id.setPlaceholderText("Select a role first")
 
-        self.add_btn = QPushButton("Add")
-        self.add_btn.clicked.connect(self.add_student)
+        # 4. Name and Phone
+        name_regex = QRegularExpression(r"^[A-Za-z][A-Za-z .'-]{0,99}$")
+        self.input_name = QLineEdit()
+        self.input_name.setPlaceholderText("Full Name")
+        self.input_name.setValidator(QRegularExpressionValidator(name_regex, self.input_name))
 
+        self.input_phoneno = QLineEdit()
+        self.input_phoneno.setPlaceholderText("Phone Number")
+        phone_regex = QRegularExpression(r"^\+?[1-9]\d{9}$")
+        self.input_phoneno.setValidator(QRegularExpressionValidator(phone_regex, self.input_phoneno))
+
+       # Populate user data if editing
+        if user_id is not None:
+            user_data = self.get_user_data(user_id)
+            
+            # 1. Populate and lock ID first so the field is ready
+            self.input_id.setText(str(user_id))
+            self.input_id.setReadOnly(True)
+            self.input_id.setEnabled(True)
+            
+            # 2. Populate name and phone
+            self.input_name.setText(user_data.get("full_name", ""))
+            self.input_phoneno.setText(user_data.get("phone_number", ""))
+            
+            # 3. Set dropdowns last (this triggers signals safely after fields exist)
+            role = user_data.get("role", "")
+            if self.combo_role.findText(role) >= 0:
+                self.combo_role.setCurrentText(role)
+                
+            dept = user_data.get("department", "")
+            if self.combo_department.findText(dept) >= 0:
+                self.combo_department.setCurrentText(dept)
+
+        self.btn = QPushButton("Add User" if user_id is None else "Update User")
+        self.btn.clicked.connect(self.add_student if user_id is None else self.edit_user)
+
+        # Add to layout in the correct logical sequence
+        layout.addWidget(self.combo_role)
+        layout.addWidget(self.combo_department)
         layout.addWidget(self.input_id)
         layout.addWidget(self.input_name)
         layout.addWidget(self.input_phoneno)
-        layout.addWidget(self.combo_department)
-        layout.addWidget(self.combo_role)
-        layout.addWidget(self.add_btn)
+        layout.addWidget(self.btn)
+
+    def set_id_validator(self, role):
+        if role == "Student":
+            regex = QRegularExpression(r"^[0-9]{5}-[A-Za-z]{2}-[0-9]{3}$")
+            self.input_id.setEnabled(True)
+            if not self.input_id.isReadOnly():
+                self.input_id.setPlaceholderText("e.g., 12345-CSE-123")
+        elif role in ["Faculty", "Admin", "Librarian"]:
+            regex = QRegularExpression(r"^[0-9]{5}$")
+            self.input_id.setEnabled(True)
+            if not self.input_id.isReadOnly():
+                self.input_id.setPlaceholderText("e.g., 12345")
+        else:
+            regex = QRegularExpression(r"")
+            if not self.input_id.isReadOnly():
+                self.input_id.clear()
+                self.input_id.setEnabled(False)
+                self.input_id.setPlaceholderText("Select a role first")
+                
+        self.input_id.setValidator(QRegularExpressionValidator(regex, self.input_id))
 
     def add_student(self):
         user_id = self.input_id.text().strip()
@@ -111,9 +248,22 @@ class NewUserDialog(QDialog):
         department = self.combo_department.currentText()
         role = self.combo_role.currentText()
 
+        # Basic presence check
         if not user_id or not name or department == "Select Department" or role == "Select Role":
             QMessageBox.warning(self, "Validation Error", "All fields are required!")
             return
+
+        # Ensure user ID fully satisfies the regex criteria before submitting
+        validator = self.input_id.validator()
+        if validator:
+            state, _, _ = validator.validate(user_id, 0)
+            if state != QValidator.State.Acceptable:
+                QMessageBox.warning(
+                    self, 
+                    "Validation Error", 
+                    "The User ID format is incomplete or invalid for the selected role."
+                )
+                return
 
         success, message = self.db.insert_user(user_id, name, phone_number, role, department)
         if success:
@@ -122,54 +272,6 @@ class NewUserDialog(QDialog):
             self.accept()
         else:
             QMessageBox.warning(self, "Warning", message)
-
-
-class EditUserDialog(QDialog):
-    data_updated = pyqtSignal()
-
-    def __init__(self, db, user_id, parent=None):
-        super().__init__(parent)
-        self.db = db
-        self.user_id = user_id
-        self.setWindowTitle("Edit User")
-        self.setFixedSize(350, 300)
-
-        user_data = self.get_user_data(user_id)
-        layout = QVBoxLayout(self)
-
-        self.input_name = QLineEdit(user_data.get("full_name", ""))
-        self.input_name.setPlaceholderText("Full Name")
-
-        self.input_phoneno = QLineEdit(user_data.get("phone_number", ""))
-        self.input_phoneno.setPlaceholderText("Phone Number")
-
-        self.combo_department = QComboBox()
-        self.combo_department.addItems([
-            "Select Department", "CSE", "ECE", "EEE", "CE", 
-            "ME", "AU", "PH", "EV", "ET"
-        ])
-        current_dept = user_data.get("department", "")
-        dept_index = self.combo_department.findText(current_dept)
-        if dept_index >= 0:
-            self.combo_department.setCurrentIndex(dept_index)
-
-        self.combo_role = QComboBox()
-        self.combo_role.addItems([
-            "Student", "Faculty", "Librarian", "Admin"
-        ])
-        current_role = user_data.get("role", "")
-        role_index = self.combo_role.findText(current_role)
-        if role_index >= 0:
-            self.combo_role.setCurrentIndex(role_index)
-
-        self.edit_btn = QPushButton("Edit")
-        self.edit_btn.clicked.connect(self.edit_user)
-
-        layout.addWidget(self.input_name)
-        layout.addWidget(self.input_phoneno)
-        layout.addWidget(self.combo_department)
-        layout.addWidget(self.combo_role)
-        layout.addWidget(self.edit_btn)
 
     def get_user_data(self, user_id):
         success, row = self.db.get_user_details(user_id)
@@ -188,8 +290,8 @@ class EditUserDialog(QDialog):
         role = self.combo_role.currentText()
         dept = self.combo_department.currentText()
 
-        if not name or dept == "Select Department":
-            QMessageBox.warning(self, "Validation Error", "Full name and Department are required.")
+        if not name or dept == "Select Department" or role == "Select Role":
+            QMessageBox.warning(self, "Validation Error", "Full name, Role, and Department are required.")
             return
 
         success, message = self.db.edit_user(self.user_id, name, phone_number, role, dept)
@@ -199,252 +301,299 @@ class EditUserDialog(QDialog):
             self.accept()
         else:
             QMessageBox.critical(self, "Error", message)
-
-
 class ViewBooksDialog(QDialog):
     def __init__(self, db, user_id, parent=None):
         super().__init__(parent)
         self.db = db
         self.user_id = user_id
+        self.books_data = []
         
-        self.setWindowTitle("User Borrowed Books")
-        self.resize(850, 600)
+        self.setWindowTitle(f"User Assigned Books & History — ID: {user_id}")
+        self.resize(950, 550)
         
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setContentsMargins(24, 24, 24, 24)
+        main_layout.setSpacing(16)
 
-        lbl_header = QLabel("Book History & Status")
-        lbl_header.setStyleSheet("font-size: 20px; font-weight: bold; color: #0f172a; margin-bottom: 10px;")
+        # Header Title
+        lbl_header = QLabel(f"Circulation History for User: <b>{user_id}</b>")
+        lbl_header.setStyleSheet("font-size: 18px; font-weight: bold; color: #0f172a;")
         main_layout.addWidget(lbl_header)
 
-        books = self.db.get_user_books_status(user_id)
+        # Main Layout: Table (Left) + Inspector Panel (Right)
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(20)
 
-        if not books:
-            lbl_empty = QLabel("No book history found for this user.")
-            lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl_empty.setStyleSheet("color: #64748b; font-size: 14px; margin-top: 50px;")
-            main_layout.addWidget(lbl_empty)
-            return
+        # --- Table View ---
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-
-        container_widget = QWidget()
-        grid_layout = QGridLayout(container_widget)
-        grid_layout.setSpacing(15)
-
-        cols = 2
-        for idx, book in enumerate(books):
-            row = idx // cols
-            col = idx % cols
-            card = self.create_book_tile(book)
-            grid_layout.addWidget(card, row, col)
-
-        grid_layout.setRowStretch(grid_layout.rowCount(), 1)
-
-        scroll_area.setWidget(container_widget)
-        main_layout.addWidget(scroll_area)
-
-    def create_book_tile(self, book):
-        book_id, title, author, publisher, status, checkout_date, due_date,return_date,fine = book
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setHorizontalHeaderLabels(["Book ID", "Title", "Author", "Status", "Checkout", "Due Date", "Fine"])
         
-        is_checkout = str(status) == 'ISSUED'
-        status_text = "ISSUED" if is_checkout else "RETURNED"
-        badge_bg = "#dcfce7" if is_checkout else "#e0f2fe"
-        badge_color = "#15803d" if is_checkout else "#0369a1"
+        # Professional Table Styling matching CatalogView
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                gridline-color: #f1f5f9;
+                color: #1e293b;
+                selection-background-color: #eff6ff;
+                selection-color: #1d4ed8;
+                outline: none;
+            }
+            QTableWidget::item {
+                padding: 10px 8px;
+                border-bottom: 1px solid #f1f5f9;
+            }
+            QTableWidget::item:selected {
+                background-color: #eff6ff;
+                color: #1d4ed8;
+                outline: none;
+            }
+            QHeaderView::section {
+                background-color: #f8fafc;
+                color: #475569;
+                font-weight: bold;
+                font-size: 12px;
+                border: none;
+                border-bottom: 2px solid #e2e8f0;
+                padding: 10px 8px;
+            }
+            QHeaderView::section:first { border-top-left-radius: 12px; }
+            QHeaderView::section:last { border-top-right-radius: 12px; }
+        """)
 
-        card = QFrame()
-        card.setStyleSheet("""
+        self.table.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        content_layout.addWidget(self.table, stretch=3)
+
+        # --- Right-Side Inspector Panel ---
+        self.detail_container = QFrame()
+        self.detail_container.setFixedWidth(280)
+        self.detail_container.setStyleSheet("""
             QFrame {
                 background-color: #ffffff;
-                border-radius: 10px;
                 border: 1px solid #e2e8f0;
+                border-radius: 12px;
             }
         """)
         
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 16, 16, 16)
-        card_layout.setSpacing(6)
-
-        top_bar = QHBoxLayout()
-        lbl_id = QLabel(f"ID: {book_id}")
-        lbl_id.setStyleSheet("color: #64748b; font-size: 11px; font-weight: bold; border: none;")
+        self.detail_layout = QVBoxLayout(self.detail_container)
+        self.detail_layout.setContentsMargins(16, 16, 16, 16)
+        self.detail_layout.setSpacing(12)
         
-        lbl_badge = QLabel(status_text)
-        lbl_badge.setStyleSheet(f"""
-            background-color: {badge_bg};
-            color: {badge_color};
-            font-size: 11px;
-            font-weight: bold;
-            padding: 3px 8px;
-            border-radius: 6px;
-            border: none;
-        """)
+        self.show_default_inspector()
+        content_layout.addWidget(self.detail_container, stretch=0)
+
+        main_layout.addLayout(content_layout)
+        self.setStyleSheet("background-color: #f8fafc;")
+
+        self.load_user_books()
+
+    def show_default_inspector(self):
+        clear_layout(self.detail_layout)
+        lbl_header = QLabel("Record Inspector")
+        lbl_header.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: bold; border: none; background: transparent;")
+        self.detail_layout.addWidget(lbl_header)
         
-        top_bar.addWidget(lbl_id)
-        top_bar.addStretch()
-        top_bar.addWidget(lbl_badge)
-        card_layout.addLayout(top_bar)
+        hint = QLabel("Select any book row from the table to view complete loan details, return dates, and fine calculations.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #64748b; font-size: 13px; border: none; background: transparent; padding-top: 20px;")
+        self.detail_layout.addWidget(hint)
+        self.detail_layout.addStretch()
 
-        lbl_title = QLabel(str(title))
-        lbl_title.setWordWrap(True)
-        lbl_title.setStyleSheet("color: #0f172a; font-size: 16px; font-weight: bold; border: none; margin-top: 4px;")
-        card_layout.addWidget(lbl_title)
-
-        lbl_meta = QLabel(f"By {author}  •  {publisher}")
-        lbl_meta.setStyleSheet("color: #64748b; font-size: 12px; border: none;")
-        card_layout.addWidget(lbl_meta)
-
-        checkout_str = str(checkout_date) if checkout_date else "N/A"
-        lbl_checkout= QLabel(f"Issued Date: {checkout_str}")
-        lbl_checkout.setStyleSheet("color: black; font-size: 11px; border: none; margin-top: 6px;")
-        card_layout.addWidget(lbl_checkout)
-        
-        due_str = str(due_date) if due_date else "N/A"
-        lbl_due_date = QLabel(f"Due Date: {due_str}")
-        lbl_due_date.setStyleSheet("color: black; font-size: 11px; border: none;")
-        card_layout.addWidget(lbl_due_date)
-
-        return_str = str(return_date) if return_date else "N/A"
-        lbl_return_date = QLabel(f"Return Date: {return_str}")
-        lbl_return_date.setStyleSheet("color: black; font-size: 11px; border: none;")
-        card_layout.addWidget(lbl_return_date)
-
-        fine_str = str(fine) if return_date else "0.0"
-        lbl_fine_date = QLabel(f"Fine: {fine_str}")
-        lbl_fine_date.setStyleSheet("color: black; font-size: 11px; border: none;")
-        card_layout.addWidget(lbl_fine_date)
-
-        return card
-
-
-class EditBookDialog(QDialog):
-    data_updated = pyqtSignal()
-
-    def __init__(self, db, book_id, parent=None):
-        super().__init__(parent)
-        self.db = db
-        self.book_id = book_id
-        self.setWindowTitle("Edit Book")
-        self.setFixedSize(350, 300)
-
-        book_data = self.get_book_data(book_id)
-
-        layout = QVBoxLayout(self)
-
-        self.input_title = QLineEdit(book_data.get("title", ""))
-        self.input_title.setPlaceholderText("Title")
-
-        self.input_author = QLineEdit(book_data.get("author", ""))
-        self.input_author.setPlaceholderText("Author")
-
-        self.input_publisher = QLineEdit(book_data.get("publisher", ""))
-        self.input_publisher.setPlaceholderText("Publisher")
-
-        self.input_total = QLineEdit(str(book_data.get("total", "")))
-        self.input_total.setPlaceholderText("Total Copies")
-
-        self.input_available = QLineEdit(str(book_data.get("available", "")))
-        self.input_available.setPlaceholderText("Available Copies")
-
-        self.edit_btn = QPushButton("Edit")
-        self.edit_btn.clicked.connect(self.edit_book)
-
-        layout.addWidget(self.input_title)
-        layout.addWidget(self.input_author)
-        layout.addWidget(self.input_publisher)
-        layout.addWidget(self.input_total)
-        layout.addWidget(self.input_available)
-        layout.addWidget(self.edit_btn)
-
-    def get_book_data(self, book_id):
-        success, row = self.db.get_book_details(book_id)
-        if success and row:
-            return {
-                "title": row[1] or "",
-                "author": row[2] or "",
-                "publisher": row[3] or "",
-                "total": row[4] or 1,
-                "available": row[5] or 1
-            }
-        return {}
-
-    def edit_book(self):
-        title = self.input_title.text().strip()
-        author = self.input_author.text().strip()
-        publisher = self.input_publisher.text().strip()
-        
-        try:
-            total = int(self.input_total.text().strip())
-            available = int(self.input_available.text().strip())
-        except ValueError:
-            QMessageBox.warning(self, "Validation Error", "Copies count must be numeric.")
+    def load_user_books(self):
+        books = self.db.get_user_books_status(self.user_id)
+        if not books:
+            self.table.setRowCount(0)
+            self.books_data = []
+            self.show_default_inspector()
             return
 
-        if not title:
-            QMessageBox.warning(self, "Validation Error", "Title cannot be empty.")
+        self.table.setRowCount(len(books))
+        self.books_data = books  # Cache for detail views
+
+        for row_idx, book in enumerate(books):
+            book_id, title, author, publisher, status, checkout_date, due_date, return_date, fine = book
+            
+            # Map columns: Book ID, Title, Author, Status, Checkout, Due, Fine
+            row_values = [
+                str(book_id),
+                str(title),
+                str(author),
+                str(status),
+                str(checkout_date) if checkout_date else "N/A",
+                str(due_date) if due_date else "N/A",
+                f"₹{float(fine):.2f}" if fine else "₹0.00"
+            ]
+
+            for col_idx, val in enumerate(row_values):
+                item = QTableWidgetItem(val)
+                # Highlight active status column text
+                if col_idx == 3:
+                    item.setForeground(Qt.GlobalColor.darkGreen if val == 'ISSUED' else Qt.GlobalColor.darkGray)
+                self.table.setItem(row_idx, col_idx, item)
+
+    def on_selection_changed(self):
+        selected = self.table.selectionModel().selectedRows()
+        if not selected:
+            self.show_default_inspector()
             return
+            
+        row = selected[0].row()
+        if row < len(self.books_data):
+            self.display_record_details(self.books_data[row])
 
-        success, message = self.db.edit_book(self.book_id, title, author, publisher, total, available)
-        if success:
-            self.data_updated.emit()
-            QMessageBox.information(self, "Success", message)
-            self.accept()
-        else:
-            QMessageBox.critical(self, "Error", message)
+    def display_record_details(self, book):
+        book_id, title, author, publisher, status, checkout_date, due_date, return_date, fine = book
+        
+        clear_layout(self.detail_layout)
+        
+        lbl_header = QLabel("Loan Control Center")
+        lbl_header.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: bold; border: none; background: transparent;")
+        
+        is_issued = str(status) == 'ISSUED'
+        status_banner = QLabel("🔴 Active Checkout" if is_issued else "🟢 Returned Record")
+        banner_style = (
+            "background-color: #fef2f2; color: #991b1b; border: 1px solid #fecaca;" 
+            if is_issued else 
+            "background-color: #f0fdf4; color: #166534; border: 1px solid #bbf7d0;"
+        )
+        status_banner.setStyleSheet(f"{banner_style} border-radius: 6px; padding: 8px; font-size: 12px; font-weight: 600;")
+        status_banner.setWordWrap(True)
 
+        self.detail_layout.addWidget(lbl_header)
+        self.detail_layout.addWidget(status_banner)
+        
+        form_layout = QFormLayout()
+        form_layout.setSpacing(6)
+        form_layout.addRow(QLabel("<b>Book ID:</b>"), QLabel(str(book_id)))
+        form_layout.addRow(QLabel("<b>Title:</b>"), QLabel(str(title)))
+        form_layout.addRow(QLabel("<b>Author:</b>"), QLabel(str(author)))
+        form_layout.addRow(QLabel("<b>Publisher:</b>"), QLabel(str(publisher)))
+        form_layout.addRow(QLabel("<b>Checkout:</b>"), QLabel(str(checkout_date or "N/A")))
+        form_layout.addRow(QLabel("<b>Due Date:</b>"), QLabel(str(due_date or "N/A")))
+        form_layout.addRow(QLabel("<b>Returned:</b>"), QLabel(str(return_date or "Not yet returned")))
+        form_layout.addRow(QLabel("<b>Fine:</b>"), QLabel(f"₹{float(fine or 0.0):.2f}"))
+        
+        for i in range(form_layout.rowCount()):
+            lbl_item = form_layout.itemAt(i, QFormLayout.ItemRole.LabelRole)
+            val_item = form_layout.itemAt(i, QFormLayout.ItemRole.FieldRole)
+            if lbl_item and lbl_item.widget():
+                lbl_item.widget().setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+            if val_item and val_item.widget():
+                val_item.widget().setStyleSheet("color: #334155; font-size: 11px; border: none; background: transparent;")
+                val_item.widget().setWordWrap(True)
+
+        self.detail_layout.addLayout(form_layout)
+
+        # Contextual Action: If the book is currently checked out to this user, show direct Return button
+        if is_issued:
+            self.btn_return = QPushButton("🔄 Return Book")
+            self.btn_return.setStyleSheet("""
+                QPushButton {
+                    background-color: #0284c7;
+                    color: white;
+                    font-weight: 600;
+                    border-radius: 6px;
+                    padding: 8px 12px;
+                    border: none;
+                }
+                QPushButton:hover { background-color: #0369a1; }
+            """)
+            self.btn_return.clicked.connect(lambda: self.handle_return_action(book_id))
+            self.detail_layout.addWidget(self.btn_return)
+
+        self.detail_layout.addStretch()
+
+    def handle_return_action(self, book_id):
+        """Processes the return of the book directly from the user's loan history inspector."""
+        confirm = QMessageBox.question(
+            self, "Confirm Return",
+            f"Process return for Book ID '{book_id}' borrowed by User ID '{self.user_id}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if confirm == QMessageBox.StandardButton.Yes:
+            success, fine, err_msg = self.db.return_book(book_id, self.user_id)
+            if success:
+                msg = "Book successfully returned!"
+                if fine > 0:
+                    msg += f"\nCollected Fine: ₹{fine:.2f}"
+                QMessageBox.information(self, "Return Success", msg)
+                self.load_user_books()  # Refresh the user books table and status banner
+            else:
+                QMessageBox.warning(self, "Return Failed", f"Could not process return:\n{err_msg or 'Unknown error'}")
 
 class BarcodeGeneratorDialog(QDialog):
     data_updated = pyqtSignal()
 
-    def __init__(self, db, parent=None):
+    def __init__(self, db, book_id="", title="", author="", publisher="", parent=None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("Barcode Generator")
-        self.setFixedSize(380, 580)
+        self.setWindowTitle("Barcode Generator & Export")
+        self.setFixedSize(380, 600)
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(10)
 
         layout.addWidget(QLabel("Book ID :"))
-        self.input_book_id = QLineEdit()
+        self.input_book_id = QLineEdit(book_id)
         layout.addWidget(self.input_book_id)
 
         layout.addWidget(QLabel("Book Title:"))
-        self.input_book_title = QLineEdit()
+        self.input_book_title = QLineEdit(title)
         layout.addWidget(self.input_book_title)
 
         layout.addWidget(QLabel("Author:"))
-        self.input_book_author = QLineEdit()
+        self.input_book_author = QLineEdit(author)
         layout.addWidget(self.input_book_author)
 
         layout.addWidget(QLabel("Publisher:"))
-        self.input_book_publisher = QLineEdit()
+        self.input_book_publisher = QLineEdit(publisher)
         layout.addWidget(self.input_book_publisher)
 
         self.lbl_preview = QLabel("Barcode Preview")
         self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_preview.setStyleSheet("border: 2px dashed #cbd5e1; border-radius: 6px;")
-        self.lbl_preview.setFixedHeight(200)
+        self.lbl_preview.setStyleSheet("border: 2px dashed #cbd5e1; border-radius: 6px; background-color: #f8fafc;")
+        self.lbl_preview.setFixedHeight(180)
         layout.addWidget(self.lbl_preview)
 
         self.chk_box_db = QCheckBox("Save Book to the Database")
-        self.chk_box_db.setChecked(True)
+        
+        # If opened from Catalog view for an existing book, hide or uncheck DB save option
+        if book_id:
+            self.chk_box_db.setChecked(False)
+            self.chk_box_db.setVisible(False)
+        else:
+            self.chk_box_db.setChecked(True)
+            
         self.chk_box_db.setStyleSheet("font-weight: bold; margin-top: 5px; margin-bottom: 5px;")
         layout.addWidget(self.chk_box_db)
 
         self.btn_generate = QPushButton("Generate Barcode")
-        self.btn_generate.setStyleSheet("background-color: #2b7ade; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px;")
+        self.btn_generate.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 8px 12px; border-radius: 6px;")
         self.btn_generate.clicked.connect(self.generate_barcode)
         layout.addWidget(self.btn_generate)
 
         self.btn_save = QPushButton("Save PNG")
         self.btn_save.setEnabled(False)
-        self.btn_save.setStyleSheet("background-color: #2b7ade; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px;")
+        self.btn_save.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 8px 12px; border-radius: 6px;")
         self.btn_save.clicked.connect(self.save_png)
         layout.addWidget(self.btn_save)
 
         self.generated_image = None
+
+        # Automatically generate preview if pre-filled from catalog view
+        if book_id and title:
+            self.generate_barcode()
 
     def generate_barcode(self):
         book_id = self.input_book_id.text().strip()
@@ -456,7 +605,7 @@ class BarcodeGeneratorDialog(QDialog):
             QMessageBox.warning(self, "Validation Error", "Please enter the Book ID and Title.")
             return
 
-        if self.chk_box_db.isChecked():
+        if self.chk_box_db.isVisible() and self.chk_box_db.isChecked():
             try:
                 success, message = self.db.insert_book(book_id, book_title, book_author, book_publisher)
                 if success:
@@ -472,7 +621,6 @@ class BarcodeGeneratorDialog(QDialog):
         try:
             Code128 = barcode.get_barcode_class('code128')
             
-            # Configure writer options to ensure correct horizontal aspect ratio for scanners
             writer_options = {
                 'module_width': 0.4,       
                 'module_height': 15.0,     
@@ -485,17 +633,14 @@ class BarcodeGeneratorDialog(QDialog):
             code128 = Code128(book_id, writer=ImageWriter())
             
             buffer = io.BytesIO()
-            # Pass writer options into write()
             code128.write(buffer, options=writer_options)
             
             pil_img = Image.open(buffer).convert("RGB")
             self.generated_image = pil_img
 
-            # Convert to QPixmap and apply smooth scaling
             q_img = ImageQt.ImageQt(pil_img)
             pixmap = QPixmap.fromImage(q_img)
             
-            # Fit inside preview box while preserving correct aspect ratio
             scaled_pixmap = pixmap.scaled(
                 self.lbl_preview.width() - 20, 
                 self.lbl_preview.height() - 20, 
@@ -765,3 +910,240 @@ class CustomSplashScreen(QDialog):
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.text_label.setStyleSheet("color: black;")
         layout.addWidget(self.text_label)
+class BookHistoryDialog(QDialog):
+    def __init__(self, db, book_id, book_title, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.book_id = book_id
+        self.history_data = []
+
+        self.setWindowTitle(f"Audit History — {book_title} (ID: {book_id})")
+        self.resize(950, 550)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(24, 24, 24, 24)
+        main_layout.setSpacing(16)
+
+        # Header Title
+        lbl_header = QLabel(f"Circulation Log for: <b>{book_title}</b>")
+        lbl_header.setStyleSheet("font-size: 18px; font-weight: bold; color: #0f172a;")
+        main_layout.addWidget(lbl_header)
+
+        # Main Layout: Table (Left) + Inspector Panel (Right)
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(20)
+
+        # --- Table View ---
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setHorizontalHeaderLabels(["Borrower ID", "Status", "Checkout Date", "Due Date", "Return Date", "Fine"])
+        
+        # Professional Table Styling matching CatalogView
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                gridline-color: #f1f5f9;
+                color: #1e293b;
+                selection-background-color: #eff6ff;
+                selection-color: #1d4ed8;
+                outline: none;
+            }
+            QTableWidget::item {
+                padding: 10px 8px;
+                border-bottom: 1px solid #f1f5f9;
+            }
+            QTableWidget::item:selected {
+                background-color: #eff6ff;
+                color: #1d4ed8;
+                outline: none;
+            }
+            QHeaderView::section {
+                background-color: #f8fafc;
+                color: #475569;
+                font-weight: bold;
+                font-size: 12px;
+                border: none;
+                border-bottom: 2px solid #e2e8f0;
+                padding: 10px 8px;
+            }
+            QHeaderView::section:first { border-top-left-radius: 12px; }
+            QHeaderView::section:last { border-top-right-radius: 12px; }
+        """)
+
+        self.table.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        content_layout.addWidget(self.table, stretch=3)
+
+        # --- Right-Side Inspector Panel ---
+        self.detail_container = QFrame()
+        self.detail_container.setFixedWidth(280)
+        self.detail_container.setStyleSheet("""
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+            }
+        """)
+        
+        self.detail_layout = QVBoxLayout(self.detail_container)
+        self.detail_layout.setContentsMargins(16, 16, 16, 16)
+        self.detail_layout.setSpacing(12)
+        
+        self.show_default_inspector()
+        content_layout.addWidget(self.detail_container, stretch=0)
+
+        main_layout.addLayout(content_layout)
+        self.setStyleSheet("background-color: #f8fafc;")
+
+        self.load_history()
+
+    def show_default_inspector(self):
+        clear_layout(self.detail_layout)
+        lbl_header = QLabel("Record Inspector")
+        lbl_header.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: bold; border: none; background: transparent;")
+        self.detail_layout.addWidget(lbl_header)
+        
+        hint = QLabel("Select any log row from the table to view complete audit details, borrower info, and fine calculations.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #64748b; font-size: 13px; border: none; background: transparent; padding-top: 20px;")
+        self.detail_layout.addWidget(hint)
+        self.detail_layout.addStretch()
+
+    def load_history(self):
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute("""
+                SELECT user_id, checkout_date, due_date, return_date, fine_amount, status
+                FROM circulation_logs
+                WHERE book_id = ?
+                ORDER BY id DESC
+            """, (self.book_id,))
+            rows = cursor.fetchall()
+
+            if not rows:
+                self.table.setRowCount(0)
+                self.history_data = []
+                self.show_default_inspector()
+                return
+
+            self.table.setRowCount(len(rows))
+            self.history_data = rows
+
+            for row_idx, row_data in enumerate(rows):
+                user_id, checkout, due, return_dt, fine, status = row_data
+                
+                row_values = [
+                    str(user_id),
+                    str(status),
+                    str(checkout) if checkout else "N/A",
+                    str(due) if due else "N/A",
+                    str(return_dt) if return_dt else "N/A",
+                    f"₹{float(fine or 0.0):.2f}"
+                ]
+
+                for col_idx, val in enumerate(row_values):
+                    item = QTableWidgetItem(val)
+                    if col_idx == 1:
+                        item.setForeground(Qt.GlobalColor.darkGreen if val == 'ISSUED' else Qt.GlobalColor.darkGray)
+                    self.table.setItem(row_idx, col_idx, item)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Could not load book history: {e}")
+
+    def on_selection_changed(self):
+        selected = self.table.selectionModel().selectedRows()
+        if not selected:
+            self.show_default_inspector()
+            return
+            
+        row = selected[0].row()
+        if row < len(self.history_data):
+            self.display_record_details(self.history_data[row])
+
+    def display_record_details(self, record):
+        user_id, checkout, due, return_dt, fine, status = record
+        
+        clear_layout(self.detail_layout)
+        
+        lbl_header = QLabel("Audit Control Center")
+        lbl_header.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: bold; border: none; background: transparent;")
+        
+        is_issued = str(status) == 'ISSUED'
+        status_banner = QLabel("🔴 Active Checkout" if is_issued else "🟢 Completed Loan")
+        banner_style = (
+            "background-color: #fef2f2; color: #991b1b; border: 1px solid #fecaca;" 
+            if is_issued else 
+            "background-color: #f0fdf4; color: #166534; border: 1px solid #bbf7d0;"
+        )
+        status_banner.setStyleSheet(f"{banner_style} border-radius: 6px; padding: 8px; font-size: 12px; font-weight: 600;")
+        status_banner.setWordWrap(True)
+
+        self.detail_layout.addWidget(lbl_header)
+        self.detail_layout.addWidget(status_banner)
+        
+        form_layout = QFormLayout()
+        form_layout.setSpacing(6)
+        form_layout.addRow(QLabel("<b>Borrower ID:</b>"), QLabel(str(user_id)))
+        form_layout.addRow(QLabel("<b>Status:</b>"), QLabel(str(status)))
+        form_layout.addRow(QLabel("<b>Checkout:</b>"), QLabel(str(checkout or "N/A")))
+        form_layout.addRow(QLabel("<b>Due Date:</b>"), QLabel(str(due or "N/A")))
+        form_layout.addRow(QLabel("<b>Returned:</b>"), QLabel(str(return_dt or "Not yet returned")))
+        form_layout.addRow(QLabel("<b>Fine:</b>"), QLabel(f"₹{float(fine or 0.0):.2f}"))
+        
+        for i in range(form_layout.rowCount()):
+            lbl_item = form_layout.itemAt(i, QFormLayout.ItemRole.LabelRole)
+            val_item = form_layout.itemAt(i, QFormLayout.ItemRole.FieldRole)
+            if lbl_item and lbl_item.widget():
+                lbl_item.widget().setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+            if val_item and val_item.widget():
+                val_item.widget().setStyleSheet("color: #334155; font-size: 11px; border: none; background: transparent;")
+                val_item.widget().setWordWrap(True)
+
+        self.detail_layout.addLayout(form_layout)
+
+        # Contextual Action: If the book is currently checked out, show direct Return button
+        if is_issued:
+            self.btn_return = QPushButton("🔄 Return Book")
+            self.btn_return.setStyleSheet("""
+                QPushButton {
+                    background-color: #0284c7;
+                    color: white;
+                    font-weight: 600;
+                    border-radius: 6px;
+                    padding: 8px 12px;
+                    border: none;
+                }
+                QPushButton:hover { background-color: #0369a1; }
+            """)
+            self.btn_return.clicked.connect(lambda: self.handle_return_action(user_id))
+            self.detail_layout.addWidget(self.btn_return)
+
+        self.detail_layout.addStretch()
+
+    def handle_return_action(self, user_id):
+        """Processes the return of the book directly from the audit history inspector."""
+        confirm = QMessageBox.question(
+            self, "Confirm Return",
+            f"Process return for this book borrowed by User ID '{user_id}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if confirm == QMessageBox.StandardButton.Yes:
+            success, fine, err_msg = self.db.return_book(self.book_id, user_id)
+            if success:
+                msg = "Book successfully returned!"
+                if fine > 0:
+                    msg += f"\nCollected Fine: ₹{fine:.2f}"
+                QMessageBox.information(self, "Return Success", msg)
+                self.load_history()  # Refresh the history table and status banner
+            else:
+                QMessageBox.warning(self, "Return Failed", f"Could not process return:\n{err_msg or 'Unknown error'}")

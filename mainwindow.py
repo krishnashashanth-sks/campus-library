@@ -1,5 +1,6 @@
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame, QStackedWidget, QPushButton, QLabel
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame, QStackedWidget, QPushButton, QLabel, QSizePolicy,
+    QMessageBox
 )
 from PyQt6.QtGui import QIcon, QFont
 from pages.bookcatalog_view import CatalogView
@@ -8,6 +9,7 @@ from pages.reports_view import ReportsView
 from pages.usermanagement_view import UserManagementView
 from pages.settings_view import SettingsView
 from pages.dashboard_view import DashboardView
+from PyQt6.QtCore import QPropertyAnimation, QEasingCurve
 
 class MainWindow(QMainWindow):
     def __init__(self,db):
@@ -43,6 +45,25 @@ class MainWindow(QMainWindow):
             """
         )
         top_layout = QHBoxLayout(topbar)
+        self.toggle_btn=QPushButton("☰")
+        self.toggle_btn.setFixedSize(45,45)
+        self.toggle_btn.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #3A414E;
+                color: white;
+                font-size: 20px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #4E5767;
+            }
+            """
+        )
+        self.toggle_btn.clicked.connect(self.toggle_sidebar)
+        top_layout.addWidget(self.toggle_btn)
+
         custom_font = QFont("Arial", 16, QFont.Weight.Bold)
         title_label=QLabel("Library Management System")
         title_label.setFont(custom_font)
@@ -56,9 +77,11 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(0)
 
         # Sidebar
-        sidebar = QFrame()
-        sidebar.setFixedWidth(220)
-        sidebar.setStyleSheet(
+        self.sidebar = QFrame()
+        self.sidebar.setMinimumWidth(0)
+        self.sidebar.setMaximumWidth(220)
+        self.sidebar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.sidebar.setStyleSheet(
             """
             QFrame {
                 background-color: #2D333D;
@@ -84,7 +107,7 @@ class MainWindow(QMainWindow):
             """
         )
 
-        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(0, 10, 0, 10)
 
         # Initialize Buttons
@@ -110,7 +133,28 @@ class MainWindow(QMainWindow):
             sidebar_layout.addWidget(btn)
 
         sidebar_layout.addStretch()
-        content_layout.addWidget(sidebar)
+        
+        exit_btn=QPushButton("⏻ Exit System")
+        exit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(239, 68, 68, 0.1);
+                color: #f87171;
+                text-align: left;
+                padding: 10px 14px;
+                border-radius: 6px;
+                font-weight: 600;
+                font-size: 13px;
+                border: 1px solid rgba(239, 68, 68, 0.2);
+            }
+            QPushButton:hover {
+                background-color: #ef4444;
+                color: #ffffff;
+            }
+        """)
+        exit_btn.clicked.connect(self.confirm_exit)
+        sidebar_layout.addWidget(exit_btn)
+        
+        content_layout.addWidget(self.sidebar)
 
         # 3. Stacked Pages
         self.pages = QStackedWidget()
@@ -126,8 +170,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(SettingsView(db))
 
         content_layout.addWidget(self.pages)
-        main_layout.addWidget(content_widget)
 
+        main_layout.addWidget(content_widget)
         # Set default active page and button
         self.switch_page(0)
 
@@ -149,3 +193,25 @@ class MainWindow(QMainWindow):
         
         for i, btn in enumerate(buttons):
             btn.setChecked(i == index)
+    def toggle_sidebar(self):
+        self.animation=QPropertyAnimation(self.sidebar,b"maximumWidth")
+        self.animation.setDuration(250)
+        self.animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        current_width=self.sidebar.width()
+        if current_width>0:
+            self.animation.setStartValue(current_width)
+            self.animation.setEndValue(0)
+        else:
+            self.animation.setStartValue(0)
+            self.animation.setEndValue(220)
+        self.animation.start()
+    def confirm_exit(self):
+        reply=QMessageBox.question(
+            self,"Exit System",
+            "Are you sure you want to close the Library Management System?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply==QMessageBox.StandardButton.Yes:
+            exit()
