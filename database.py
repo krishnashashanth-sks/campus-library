@@ -1,479 +1,1014 @@
+import os
+import csv
 import sqlite3
 import datetime
 import logging
+from contextlib import contextmanager
+from typing import Optional, Iterable, Sequence, Any
+
 from utils import get_appdata_db_path
 
+
 class LocalDatabase:
-    def __init__(self):
-        self.conn = sqlite3.connect(get_appdata_db_path(), check_same_thread=False)
-        self.conn.execute("PRAGMA foreign_keys = ON;")
+    """
+    SQLite data-access layer for the Library Management System.
+
+    Compatibility:
+      - Keeps the existing public method names and return-value shapes.
+      - Keeps `self.conn` available for legacy dialogs that query SQLite directly.
+      - Uses parameterized SQL and explicit transactions for write operations.
+    """
+
+    def __init__(self, database_path=None):
+        self.database_path = os.fspath(database_path or get_appdata_db_path())
+        parent = os.path.dirname(os.path.abspath(self.database_path))
+        os.makedirs(parent, exist_ok=True)
+
+        self.conn = sqlite3.connect(
+            self.database_path,
+            timeout=15,
+            check_same_thread=False,
+            isolation_level="DEFERRED",
+        )
+        self.conn.row_factory = None
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute("PRAGMA busy_timeout = 15000")
+        try:
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.DatabaseError:
+            logging.warning("WAL mode could not be enabled; continuing with SQLite defaults.")
+
         self.create_tables()
 
+    @contextmanager
+    def _transaction(self, immediate=False):
+        """Commit the complete operation or roll it back on any exception."""
+        try:
+            if immediate:
+                self.conn.execute("BEGIN IMMEDIATE")
+            yield self.conn
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    @staticmethod
+    def _clean(value):
+        return str(value).strip() if value is not None else ""
+
+    @staticmethod
+    def _money(value, default=0.0):
+        try:
+            result = float(value)
+            return round(result, 2) if result >= 0 else default
+        except (TypeError, ValueError):
+            return default
+
     def _parse_db_error(self, error: Exception, context: str = "") -> str:
-        """Converts raw SQLite exceptions into clear, user-friendly error messages."""
-        err_msg = str(error).lower()
+        message = str(error).lower()
 
-        # Handle UNIQUE constraint failures
         if isinstance(error, sqlite3.IntegrityError):
-            if "unique constraint" in err_msg or "primary key" in err_msg:
-                if "users.id" in err_msg or "users.phone_number" in err_msg:
-                    return "A user with this ID or Phone Number already exists."
-                if "books.id" in err_msg or "books.isbn" in err_msg:
+            if "unique constraint" in message or "primary key" in message:
+                if "users.id" in message:
+                    return "A user with this ID / PIN already exists."
+                if "users.phone_number" in message:
+                    return "A user with this Phone Number already exists."
+                if "books.id" in message or "books.isbn" in message:
                     return "A book with this ID or ISBN already exists."
+                if "departments.name" in message:
+                    return "A department or branch with this name already exists."
                 return "This entry already exists in the system."
-            
-            # Handle FOREIGN KEY constraint failures
-            if "foreign key" in err_msg:
+            if "foreign key" in message:
                 return "The referenced User or Book record does not exist."
-
-            if "check constraint" in err_msg:
+            if "check constraint" in message:
                 return "Invalid data entered. Please check your inputs."
 
-        # Handle database locking / IO issues
         if isinstance(error, sqlite3.OperationalError):
-            if "locked" in err_msg or "busy" in err_msg:
+            if "locked" in message or "busy" in message:
                 return "The database is currently busy. Please try again in a moment."
-            if "no such table" in err_msg:
+            if "no such table" in message:
                 return "Database structure mismatch. Please restart the application."
+            if "readonly" in message:
+                return "The database is read-only. Check folder permissions."
 
-        # Fallback error for unexpected issues
-        logging.error(f"Database Error [{context}]: {error}")
-        return f"An unexpected error occurred while processing {context}."
+        logging.exception("Database error [%s]: %s", context, error)
+        return f"An unexpected error occurred while processing {context or 'the request'}."
 
     def create_tables(self):
-        cursor = self.conn.cursor()
+        """Create tables, indexes, and seed data without deleting existing records."""
+        with self._transaction():
+            cur = self.conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY COLLATE NOCASE,
+                    phone_number TEXT UNIQUE,
+                    full_name TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    department TEXT,
+                    created_at TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS books (
+                    id TEXT PRIMARY KEY COLLATE NOCASE,
+                    isbn TEXT UNIQUE,
+                    title TEXT NOT NULL,
+                    author TEXT,
+                    publisher TEXT,
+                    total_copies INTEGER NOT NULL DEFAULT 1 CHECK(total_copies >= 0),
+                    available_copies INTEGER NOT NULL DEFAULT 1
+                        CHECK(available_copies >= 0 AND available_copies <= total_copies),
+                    created_at TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS circulation_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id TEXT COLLATE NOCASE,
+                    user_id TEXT COLLATE NOCASE,
+                    checkout_date TIMESTAMP,
+                    due_date TIMESTAMP,
+                    return_date TIMESTAMP,
+                    fine_amount DECIMAL(10, 2) DEFAULT 0.00,
+                    status TEXT DEFAULT 'ISSUED',
+                    FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS departments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE COLLATE NOCASE,
+                    category TEXT DEFAULT 'STUDENT',
+                    duration_years INTEGER DEFAULT 3 CHECK(duration_years > 0)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS loan_policies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    role TEXT UNIQUE COLLATE NOCASE,
+                    max_books_allowed INTEGER DEFAULT 3 CHECK(max_books_allowed >= 0),
+                    default_loan_days INTEGER DEFAULT 14 CHECK(default_loan_days > 0),
+                    fine_per_day DECIMAL(10, 2) DEFAULT 2.00 CHECK(fine_per_day >= 0)
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                phone_number TEXT UNIQUE,
-                full_name TEXT,
-                role TEXT,
-                department TEXT,
-                created_at TIMESTAMP
-            )
-        """)
+            # Lightweight additive migrations for databases created by earlier versions.
+            self._ensure_column("books", "isbn", "TEXT")
+            self._ensure_column("circulation_logs", "status", "TEXT DEFAULT 'ISSUED'")
+            self._ensure_column("circulation_logs", "fine_amount", "DECIMAL(10, 2) DEFAULT 0.00")
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS books (
-                id TEXT PRIMARY KEY,
-                isbn TEXT UNIQUE,
-                title TEXT,
-                author TEXT,
-                publisher TEXT,
-                total_copies INTEGER DEFAULT 1,
-                available_copies INTEGER DEFAULT 1,
-                created_at TIMESTAMP
-            )
-        """)
+            cur.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+                CREATE INDEX IF NOT EXISTS idx_users_department ON users(department);
+                CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
+                CREATE INDEX IF NOT EXISTS idx_logs_user_status ON circulation_logs(user_id, status);
+                CREATE INDEX IF NOT EXISTS idx_logs_book_status ON circulation_logs(book_id, status);
+                CREATE INDEX IF NOT EXISTS idx_logs_due_status ON circulation_logs(due_date, status);
+                CREATE INDEX IF NOT EXISTS idx_logs_checkout ON circulation_logs(checkout_date);
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS circulation_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                book_id TEXT,
-                user_id TEXT,
-                checkout_date TIMESTAMP,
-                due_date TIMESTAMP,
-                return_date TIMESTAMP,
-                fine_amount DECIMAL(10, 2) DEFAULT 0.00,
-                status TEXT,
-                FOREIGN KEY (book_id) REFERENCES books (id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-            )
-        """)
+            if cur.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
+                # Retained for compatibility with the existing login dialog.
+                # Change this default immediately after first launch.
+                cur.executemany(
+                    "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+                    [("admin_password", "admin123"), ("daily_fine", "10.0"), ("default_days", "14")],
+                )
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS settings(
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
+            if cur.execute("SELECT COUNT(*) FROM departments").fetchone()[0] == 0:
+                departments = [
+                    ("CSE (Computer Science & Engineering)", "STUDENT", 3),
+                    ("ECE (Electronics & Communication)", "STUDENT", 3),
+                    ("EEE (Electrical & Electronics)", "STUDENT", 3),
+                    ("Advanced Manufacturing Technology (AMT)", "STUDENT", 3),
+                    ("Electrical Engineering and Electric Vehicle Technology", "STUDENT", 3),
+                    ("Interior Design (ID)", "STUDENT", 3),
+                    ("Civil Engineering", "STUDENT", 3),
+                    ("Mechanical Engineering", "STUDENT", 3),
+                    ("Automobile Engineering", "STUDENT", 3),
+                    ("Pharmacy", "STUDENT", 2),
+                    ("Sciences & Humanities Department", "FACULTY", 3),
+                    ("Computer Engineering Department", "FACULTY", 3),
+                    ("Electronics & Communication Department", "FACULTY", 3),
+                    ("Electrical & EV Department", "FACULTY", 3),
+                    ("Mechanical & AMT Department", "FACULTY", 3),
+                    ("Civil & Interior Design Department", "FACULTY", 3),
+                    ("Automobile Engineering Department", "FACULTY", 3),
+                    ("Pharmacy Department", "FACULTY", 3),
+                    ("General Administration", "FACULTY", 3),
+                ]
+                cur.executemany(
+                    "INSERT OR IGNORE INTO departments(name, category, duration_years) VALUES (?, ?, ?)",
+                    departments,
+                )
 
-        cursor.execute("SELECT COUNT(*) FROM settings")
-        if cursor.fetchone()[0]==0:
-            self.set_setting('admin_password', 'admin123')
-            self.set_setting('daily_fine', 10.00)
-            self.set_setting('default_days', 14)
-        self.conn.commit()
+            if cur.execute("SELECT COUNT(*) FROM loan_policies").fetchone()[0] == 0:
+                cur.executemany("""
+                    INSERT OR IGNORE INTO loan_policies
+                    (role, max_books_allowed, default_loan_days, fine_per_day)
+                    VALUES (?, ?, ?, ?)
+                """, [
+                    ("Student", 3, 14, 2.00),
+                    ("Faculty", 8, 30, 1.00),
+                    ("Guest Lecturer", 5, 21, 2.00),
+                    ("Admin", 15, 60, 0.00),
+                    ("Librarian", 10, 30, 0.00),
+                ])
 
-    # --- SETTINGS MANAGEMENT ---
+    def _ensure_column(self, table, column, declaration):
+        existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
+    # SETTINGS
     def get_setting(self, key, default=None):
         try:
-            cursor = self.conn.cursor()
-            row = cursor.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
             return row[0] if row else default
-        except Exception:
+        except sqlite3.Error as exc:
+            logging.error("Could not read setting %s: %s", key, exc)
             return default
+
     def set_setting(self, key, value):
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                INSERT INTO settings (key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """, (key, str(value)))
-            self.conn.commit()
+            with self._transaction():
+                self.conn.execute("""
+                    INSERT INTO settings(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """, (str(key), str(value)))
             return True
-        except Exception as e:
-            self.conn.rollback()
+        except Exception as exc:
+            logging.error("Could not save setting %s: %s", key, exc)
             return False
 
-    # --- USER MANAGEMENT ---
-
-    def insert_user(self, user_id, full_name, phone_number, role, department):
-        cursor = self.conn.cursor()
-        created_at = datetime.datetime.now().strftime("%Y-%m-%d")
-
+    # DEPARTMENTS
+    def get_departments(self, category=None):
         try:
-            cursor.execute("""
-                INSERT INTO users (id, full_name, phone_number, role, department, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (user_id, full_name, phone_number, role, department, created_at))
-            self.conn.commit()
+            if category:
+                rows = self.conn.execute(
+                    "SELECT name FROM departments WHERE category = ? ORDER BY name COLLATE NOCASE",
+                    (self._clean(category).upper(),),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT name FROM departments ORDER BY name COLLATE NOCASE"
+                ).fetchall()
+            return [r[0] for r in rows]
+        except sqlite3.Error:
+            logging.exception("Could not fetch departments")
+            return []
+
+    def get_course_duration(self, department_name: str) -> int:
+        name = self._clean(department_name)
+        if not name or name.upper() in ("N/A", "GENERAL ADMINISTRATION"):
+            return 3
+        try:
+            row = self.conn.execute(
+                "SELECT duration_years FROM departments WHERE name = ? COLLATE NOCASE", (name,)
+            ).fetchone()
+            if row and row[0]:
+                return int(row[0])
+        except (sqlite3.Error, TypeError, ValueError):
+            logging.exception("Could not read course duration")
+        lower = name.lower()
+        if "pharm" in lower:
+            return 2
+        if "arch" in lower:
+            return 5
+        if "b.tech" in lower or "btech" in lower:
+            return 4
+        return 3
+
+    def add_department(self, name, category="STUDENT", duration_years=3):
+        clean_name = self._clean(name)
+        category = self._clean(category).upper()
+        try:
+            duration = int(duration_years)
+            if not clean_name or category not in ("STUDENT", "FACULTY") or duration < 1:
+                return False, "Enter a valid department name, category, and course duration."
+            with self._transaction():
+                self.conn.execute("""
+                    INSERT INTO departments(name, category, duration_years) VALUES (?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        category = excluded.category,
+                        duration_years = excluded.duration_years
+                """, (clean_name, category, duration))
+            return True, "Department and duration saved successfully."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "adding department")
+
+    def update_department(self, dept_id, name, category, duration_years):
+        clean_name = self._clean(name)
+        category = self._clean(category).upper()
+        try:
+            duration = int(duration_years)
+            if not clean_name or category not in ("STUDENT", "FACULTY") or duration < 1:
+                return False, "Enter valid department details."
+            with self._transaction():
+                row = self.conn.execute(
+                    "SELECT name FROM departments WHERE id = ?", (dept_id,)
+                ).fetchone()
+                if not row:
+                    return False, "Department not found."
+                old_name = row[0]
+                self.conn.execute("""
+                    UPDATE departments SET name = ?, category = ?, duration_years = ?
+                    WHERE id = ?
+                """, (clean_name, category, duration, dept_id))
+                if old_name.lower() != clean_name.lower():
+                    self.conn.execute(
+                        "UPDATE users SET department = ? WHERE department = ? COLLATE NOCASE",
+                        (clean_name, old_name),
+                    )
+            return True, "Department updated successfully."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "department update")
+
+    def delete_department(self, name):
+        try:
+            with self._transaction():
+                cur = self.conn.execute(
+                    "DELETE FROM departments WHERE name = ? COLLATE NOCASE", (self._clean(name),)
+                )
+                if cur.rowcount == 0:
+                    return False, "Department not found."
+            return True, "Department removed successfully."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "deleting department")
+
+    # LOAN POLICIES
+    def get_loan_policy(self, role):
+        try:
+            row = self.conn.execute("""
+                SELECT max_books_allowed, default_loan_days, fine_per_day
+                FROM loan_policies WHERE role = ? COLLATE NOCASE
+            """, (self._clean(role),)).fetchone()
+            if row:
+                return {
+                    "max_books": int(row[0]),
+                    "default_days": int(row[1]),
+                    "fine_rate": float(row[2]),
+                }
+        except (sqlite3.Error, TypeError, ValueError):
+            logging.exception("Could not read loan policy")
+        try:
+            days = max(1, int(self.get_setting("default_days", 14)))
+        except (ValueError, TypeError):
+            days = 14
+        fine = self._money(self.get_setting("daily_fine", 2.0), 2.0)
+        return {"max_books": 3, "default_days": days, "fine_rate": fine}
+
+    def get_all_loan_policies(self):
+        try:
+            rows = self.conn.execute("""
+                SELECT role, max_books_allowed, default_loan_days, fine_per_day
+                FROM loan_policies ORDER BY id
+            """).fetchall()
+            return True, rows
+        except sqlite3.Error:
+            logging.exception("Could not fetch loan policies")
+            return False, []
+
+    def update_loan_policy(self, role, max_books, default_days, fine_per_day):
+        try:
+            role = self._clean(role)
+            max_books, default_days = int(max_books), int(default_days)
+            fine = float(fine_per_day)
+            if not role or max_books < 0 or default_days < 1 or fine < 0:
+                return False, "Enter a valid role, non-negative book limit/fine, and loan duration above zero."
+            with self._transaction():
+                self.conn.execute("""
+                    INSERT INTO loan_policies(role, max_books_allowed, default_loan_days, fine_per_day)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(role) DO UPDATE SET
+                        max_books_allowed = excluded.max_books_allowed,
+                        default_loan_days = excluded.default_loan_days,
+                        fine_per_day = excluded.fine_per_day
+                """, (role, max_books, default_days, fine))
+            return True, f"Loan policy for '{role}' updated."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "loan policy update")
+
+    # USERS
+    def insert_user(self, user_id, full_name, phone_number, role, department):
+        uid, name = self._clean(user_id).upper(), self._clean(full_name)
+        phone = self._clean(phone_number) or None
+        role, dept = self._clean(role), self._clean(department)
+        if not uid or not name or not role:
+            return False, "User ID, full name, and role are required."
+        created = datetime.date.today().isoformat()
+        try:
+            with self._transaction():
+                self.conn.execute("""
+                    INSERT INTO users(id, full_name, phone_number, role, department, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (uid, name, phone, role, dept, created))
             return True, "User created successfully."
-        except Exception as e:
-            self.conn.rollback()
-            return False, self._parse_db_error(e, "user registration")
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "user registration")
 
     def get_users(self):
-        cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT id, full_name, phone_number, role, department, created_at FROM users")
-            return True, cursor.fetchall()
-        except Exception as e:
+            rows = self.conn.execute("""
+                SELECT id, full_name, COALESCE(phone_number, ''), role, department, created_at
+                FROM users ORDER BY full_name COLLATE NOCASE
+            """).fetchall()
+            return True, rows
+        except sqlite3.Error:
+            logging.exception("Could not fetch users")
             return False, []
 
     def get_user_details(self, user_id):
-        cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT id, full_name, phone_number, role, department, created_at FROM users WHERE id=?", (user_id,))
-            return True, cursor.fetchone()
-        except Exception:
+            row = self.conn.execute("""
+                SELECT id, full_name, COALESCE(phone_number, ''), role, department, created_at
+                FROM users WHERE id = ?
+            """, (self._clean(user_id),)).fetchone()
+            return True, row
+        except sqlite3.Error:
+            logging.exception("Could not fetch user details")
             return False, None
 
     def edit_user(self, user_id, name, phone_number, role, dept):
-        cursor = self.conn.cursor()
+        name, role = self._clean(name), self._clean(role)
+        phone = self._clean(phone_number) or None
+        if not name or not role:
+            return False, "Full name and role are required."
         try:
-            cursor.execute("""
-                UPDATE users
-                SET full_name=?, phone_number=?, role=?, department=?
-                WHERE id=?
-            """, (name, phone_number, role, dept, user_id))
-            self.conn.commit()
+            with self._transaction():
+                cur = self.conn.execute("""
+                    UPDATE users SET full_name = ?, phone_number = ?, role = ?, department = ?
+                    WHERE id = ?
+                """, (name, phone, role, self._clean(dept), self._clean(user_id)))
+                if cur.rowcount == 0:
+                    return False, "User not found."
             return True, "User details updated successfully."
-        except Exception as e:
-            self.conn.rollback()
-            return False, self._parse_db_error(e, "user update")
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "user update")
 
     def delete_user(self, user_id):
-        cursor = self.conn.cursor()
+        uid = self._clean(user_id)
         try:
-            cursor.execute("""
-                SELECT id FROM circulation_logs 
-                WHERE user_id = ? AND status = 'ISSUED'
-            """, (user_id,))
-            if cursor.fetchone():
-                return False, f"Cannot delete User ID ({user_id}): They currently have active checked-out books."
-
-            cursor.execute("DELETE FROM users WHERE id=?", (user_id,))
-            self.conn.commit()
+            with self._transaction(immediate=True):
+                active = self.conn.execute("""
+                    SELECT 1 FROM circulation_logs WHERE user_id = ? AND status = 'ISSUED' LIMIT 1
+                """, (uid,)).fetchone()
+                if active:
+                    return False, f"Cannot delete User ID ({uid}): They currently have active checked-out books."
+                cur = self.conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+                if cur.rowcount == 0:
+                    return False, "User not found."
             return True, "User has been removed successfully."
-        except Exception as e:
-            self.conn.rollback()
-            return False, self._parse_db_error(e, "user deletion")
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "user deletion")
 
-    # --- BOOK MANAGEMENT ---
-
+    # BOOKS
     def insert_book(self, book_id, title, author, publisher, total, available):
-        cursor = self.conn.cursor()
-        created_at = datetime.datetime.now().strftime("%Y-%m-%d")
-
+        bid, title = self._clean(book_id), self._clean(title)
+        author, publisher = self._clean(author), self._clean(publisher)
         try:
-            cursor.execute("""
-                INSERT INTO books (id, title, author, publisher, total_copies, available_copies, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (book_id, title, author, publisher, total, available, created_at))
-            self.conn.commit()
+            total, available = int(total), int(available)
+            if not bid or not title or total < 1 or available < 0 or available > total:
+                return False, "Enter a valid Book ID, title, total copies, and available copies."
+            with self._transaction():
+                self.conn.execute("""
+                    INSERT INTO books(id, title, author, publisher, total_copies, available_copies, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (bid, title, author, publisher, total, available, datetime.date.today().isoformat()))
             return True, "Book added successfully."
-        except Exception as e:
-            self.conn.rollback()
-            return False, self._parse_db_error(e, "book entry")
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "book entry")
 
     def get_books(self):
-        cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT id, title, author, publisher, total_copies, available_copies, created_at FROM books")
-            return True, cursor.fetchall()
-        except Exception:
+            rows = self.conn.execute("""
+                SELECT id, title, author, publisher, total_copies, available_copies, created_at
+                FROM books ORDER BY title COLLATE NOCASE
+            """).fetchall()
+            return True, rows
+        except sqlite3.Error:
+            logging.exception("Could not fetch books")
             return False, []
 
     def get_book_details(self, book_id):
-        cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT id, title, author, publisher, total_copies, available_copies, created_at FROM books WHERE id=?", (book_id,))
-            return True, cursor.fetchone()
-        except Exception:
+            row = self.conn.execute("""
+                SELECT id, title, author, publisher, total_copies, available_copies, created_at
+                FROM books WHERE id = ?
+            """, (self._clean(book_id),)).fetchone()
+            return True, row
+        except sqlite3.Error:
+            logging.exception("Could not fetch book details")
             return False, None
 
     def edit_book(self, book_id, title, author, publisher, total, available):
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                UPDATE books
-                SET title=?, author=?, publisher=?, total_copies=?, available_copies=?
-                WHERE id=?
-            """, (title, author, publisher, total, available, book_id))
-            self.conn.commit()
+            total, available = int(total), int(available)
+            if not self._clean(title) or total < 0 or available < 0 or available > total:
+                return False, "Invalid book details or copy counts."
+            with self._transaction(immediate=True):
+                row = self.conn.execute("""
+                    SELECT total_copies, available_copies FROM books WHERE id = ?
+                """, (self._clean(book_id),)).fetchone()
+                if not row:
+                    return False, "Book not found."
+                currently_issued = int(row[0]) - int(row[1])
+                if total < currently_issued:
+                    return False, f"Total copies cannot be less than currently issued copies ({currently_issued})."
+                # Preserve actual checked-out count; do not trust a stale UI availability value.
+                available = total - currently_issued
+                self.conn.execute("""
+                    UPDATE books SET title = ?, author = ?, publisher = ?,
+                        total_copies = ?, available_copies = ?
+                    WHERE id = ?
+                """, (self._clean(title), self._clean(author), self._clean(publisher),
+                      total, available, self._clean(book_id)))
             return True, "Book details updated successfully."
-        except Exception as e:
-            self.conn.rollback()
-            return False, self._parse_db_error(e, "book update")
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "book update")
 
     def delete_book(self, book_id):
-        cursor = self.conn.cursor()
+        bid = self._clean(book_id)
         try:
-            cursor.execute("""
-                SELECT id FROM circulation_logs 
-                WHERE book_id = ? AND status = 'ISSUED'
-            """, (book_id,))
-            if cursor.fetchone():
-                return False, f"Cannot delete Book ID ({book_id}): Copies of this book are currently checked out."
+            with self._transaction(immediate=True):
+                active = self.conn.execute("""
+                    SELECT 1 FROM circulation_logs WHERE book_id = ? AND status = 'ISSUED' LIMIT 1
+                """, (bid,)).fetchone()
+                if active:
+                    return False, f"Cannot delete Book ID ({bid}): Copies of this book are currently checked out."
+                cur = self.conn.execute("DELETE FROM books WHERE id = ?", (bid,))
+                if cur.rowcount == 0:
+                    return False, "Book not found."
+            return True, f"Successfully deleted book ({bid})."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "book deletion")
 
-            cursor.execute("DELETE FROM books WHERE id=?", (book_id,))
-            self.conn.commit()
-            return True, f"Successfully deleted book ({book_id})."
-        except Exception as e:
-            self.conn.rollback()
-            return False, self._parse_db_error(e, "book deletion")
-
-    # --- CIRCULATION MANAGEMENT ---
-
+    # CIRCULATION
     def issue_book(self, book_id, user_id, days_allowed=None):
-        if days_allowed is None:
-            try:
-                days_allowed = int(self.get_setting("default_days", 14))
-            except (ValueError, TypeError):
-                days_allowed = 14
-        else:
-            try:
-                days_allowed = int(days_allowed)
-            except (ValueError, TypeError):
-                days_allowed = 14
-
-        cursor = self.conn.cursor()
-        now = datetime.datetime.now()
-        checkout_date = now.strftime("%Y-%m-%d %H:%M")
-        due_date = (now + datetime.timedelta(days=days_allowed)).strftime("%Y-%m-%d %H:%M")
-
+        bid, uid = self._clean(book_id), self._clean(user_id)
         try:
-            cursor.execute("SELECT available_copies FROM books WHERE id = ?", (book_id,))
-            book = cursor.fetchone()
-            if not book:
-                return False, f"Book ID '{book_id}' is not registered in the system."
-            if book[0] <= 0:
-                return False, f"Book ID '{book_id}' has no available copies for checkout."
+            with self._transaction(immediate=True):
+                user = self.conn.execute("SELECT role FROM users WHERE id = ?", (uid,)).fetchone()
+                if not user:
+                    return False, f"User ID '{uid}' is not registered in the system."
+                role = user[0]
+                policy = self.get_loan_policy(role)
+                try:
+                    days = int(days_allowed) if days_allowed is not None else int(policy["default_days"])
+                except (ValueError, TypeError):
+                    days = int(policy["default_days"])
+                if days < 1:
+                    return False, "Loan duration must be at least one day."
 
-            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-            if not cursor.fetchone():
-                return False, f"User ID '{user_id}' is not registered in the system."
+                book = self.conn.execute(
+                    "SELECT available_copies FROM books WHERE id = ?", (bid,)
+                ).fetchone()
+                if not book:
+                    return False, f"Book ID '{bid}' is not registered in the system."
+                if int(book[0]) <= 0:
+                    return False, f"Book ID '{bid}' has no available copies for checkout."
 
-            cursor.execute("""
-                INSERT INTO circulation_logs (book_id, user_id, checkout_date, due_date, status)
-                VALUES (?, ?, ?, ?, 'ISSUED')
-            """, (book_id, user_id, checkout_date, due_date))
+                duplicate = self.conn.execute("""
+                    SELECT 1 FROM circulation_logs
+                    WHERE book_id = ? AND user_id = ? AND status = 'ISSUED' LIMIT 1
+                """, (bid, uid)).fetchone()
+                if duplicate:
+                    return False, f"User '{uid}' already has an active copy of Book ID '{bid}' checked out."
 
-            cursor.execute("UPDATE books SET available_copies = available_copies - 1 WHERE id = ?", (book_id,))
+                active_count = self.conn.execute("""
+                    SELECT COUNT(*) FROM circulation_logs WHERE user_id = ? AND status = 'ISSUED'
+                """, (uid,)).fetchone()[0]
+                if int(active_count) >= int(policy["max_books"]):
+                    return False, (
+                        f"Checkout denied: User has reached the maximum allowed limit of "
+                        f"{policy['max_books']} active loans for role '{role}'."
+                    )
 
-            self.conn.commit()
-            return True, f"Book issued successfully! Due Date: {due_date}"
-
-        except Exception as e:
-            self.conn.rollback()
-            return False, self._parse_db_error(e, "book issue")
+                now = datetime.datetime.now().replace(second=0, microsecond=0)
+                due = now + datetime.timedelta(days=days)
+                checkout_text = now.strftime("%Y-%m-%d %H:%M")
+                due_text = due.strftime("%Y-%m-%d %H:%M")
+                self.conn.execute("""
+                    INSERT INTO circulation_logs(book_id, user_id, checkout_date, due_date, status)
+                    VALUES (?, ?, ?, ?, 'ISSUED')
+                """, (bid, uid, checkout_text, due_text))
+                self.conn.execute("""
+                    UPDATE books SET available_copies = available_copies - 1
+                    WHERE id = ? AND available_copies > 0
+                """, (bid,))
+            return True, f"Book issued successfully! Due Date: {due_text}"
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "book issue")
 
     def return_book(self, book_id, user_id):
-        cursor = self.conn.cursor()
+        bid, uid = self._clean(book_id), self._clean(user_id)
         try:
-            cursor.execute("SELECT id FROM books WHERE id = ?", (book_id,))
-            if not cursor.fetchone():
-                return False, 0.0, f"Book ID '{book_id}' was not found in the library database."
+            with self._transaction(immediate=True):
+                book = self.conn.execute("""
+                    SELECT total_copies, available_copies FROM books WHERE id = ?
+                """, (bid,)).fetchone()
+                if not book:
+                    return False, 0.0, f"Book ID '{bid}' was not found in the library database."
+                user = self.conn.execute("SELECT role FROM users WHERE id = ?", (uid,)).fetchone()
+                if not user:
+                    return False, 0.0, f"User ID '{uid}' was not found in the library database."
 
-            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-            if not cursor.fetchone():
-                return False, 0.0, f"User ID '{user_id}' was not found in the library database."
+                policy = self.get_loan_policy(user[0])
+                record = self.conn.execute("""
+                    SELECT id, due_date FROM circulation_logs
+                    WHERE book_id = ? AND user_id = ? AND status = 'ISSUED'
+                    ORDER BY id DESC LIMIT 1
+                """, (bid, uid)).fetchone()
+                if not record:
+                    return False, 0.0, (
+                        f"No active issue record found matching Book ID '{bid}' and User ID '{uid}'."
+                    )
 
-            now = datetime.datetime.now()
-            timestamp = now.strftime("%Y-%m-%d %H:%M")
+                log_id, due_text = record
+                now = datetime.datetime.now().replace(second=0, microsecond=0)
+                fine_rate = self._money(policy.get("fine_rate", 2.0), 2.0)
+                fine = 0.0
+                if due_text:
+                    try:
+                        due_dt = datetime.datetime.strptime(str(due_text), "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        try:
+                            due_dt = datetime.datetime.strptime(str(due_text)[:10], "%Y-%m-%d")
+                        except ValueError:
+                            due_dt = None
+                    if due_dt and now > due_dt:
+                        # Fine is charged per overdue calendar day, matching the app's date-based policy.
+                        overdue_days = (now.date() - due_dt.date()).days
+                        fine = round(max(0, overdue_days) * fine_rate, 2)
 
-            cursor.execute("""
-                SELECT id, due_date FROM circulation_logs
-                WHERE book_id = ? AND user_id = ? AND status = 'ISSUED'
-                ORDER BY id DESC LIMIT 1
-            """, (book_id, user_id))
-            
-            record = cursor.fetchone()
-            if not record:
-                return False, 0.0, f"No active issue record found matching Book ID '{book_id}' and User ID '{user_id}'."
-
-            log_id, due_date_str = record
-            fine = 0.0
-
-            try:
-                daily_fine_rate = float(self.get_setting('daily_fine', 1.00))
-            except (ValueError, TypeError):
-                daily_fine_rate = 1.00
-
-            if due_date_str:
-                due_date = datetime.datetime.strptime(due_date_str, "%Y-%m-%d %H:%M")
-                if now > due_date:
-                    overdue_days = (now - due_date).days
-                    fine = max(0.0, overdue_days * daily_fine_rate)
-
-            cursor.execute("""
-                UPDATE circulation_logs 
-                SET return_date = ?, fine_amount = ?, status = 'RETURNED'
-                WHERE id = ?
-            """, (timestamp, fine, log_id))
-
-            cursor.execute("UPDATE books SET available_copies = available_copies + 1 WHERE id = ?", (book_id,))
-
-            self.conn.commit()
+                returned_text = now.strftime("%Y-%m-%d %H:%M")
+                self.conn.execute("""
+                    UPDATE circulation_logs
+                    SET return_date = ?, fine_amount = ?, status = 'RETURNED'
+                    WHERE id = ? AND status = 'ISSUED'
+                """, (returned_text, fine, log_id))
+                self.conn.execute("""
+                    UPDATE books SET available_copies = MIN(total_copies, available_copies + 1)
+                    WHERE id = ?
+                """, (bid,))
             return True, fine, "Book returned successfully."
-
-        except Exception as e:
-            self.conn.rollback()
-            return False, 0.0, self._parse_db_error(e, "book return")
+        except Exception as exc:
+            return False, 0.0, self._parse_db_error(exc, "book return")
 
     def get_logs(self):
-        cursor = self.conn.cursor()
         try:
-            cursor.execute("""
-                SELECT 
-                    id, book_id, user_id, 
-                    checkout_date, due_date, return_date, 
-                    fine_amount, status
-                FROM circulation_logs 
-                ORDER BY id DESC
-            """)
-            return True, cursor.fetchall()
-        except Exception:
+            rows = self.conn.execute("""
+                SELECT id, book_id, user_id, checkout_date, due_date, return_date, fine_amount, status
+                FROM circulation_logs ORDER BY id DESC
+            """).fetchall()
+            return True, rows
+        except sqlite3.Error:
+            logging.exception("Could not fetch circulation logs")
             return False, []
 
     def clear_all_logs(self):
-        cursor = self.conn.cursor()
         try:
-            cursor.execute("DELETE FROM circulation_logs")
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='circulation_logs'")
-            self.conn.commit()
+            with self._transaction(immediate=True):
+                active = self.conn.execute(
+                    "SELECT COUNT(*) FROM circulation_logs WHERE status = 'ISSUED'"
+                ).fetchone()[0]
+                if active:
+                    return False, "Cannot clear circulation history while active loans exist."
+                self.conn.execute("DELETE FROM circulation_logs")
+                self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'circulation_logs'")
+                self.conn.execute("UPDATE books SET available_copies = total_copies")
             return True, "Circulation logs cleared successfully."
-        except Exception as e:
-            self.conn.rollback()
-            return False, self._parse_db_error(e, "clearing logs")
-
-    # --- DASHBOARD & STATS ---
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "clearing logs")
 
     def get_user_books_status(self, user_id):
-        cursor = self.conn.cursor()
         try:
-            cursor.execute("""
-                SELECT 
-                    b.id AS book_id,
-                    b.title,
-                    b.author,
-                    b.publisher,
-                    c.status,          
-                    c.checkout_date,   
-                    c.due_date,        
-                    c.return_date,     
-                    c.fine_amount      
-                FROM circulation_logs c
-                JOIN books b ON c.book_id = b.id
-                WHERE c.user_id = ?
-                ORDER BY c.id DESC
-            """, (user_id,))
-            return cursor.fetchall()
-        except Exception as e:
-            logging.error(f"Error getting user books status: {e}")
+            return self.conn.execute("""
+                SELECT b.id, b.title, b.author, b.publisher, c.status,
+                       c.checkout_date, c.due_date, c.return_date, c.fine_amount
+                FROM circulation_logs c JOIN books b ON c.book_id = b.id
+                WHERE c.user_id = ? ORDER BY c.id DESC
+            """, (self._clean(user_id),)).fetchall()
+        except sqlite3.Error:
+            logging.exception("Error getting user books status")
             return []
 
+    # DASHBOARD / REPORTS
     def get_dashboard_details(self):
-        """Returns counts for all dashboard metric tiles: 
-           (total_users, total_books, today_issued, today_due, today_returned, available_books, unpaid_fines)
-        """
-        cursor = self.conn.cursor()
+        today = datetime.date.today().isoformat()
         try:
-            # 1. Total Users
-            cursor.execute("SELECT COUNT(*) FROM users")
-            total_users = cursor.fetchone()[0] or 0
-
-            # 2. Total Books Titles
-            cursor.execute("SELECT COUNT(*) FROM books")
-            total_books = cursor.fetchone()[0] or 0
-
-            # 3. Available Books (sum of available copies on shelf)
-            cursor.execute("SELECT SUM(available_copies) FROM books")
-            available_books = cursor.fetchone()[0] or 0
-
-            # 4. Issued Today (status = 'Issued' or similar on current date)
-            cursor.execute("""
-                SELECT COUNT(*) FROM circulation_logs 
-                WHERE status = 'Issued' AND date(checkout_date) = date('now')
-            """)
-            today_issued = cursor.fetchone()[0] or 0
-
-            # 5. Returned Today
-            cursor.execute("""
-                SELECT COUNT(*) FROM circulation_logs 
-                WHERE status = 'Returned' AND date(return_date) = date('now')
-            """)
-            today_returned = cursor.fetchone()[0] or 0
-
-            # 6. Overdue Books (status = 'Issued' and due_date < current date)
-            cursor.execute("""
-                SELECT COUNT(*) FROM circulation_logs 
-                WHERE status = 'Issued' AND date(due_date) < date('now')
-            """)
-            today_due = cursor.fetchone()[0] or 0
-
-            # 7. Unpaid Fines (sum of fine amounts where status isn't paid or pending collection)
-            cursor.execute("""
-                SELECT SUM(fine_amount) FROM circulation_logs 
-                WHERE fine_amount > 0 AND status != 'Paid'
-            """)
-            unpaid_fines = cursor.fetchone()[0] or 0.0
-
-            return (
-                total_users, 
-                total_books, 
-                today_issued, 
-                today_due, 
-                today_returned, 
-                available_books, 
-                float(unpaid_fines)
-            )
-        except Exception as e:
-            logging.error(f"Error fetching dashboard details: {e}")
-            return 0, 0, 0, 0, 0, 0, 0.0
+            row = self.conn.execute("""
+                SELECT
+                    (SELECT COUNT(*) FROM users),
+                    (SELECT COUNT(*) FROM books),
+                    (SELECT COALESCE(SUM(total_copies), 0) FROM books),
+                    (SELECT COALESCE(SUM(available_copies), 0) FROM books),
+                    (SELECT COUNT(*) FROM circulation_logs WHERE status = 'ISSUED'),
+                    (SELECT COUNT(*) FROM circulation_logs
+                        WHERE status = 'ISSUED' AND substr(checkout_date, 1, 10) = ?),
+                    (SELECT COUNT(*) FROM circulation_logs
+                        WHERE status = 'ISSUED' AND substr(due_date, 1, 10) < ?),
+                    (SELECT COUNT(*) FROM circulation_logs
+                        WHERE status = 'ISSUED' AND substr(due_date, 1, 10) = ?),
+                    (SELECT COALESCE(SUM(fine_amount), 0) FROM circulation_logs
+                        WHERE fine_amount > 0 AND status != 'PAID')
+            """, (today, today, today)).fetchone()
+            return (*row[:8], float(row[8] or 0.0))
+        except sqlite3.Error:
+            logging.exception("Error fetching dashboard details")
+            return (0, 0, 0, 0, 0, 0, 0, 0, 0.0)
 
     def get_recent_activity_logs(self, limit=10):
-        """Fetches recent circulation logs with pre-formatted book and user info."""
-        cursor = self.conn.cursor()
         try:
-            query = """
-                SELECT 
-                    COALESCE(c.status, 'Activity') AS action_type,
-                    COALESCE(b.title, 'Unknown Book') || ' [ID: ' || COALESCE(c.book_id, 'N/A') || ']' AS book_details,
-                    COALESCE(u.full_name, 'Unknown User') AS user_name,
-                    COALESCE(c.checkout_date, 'N/A') AS timestamp
+            limit = max(1, min(int(limit), 500))
+            rows = self.conn.execute("""
+                SELECT COALESCE(c.status, 'Activity'),
+                    COALESCE(b.title, 'Unknown Book') || ' [ID: ' ||
+                        COALESCE(c.book_id, 'N/A') || ']',
+                    COALESCE(u.full_name, 'Unknown User'),
+                    CASE WHEN UPPER(c.status) = 'RETURNED'
+                        THEN COALESCE(c.return_date, c.checkout_date, 'N/A')
+                        ELSE COALESCE(c.checkout_date, 'N/A') END
                 FROM circulation_logs c
                 LEFT JOIN books b ON c.book_id = b.id
                 LEFT JOIN users u ON c.user_id = u.id
-                ORDER BY c.id DESC
-                LIMIT ?
-            """
-            cursor.execute(query, (limit,))
-            rows = cursor.fetchall()
+                ORDER BY c.id DESC LIMIT ?
+            """, (limit,)).fetchall()
             return True, rows
-        except Exception as e:
-            print(f"Error fetching recent logs: {e}")
+        except (sqlite3.Error, ValueError, TypeError):
+            logging.exception("Error fetching recent logs")
             return False, []
+
+    def get_book_circulation_status(self, book_id: str):
+        try:
+            return self.conn.execute("""
+                SELECT user_id, due_date FROM circulation_logs
+                WHERE book_id = ? AND status = 'ISSUED' ORDER BY id DESC LIMIT 1
+            """, (self._clean(book_id),)).fetchone()
+        except sqlite3.Error:
+            logging.exception("Could not get book circulation status")
+            return None
+
+    def get_active_loans_report(self):
+        return self._report_query("""
+            SELECT book_id, user_id, checkout_date, due_date
+            FROM circulation_logs WHERE status = 'ISSUED' ORDER BY due_date
+        """)
+
+    def get_issued_today_report(self, today_str: str):
+        return self._report_query("""
+            SELECT book_id, user_id, checkout_date, due_date
+            FROM circulation_logs
+            WHERE status = 'ISSUED' AND substr(checkout_date, 1, 10) = ?
+            ORDER BY checkout_date DESC
+        """, (today_str,))
+
+    def get_overdue_books_report(self, today_str: str):
+        return self._report_query("""
+            SELECT book_id, user_id, checkout_date, due_date
+            FROM circulation_logs
+            WHERE status = 'ISSUED' AND substr(due_date, 1, 10) < ?
+            ORDER BY due_date
+        """, (today_str,))
+
+    def get_due_today_report(self, today_str: str):
+        return self._report_query("""
+            SELECT book_id, user_id, checkout_date, due_date
+            FROM circulation_logs
+            WHERE status = 'ISSUED' AND substr(due_date, 1, 10) = ?
+            ORDER BY due_date
+        """, (today_str,))
+
+    def get_pending_fines_report(self):
+        return self._report_query("""
+            SELECT user_id, book_id, fine_amount, return_date
+            FROM circulation_logs WHERE fine_amount > 0 AND status != 'PAID'
+            ORDER BY fine_amount DESC
+        """)
+
+    def _report_query(self, query, params=()):
+        try:
+            return True, self.conn.execute(query, params).fetchall()
+        except sqlite3.Error:
+            logging.exception("Could not generate report")
+            return False, []
+
+    def get_all_user_departments(self):
+        try:
+            rows = self.conn.execute("""
+                SELECT department FROM users
+                WHERE department IS NOT NULL AND TRIM(department) != ''
+                UNION
+                SELECT name FROM departments
+            """).fetchall()
+            excluded = {"N/A", "GENERAL ADMINISTRATION"}
+            values = {self._clean(row[0]) for row in rows
+                      if row[0] and self._clean(row[0]).upper() not in excluded}
+            return sorted(values, key=str.casefold)
+        except sqlite3.Error:
+            logging.exception("Could not fetch user departments")
+            return []
+
+    # IMPORT / EXPORT
+    def import_books_batch(self, books_data: list):
+        """Atomically insert or merge books; input rows retain the legacy 7-column format."""
+        if not books_data:
+            return True, 0
+        try:
+            normalized = []
+            for row in books_data:
+                if len(row) != 7:
+                    raise ValueError("Each book import row must contain 7 values.")
+                bid, title, author, publisher, total, available, created = row
+                bid, title = self._clean(bid), self._clean(title)
+                total, available = int(total), int(available)
+                if not bid or not title or total < 0 or available < 0 or available > total:
+                    raise ValueError(f"Invalid book import data for ID '{bid}'.")
+                normalized.append((bid, title, self._clean(author), self._clean(publisher),
+                                   total, available, created or datetime.date.today().isoformat()))
+            with self._transaction(immediate=True):
+                for row in normalized:
+                    bid, title, author, publisher, total, available, created = row
+                    existing = self.conn.execute(
+                        "SELECT total_copies, available_copies FROM books WHERE id = ?", (bid,)
+                    ).fetchone()
+                    if existing:
+                        issued = int(existing[0]) - int(existing[1])
+                        new_total = int(existing[0]) + total
+                        self.conn.execute("""
+                            UPDATE books SET title = ?, author = ?, publisher = ?,
+                                total_copies = ?, available_copies = ?
+                            WHERE id = ?
+                        """, (title, author, publisher, new_total, new_total - issued, bid))
+                    else:
+                        self.conn.execute("""
+                            INSERT INTO books(id, title, author, publisher, total_copies,
+                                available_copies, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, row)
+            return True, len(normalized)
+        except Exception as exc:
+            self.conn.rollback()
+            logging.exception("Book batch import failed")
+            return False, str(exc)
+
+    def import_users_batch(self, users_data: list):
+        """Atomically upsert user rows using the legacy 6-column format."""
+        if not users_data:
+            return True, 0
+        try:
+            normalized = []
+            for row in users_data:
+                if len(row) != 6:
+                    raise ValueError("Each user import row must contain 6 values.")
+                uid, name, phone, role, dept, created = row
+                uid, name, role = self._clean(uid).upper(), self._clean(name), self._clean(role)
+                if not uid or not name or not role:
+                    raise ValueError("Imported users require an ID, full name, and role.")
+                normalized.append((uid, name, self._clean(phone) or None, role,
+                                   self._clean(dept), created or datetime.date.today().isoformat()))
+            with self._transaction(immediate=True):
+                self.conn.executemany("""
+                    INSERT INTO users(id, full_name, phone_number, role, department, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        full_name = excluded.full_name,
+                        phone_number = excluded.phone_number,
+                        role = excluded.role,
+                        department = excluded.department
+                """, normalized)
+            return True, len(normalized)
+        except Exception as exc:
+            self.conn.rollback()
+            logging.exception("User batch import failed")
+            return False, str(exc)
+
+    def export_and_delete_final_year_students(self, output_directory: str,
+                                              skip_active_loans: bool = True):
+        try:
+            os.makedirs(output_directory, exist_ok=True)
+            current_year = datetime.date.today().year
+            students = self.conn.execute("""
+                SELECT id, full_name, COALESCE(phone_number, ''), role, department, created_at
+                FROM users WHERE LOWER(role) = 'student'
+            """).fetchall()
+
+            graduating = []
+            for student in students:
+                try:
+                    prefix = self._clean(student[0])[:2]
+                    admission_year = int("20" + prefix)
+                    duration = self.get_course_duration(student[4])
+                    if current_year - admission_year >= duration - 1:
+                        graduating.append(student)
+                except (ValueError, TypeError):
+                    continue
+
+            if not graduating:
+                return False, 0, "No graduating final-year students found across active course structures."
+
+            ids = [s[0] for s in graduating]
+            marks = ",".join("?" for _ in ids)
+            active_rows = self.conn.execute(f"""
+                SELECT DISTINCT u.id, u.full_name
+                FROM circulation_logs c JOIN users u ON c.user_id = u.id
+                WHERE c.user_id IN ({marks}) AND c.status = 'ISSUED'
+            """, ids).fetchall()
+            active_map = {r[0]: r[1] for r in active_rows}
+
+            skipped = [s for s in graduating if s[0] in active_map]
+            if skipped and not skip_active_loans:
+                names = "\n".join(f"• {s[0]} - {s[1]}" for s in skipped[:10])
+                if len(skipped) > 10:
+                    names += f"\n...and {len(skipped) - 10} more."
+                return False, 0, (
+                    "Cannot archive batch because the following students have active unreturned books:\n\n"
+                    + names
+                )
+
+            archive = [s for s in graduating if s[0] not in active_map]
+            if not archive:
+                return False, 0, "All final-year students have active loans and were skipped."
+
+            filename = f"Graduated_Batch_{current_year - 3}_Archive.csv"
+            path = os.path.join(output_directory, filename)
+            temp_path = path + ".tmp"
+            with open(temp_path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["PIN / ID", "Full Name", "Phone Number", "Role",
+                                 "Department / Branch", "Created At"])
+                writer.writerows(archive)
+            os.replace(temp_path, path)
+
+            archive_ids = [s[0] for s in archive]
+            marks = ",".join("?" for _ in archive_ids)
+            with self._transaction(immediate=True):
+                # Recheck active loans inside the write transaction to avoid a race.
+                active_now = self.conn.execute(f"""
+                    SELECT COUNT(*) FROM circulation_logs
+                    WHERE user_id IN ({marks}) AND status = 'ISSUED'
+                """, archive_ids).fetchone()[0]
+                if active_now:
+                    return False, 0, "Archive cancelled: one or more selected students now have active loans."
+                self.conn.execute(f"DELETE FROM users WHERE id IN ({marks})", archive_ids)
+
+            message = f"Successfully archived {len(archive)} students from the graduating batch."
+            if skipped:
+                message += f"\n\nSkipped {len(skipped)} student(s) with active book loans."
+            return True, len(archive), message
+        except Exception as exc:
+            logging.exception("Final-year archive failed")
+            return False, 0, self._parse_db_error(exc, "batch archiving final year students")
+
+    # MAINTENANCE
+    def backup_database(self, destination_path):
+        """Create a consistent SQLite backup without copying a live WAL database manually."""
+        try:
+            destination_path = os.fspath(destination_path)
+            os.makedirs(os.path.dirname(os.path.abspath(destination_path)), exist_ok=True)
+            with sqlite3.connect(destination_path) as backup_conn:
+                self.conn.backup(backup_conn)
+            return True, destination_path
+        except Exception as exc:
+            logging.exception("Database backup failed")
+            return False, str(exc)
+
+    def get_database_stats(self):
+        """Returns basic database health and storage statistics."""
+        try:
+            page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
+            page_size = self.conn.execute("PRAGMA page_size").fetchone()[0]
+            integrity = self.conn.execute("PRAGMA integrity_check").fetchone()[0]
+            return {
+                "database_path": self.database_path,
+                "size_bytes": page_count * page_size,
+                "integrity": integrity,
+                "journal_mode": self.conn.execute("PRAGMA journal_mode").fetchone()[0],
+            }
+        except sqlite3.Error:
+            logging.exception("Could not read database statistics")
+            return {}
+
+    def close(self):
+        """Close the SQLite connection cleanly. Safe to call more than once."""
+        if getattr(self, "conn", None) is not None:
+            try:
+                self.conn.close()
+            except sqlite3.Error:
+                logging.exception("Error closing database")
+            finally:
+                self.conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()

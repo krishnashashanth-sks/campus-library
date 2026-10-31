@@ -1,716 +1,1982 @@
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem, QLineEdit, QHBoxLayout,
-    QSizePolicy, QHeaderView, QPushButton, QFrame, QLabel, QMessageBox, QFormLayout,
-    QMenu, QInputDialog, QFileDialog
-)
-from dialogs import BookDialog, BarcodeGeneratorDialog, BookHistoryDialog
-from utils import clear_layout
-from PyQt6.QtCore import Qt
+
 import csv
 from datetime import date
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QSizePolicy,
+    QAbstractItemView,
+    QMessageBox,
+    QFileDialog,
+    QMenu,
+    QTabWidget,
+    QFormLayout,
+)
+
+from dialogs import (
+    BookDialog,
+    BarcodeGeneratorDialog,
+    BookHistoryDialog,
+    IssueBookDialog,
+    ReturnBookDialog,
+)
+
+from utils import clear_layout
+
+
+# ============================================================
+# COLORS
+# ============================================================
+
+ACCENT_BLUE = "#3B82F6"
+ACCENT_PURPLE = "#8B5CF6"
+ACCENT_GREEN = "#16A34A"
+ACCENT_ORANGE = "#D97706"
+ACCENT_RED = "#DC2626"
+
+
+# ============================================================
+# INTERACTIVE KPI CARD
+# ============================================================
+
+class MetricCard(QFrame):
+    """
+    Interactive dashboard KPI card.
+
+    Clicking a card emits its filter key to CatalogView.
+    """
+
+    clicked = pyqtSignal(str)
+
+    def __init__(
+        self,
+        title,
+        value="0",
+        accent=ACCENT_BLUE,
+        filter_key="ALL",
+        parent=None,
+    ):
+        super().__init__(parent)
+
+        self.accent = accent
+        self.filter_key = filter_key
+        self.selected = False
+
+        self.setObjectName("MetricCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.setMinimumHeight(88)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(5)
+
+        self.lbl_title = QLabel(title)
+        self.lbl_title.setObjectName("MetricTitle")
+
+        self.lbl_value = QLabel(str(value))
+        self.lbl_value.setObjectName("MetricValue")
+
+        self.lbl_title.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+
+        self.lbl_value.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+
+        layout.addWidget(self.lbl_title)
+        layout.addWidget(self.lbl_value)
+
+        self.apply_style()
+
+    def set_value(self, value):
+        self.lbl_value.setText(str(value))
+
+    def set_selected(self, selected):
+        self.selected = bool(selected)
+        self.apply_style()
+
+    def apply_style(self):
+        background = (
+            "palette(alternate-base)"
+            if self.selected
+            else "palette(base)"
+        )
+
+        border = (
+            self.accent
+            if self.selected
+            else "palette(mid)"
+        )
+
+        self.setStyleSheet(f"""
+            QFrame#MetricCard {{
+                background-color: {background};
+                border: 1px solid {border};
+                border-left: 4px solid {self.accent};
+                border-radius: 9px;
+            }}
+
+            QFrame#MetricCard:hover {{
+                border: 2px solid {self.accent};
+                border-left: 5px solid {self.accent};
+            }}
+
+            QLabel#MetricTitle {{
+                color: palette(placeholder-text);
+                font-size: 10px;
+                font-weight: 700;
+                background: transparent;
+                border: none;
+            }}
+
+            QLabel#MetricValue {{
+                color: {self.accent};
+                font-size: 23px;
+                font-weight: 800;
+                background: transparent;
+                border: none;
+            }}
+        """)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.filter_key)
+
+        super().mousePressEvent(event)
+
+
+# ============================================================
+# CATALOG VIEW
+# ============================================================
 
 class CatalogView(QWidget):
+
+    HEADERS = [
+        "Book ID",
+        "Title",
+        "Author",
+        "Publisher",
+        "Total Copies",
+        "Available",
+        "Added On",
+    ]
+
+    FILTERS = {
+        "ALL": "All Titles",
+        "AVAILABLE": "Available",
+        "ISSUED": "Checked Out",
+        "LOW_STOCK": "Low Stock",
+    }
+
     def __init__(self, db):
         super().__init__()
+
         self.db = db
+
         self.setObjectName("CatalogView")
-        
+
+        self.all_books = []
+        self.current_filter = "ALL"
+        self.current_book_id = None
+        self._updating_table = False
+
+        self.metric_cards = {}
+
+        app = QApplication.instance()
+        self.theme_manager = (
+            getattr(app, "theme_manager", None)
+            if app else None
+        )
+
+        self._build_ui()
+        self._connect_theme_manager()
+        self.apply_theme()
+        self.load_books_to_table()
+
+    # ========================================================
+    # UI CONSTRUCTION
+    # ========================================================
+
+    def _build_ui(self):
+
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(24, 24, 24, 24)
-        main_layout.setSpacing(20)
 
-        # --- Top Action Bar (Search + Add Button) ---
-        top_layout = QHBoxLayout()
-        top_layout.setSpacing(12)
-        
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(12)
+
+        # HEADER
+        header = QHBoxLayout()
+
+        title_column = QVBoxLayout()
+        title_column.setSpacing(2)
+
+        self.lbl_title = QLabel("Book Catalog")
+        self.lbl_title.setObjectName("PageTitle")
+
+        self.lbl_subtitle = QLabel(
+            "Manage physical inventory, import and export CSV data, "
+            "and monitor book availability."
+        )
+        self.lbl_subtitle.setObjectName("PageSubtitle")
+        self.lbl_subtitle.setWordWrap(True)
+
+        title_column.addWidget(self.lbl_title)
+        title_column.addWidget(self.lbl_subtitle)
+
+        header.addLayout(title_column)
+        header.addStretch()
+
+        self.refresh_btn = QPushButton("↻ Refresh")
+        self.refresh_btn.setObjectName("SecondaryButton")
+        self.refresh_btn.setMinimumHeight(35)
+        self.refresh_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.refresh_btn.clicked.connect(
+            self.load_books_to_table
+        )
+
+        header.addWidget(self.refresh_btn)
+        main_layout.addLayout(header)
+
+        # ====================================================
+        # INTERACTIVE KPI CARDS
+        # ====================================================
+
+        metrics_grid = QGridLayout()
+        metrics_grid.setSpacing(10)
+
+        card_definitions = [
+            (
+                "TOTAL TITLES",
+                "0",
+                ACCENT_BLUE,
+                "ALL",
+            ),
+            (
+                "TOTAL COPIES",
+                "0",
+                ACCENT_PURPLE,
+                "ALL",
+            ),
+            (
+                "AVAILABLE",
+                "0",
+                ACCENT_GREEN,
+                "AVAILABLE",
+            ),
+            (
+                "ISSUED",
+                "0",
+                ACCENT_ORANGE,
+                "ISSUED",
+            ),
+            (
+                "LOW STOCK",
+                "0",
+                ACCENT_RED,
+                "LOW_STOCK",
+            ),
+        ]
+
+        for index, definition in enumerate(card_definitions):
+
+            title, value, accent, filter_key = definition
+
+            card = MetricCard(
+                title=title,
+                value=value,
+                accent=accent,
+                filter_key=filter_key,
+                parent=self,
+            )
+
+            card.clicked.connect(
+                self.set_catalog_filter
+            )
+
+            self.metric_cards[title] = card
+
+            metrics_grid.addWidget(
+                card,
+                0,
+                index,
+            )
+
+        metrics_grid.setColumnStretch(0, 1)
+        metrics_grid.setColumnStretch(1, 1)
+        metrics_grid.setColumnStretch(2, 1)
+        metrics_grid.setColumnStretch(3, 1)
+        metrics_grid.setColumnStretch(4, 1)
+
+        main_layout.addLayout(metrics_grid)
+
+        # Default selected card
+        self.metric_cards["TOTAL TITLES"].set_selected(True)
+
+        # ====================================================
+        # TOOLBAR
+        # ====================================================
+
+        toolbar = QFrame()
+        toolbar.setObjectName("CatalogToolbar")
+
+        toolbar_layout = QHBoxLayout(toolbar)
+
+        toolbar_layout.setContentsMargins(10, 8, 10, 8)
+        toolbar_layout.setSpacing(8)
+
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍  Search books by title, author, publisher...")
-        self.search_input.setStyleSheet("""
-            QLineEdit {
-                background-color: #ffffff;
-                color: #0f172a;
-                border: 1px solid #cbd5e1;
-                border-radius: 8px;
-                padding: 10px 14px;
-                font-size: 13px;
-            }
-            QLineEdit:focus {
-                border: 2px solid #3b82f6;
-            }
-        """)
-        self.search_input.textChanged.connect(self.filter_books)
+        self.search_input.setObjectName("CatalogSearch")
 
-        self.import_btn = QPushButton("📥  Import CSV")
-        self.import_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f1f5f9;
-                color: #1e293b;
-                border: 1px solid #cbd5e1;
-                font-weight: 600;
-                font-size: 13px;
-                border-radius: 8px;
-                padding: 10px 14px;
-            }
-            QPushButton:hover { background-color: #e2e8f0; }
-        """)
-        self.import_btn.clicked.connect(self.import_books_from_csv)
+        self.search_input.setPlaceholderText(
+            "Search by ID, title, author or publisher..."
+        )
 
-        self.addbook_btn = QPushButton("＋ Add New Book")
-        self.addbook_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2563eb;
-                color: white;
-                font-weight: 600;
-                font-size: 13px;
-                border-radius: 8px;
-                padding: 10px 18px;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #1d4ed8;
-            }
-        """)
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMinimumHeight(36)
+
+        self.search_input.textChanged.connect(
+            self.apply_filters
+        )
+
+        self.export_btn = QPushButton("Export CSV")
+        self.export_btn.setObjectName("SecondaryButton")
+        self.export_btn.setMinimumHeight(36)
+        self.export_btn.clicked.connect(
+            self.export_books_to_csv
+        )
+
+        self.import_btn = QPushButton("Import CSV")
+        self.import_btn.setObjectName("SecondaryButton")
+        self.import_btn.setMinimumHeight(36)
+        self.import_btn.clicked.connect(
+            self.import_books_from_csv
+        )
+
+        self.addbook_btn = QPushButton("+ Add New Book")
+        self.addbook_btn.setObjectName("PrimaryButton")
+        self.addbook_btn.setMinimumHeight(36)
         self.addbook_btn.clicked.connect(self.add_book)
-        
-        top_layout.addWidget(self.search_input, stretch=4)
-        top_layout.addWidget(self.import_btn, stretch=1)
-        top_layout.addWidget(self.addbook_btn, stretch=1)
-        main_layout.addLayout(top_layout)
 
-        # --- Bottom Section: Table + Inspector Drawer ---
-        bottom_layout = QHBoxLayout()
-        bottom_layout.setSpacing(20)
+        for button in (
+            self.export_btn,
+            self.import_btn,
+            self.addbook_btn,
+        ):
+            button.setCursor(
+                Qt.CursorShape.PointingHandCursor
+            )
 
+        toolbar_layout.addWidget(self.search_input, 1)
+        toolbar_layout.addWidget(self.export_btn)
+        toolbar_layout.addWidget(self.import_btn)
+        toolbar_layout.addWidget(self.addbook_btn)
+
+        main_layout.addWidget(toolbar)
+
+        # ====================================================
+        # FILTER BAR
+        # ====================================================
+
+        filter_frame = QFrame()
+        filter_frame.setObjectName("FilterBar")
+
+        filter_layout = QHBoxLayout(filter_frame)
+
+        filter_layout.setContentsMargins(6, 4, 6, 4)
+        filter_layout.setSpacing(4)
+
+        self.filter_buttons = {}
+
+        for key, label in self.FILTERS.items():
+
+            button = QPushButton(label)
+            button.setObjectName("FilterButton")
+            button.setCheckable(True)
+            button.setChecked(key == "ALL")
+
+            button.setCursor(
+                Qt.CursorShape.PointingHandCursor
+            )
+
+            button.clicked.connect(
+                lambda checked=False, selected=key:
+                self.set_catalog_filter(selected)
+            )
+
+            self.filter_buttons[key] = button
+
+            filter_layout.addWidget(button)
+
+        filter_layout.addStretch()
+
+        self.lbl_count = QLabel("0 titles")
+        self.lbl_count.setObjectName("CountLabel")
+
+        filter_layout.addWidget(self.lbl_count)
+
+        main_layout.addWidget(filter_frame)
+
+        # ====================================================
+        # CONTENT AREA
+        # ====================================================
+
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(12)
+
+        # BOOK TABLE
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
-        
-        # Connect selection model change safely
-        self.table.selectionModel().selectionChanged.connect(self.on_books_selection_changed)
+
+        self.table.setObjectName("CatalogTable")
+
+        self.table.setColumnCount(len(self.HEADERS))
+        self.table.setHorizontalHeaderLabels(self.HEADERS)
+
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(43)
 
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.setHorizontalHeaderLabels(["ID", "Title", "Author", "Publisher", "Total", "Available", "Added On"])
-        
-        # Professional Table Styling with Smooth Rounded Corners & No Focus Lines
-        self.table.setStyleSheet("""
-            QTableWidget {
-                background-color: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 12px;
-                gridline-color: #f1f5f9;
-                color: #1e293b;
-                selection-background-color: #eff6ff;
-                selection-color: #1d4ed8;
-                outline: none;
-            }
-            QTableWidget::item {
-                padding: 12px 10px;
-                border-bottom: 1px solid #f1f5f9;
-            }
-            QTableWidget::item:selected {
-                background-color: #eff6ff;
-                color: #1d4ed8;
-                outline: none;
-            }
-            QTableWidget::item:focus {
-                border: none;
-                outline: none;
-            }
-            QHeaderView::section {
-                background-color: #f8fafc;
-                color: #475569;
-                font-weight: bold;
-                font-size: 12px;
-                border: none;
-                border-bottom: 2px solid #e2e8f0;
-                padding: 12px 10px;
-            }
-            QHeaderView::section:first {
-                border-top-left-radius: 12px;
-            }
-            QHeaderView::section:last {
-                border-top-right-radius: 12px;
-            }
-        """)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        
-        # REMOVED self.table.cellClicked.connect to prevent conflict with selectionChanged!
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self.show_context_menu)
-        
-        bottom_layout.addWidget(self.table, stretch=3)
 
-        # --- Right-Side Inspector Panel (Clean SaaS Card) ---
+        header.setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+
+        header.setMinimumSectionSize(65)
+        header.setHighlightSections(False)
+
+        self.table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+
+        self.table.customContextMenuRequested.connect(
+            self.show_context_menu
+        )
+
+        self.table.itemSelectionChanged.connect(
+            self.on_books_selection_changed
+        )
+
+        content_layout.addWidget(self.table, 1)
+
+        # ====================================================
+        # BOOK INSPECTOR
+        # ====================================================
+
         self.detail_container = QFrame()
-        self.detail_container.setFixedWidth(300)
-        self.detail_container.setStyleSheet("""
-            QFrame {
-                background-color: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 12px;
-            }
-        """)
-        
-        self.detail_layout = QVBoxLayout(self.detail_container)
-        self.detail_layout.setContentsMargins(16, 16, 16, 16)
-        self.detail_layout.setSpacing(12)
-        
+        self.detail_container.setObjectName("BookInspector")
+
+        self.detail_container.setMinimumWidth(265)
+        self.detail_container.setMaximumWidth(330)
+
+        self.detail_container.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+        )
+
+        inspector_layout = QVBoxLayout(
+            self.detail_container
+        )
+
+        inspector_layout.setContentsMargins(10, 10, 10, 10)
+        inspector_layout.setSpacing(8)
+
+        self.inspector_title = QLabel(
+            "Book Control Center"
+        )
+        self.inspector_title.setObjectName("SectionTitle")
+
+        inspector_layout.addWidget(
+            self.inspector_title
+        )
+
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setObjectName("InspectorTabs")
+
+        # DETAILS TAB
+        self.tab_overview = QWidget()
+
+        self.overview_layout = QVBoxLayout(
+            self.tab_overview
+        )
+
+        self.overview_layout.setContentsMargins(
+            8, 8, 8, 8
+        )
+
+        self.overview_layout.setSpacing(8)
+
+        self.tab_widget.addTab(
+            self.tab_overview,
+            "Details",
+        )
+
+        # ACTIONS TAB
+        self.tab_actions = QWidget()
+
+        self.actions_layout = QVBoxLayout(
+            self.tab_actions
+        )
+
+        self.actions_layout.setContentsMargins(
+            8, 8, 8, 8
+        )
+
+        self.actions_layout.setSpacing(6)
+
+        self.tab_widget.addTab(
+            self.tab_actions,
+            "Actions",
+        )
+
+        inspector_layout.addWidget(
+            self.tab_widget
+        )
+
+        content_layout.addWidget(
+            self.detail_container
+        )
+
+        main_layout.addLayout(
+            content_layout,
+            1,
+        )
+
         self.show_default_inspector()
 
-        bottom_layout.addWidget(self.detail_container, stretch=0)
-        main_layout.addLayout(bottom_layout)
+    # ========================================================
+    # THEME MANAGEMENT
+    # ========================================================
 
-        self.setStyleSheet("""
-            #CatalogView {
-                background-color: #f8fafc;
-            }
+    def _connect_theme_manager(self):
+
+        if self.theme_manager is None:
+            return
+
+        signal = getattr(
+            self.theme_manager,
+            "themeChanged",
+            None,
+        )
+
+        if signal is not None:
+            try:
+                signal.connect(self.apply_theme)
+            except (TypeError, RuntimeError):
+                pass
+
+    def _get_colors(self):
+
+        if self.theme_manager is not None:
+
+            try:
+                active_theme = (
+                    self.theme_manager.get_active_theme()
+                )
+
+                colors = (
+                    self.theme_manager.COLORS.get(
+                        active_theme
+                    )
+                )
+
+                if colors:
+                    return colors
+
+            except Exception:
+                pass
+
+        return {
+            "window": "#0B1220",
+            "surface": "#111C2E",
+            "surface_alt": "#17243A",
+            "input": "#0F1B2D",
+            "border": "#293B55",
+            "text": "#E8EEF8",
+            "muted": "#94A3B8",
+            "primary": "#3B82F6",
+            "primary_hover": "#2563EB",
+            "selection": "#1D4ED8",
+            "success": "#16A34A",
+            "warning": "#D97706",
+            "danger": "#DC2626",
+        }
+
+    def apply_theme(self, *_):
+
+        c = self._get_colors()
+
+        self.setStyleSheet(f"""
+            QWidget#CatalogView {{
+                background-color: {c["window"]};
+                color: {c["text"]};
+                font-family: "Segoe UI";
+                font-size: 12px;
+            }}
+
+            QLabel {{
+                background: transparent;
+            }}
+
+            QLabel#PageTitle {{
+                font-size: 23px;
+                font-weight: 700;
+                color: {c["text"]};
+            }}
+
+            QLabel#PageSubtitle {{
+                font-size: 12px;
+                color: {c["muted"]};
+            }}
+
+            QLabel#SectionTitle {{
+                font-size: 14px;
+                font-weight: 700;
+                color: {c["text"]};
+            }}
+
+            QFrame#MetricCard {{
+                background-color: {c["surface"]};
+                border: 1px solid {c["border"]};
+                border-radius: 9px;
+            }}
+
+            QLabel#MetricTitle {{
+                font-size: 10px;
+                font-weight: 700;
+                color: {c["muted"]};
+            }}
+
+            QFrame#CatalogToolbar,
+            QFrame#FilterBar,
+            QFrame#BookInspector {{
+                background-color: {c["surface"]};
+                border: 1px solid {c["border"]};
+                border-radius: 10px;
+            }}
+
+            QLineEdit#CatalogSearch {{
+                background-color: {c["input"]};
+                color: {c["text"]};
+                border: 1px solid {c["border"]};
+                border-radius: 7px;
+                padding: 9px 12px;
+                font-size: 12px;
+            }}
+
+            QLineEdit#CatalogSearch:focus {{
+                border: 1px solid {c["primary"]};
+            }}
+
+            QPushButton {{
+                font-size: 12px;
+                font-weight: 600;
+                border-radius: 7px;
+                padding: 8px 13px;
+            }}
+
+            QPushButton#PrimaryButton {{
+                background-color: {c["primary"]};
+                color: white;
+                border: none;
+            }}
+
+            QPushButton#PrimaryButton:hover {{
+                background-color: {c["primary_hover"]};
+            }}
+
+            QPushButton#SecondaryButton {{
+                background-color: {c["surface_alt"]};
+                color: {c["text"]};
+                border: 1px solid {c["border"]};
+            }}
+
+            QPushButton#SecondaryButton:hover {{
+                border-color: {c["primary"]};
+            }}
+
+            QPushButton#DangerButton {{
+                background-color: rgba(220, 38, 38, 0.15);
+                color: {c["danger"]};
+                border: 1px solid {c["danger"]};
+            }}
+
+            QPushButton#FilterButton {{
+                background: transparent;
+                color: {c["muted"]};
+                border: none;
+                padding: 7px 12px;
+            }}
+
+            QPushButton#FilterButton:checked {{
+                background-color: {c["primary"]};
+                color: white;
+                border-radius: 4px;
+            }}
+
+            QTableWidget#CatalogTable {{
+                background-color: {c["surface"]};
+                alternate-background-color: {c["surface_alt"]};
+                color: {c["text"]};
+                border: 1px solid {c["border"]};
+                border-radius: 9px;
+                selection-background-color: {c["selection"]};
+                selection-color: white;
+                outline: none;
+            }}
+
+            QTableWidget#CatalogTable::item {{
+                padding: 8px;
+                border-bottom: 1px solid {c["border"]};
+            }}
+
+            QHeaderView::section {{
+                background-color: {c["surface_alt"]};
+                color: {c["muted"]};
+                border: none;
+                border-bottom: 1px solid {c["border"]};
+                padding: 11px 8px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+
+            QTabWidget::pane {{
+                border: 1px solid {c["border"]};
+                background: {c["surface"]};
+                border-radius: 6px;
+            }}
+
+            QTabBar::tab {{
+                background: {c["surface_alt"]};
+                color: {c["muted"]};
+                padding: 6px 12px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+
+            QTabBar::tab:selected {{
+                background: {c["primary"]};
+                color: white;
+            }}
         """)
-        self.load_books_to_table()
-        
-    def show_default_inspector(self):
-        clear_layout(self.detail_layout)
-        lbl_header = QLabel("Book Inspector")
-        lbl_header.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: bold; border: none; background: transparent;")
-        self.detail_layout.addWidget(lbl_header)
-        
-        hint = QLabel("Select any book row from the catalog table to view full details, check stock levels, or manage records.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #64748b; font-size: 13px; border: none; background: transparent; padding-top: 20px;")
-        self.detail_layout.addWidget(hint)
-        self.detail_layout.addStretch()
+
+        for card in self.metric_cards.values():
+            card.apply_style()
+
+        self._refresh_inspector_theme()
+
+    def _refresh_inspector_theme(self):
+
+        if self.current_book_id:
+            self.display_book_details_by_id(
+                self.current_book_id
+            )
+        else:
+            self.show_default_inspector()
+
+    # ========================================================
+    # INVENTORY HELPERS
+    # ========================================================
+
+    @staticmethod
+    def _book_counts(book):
+
+        try:
+            total = max(
+                0,
+                int(book[4] or 0),
+            )
+        except (ValueError, TypeError, IndexError):
+            total = 0
+
+        try:
+            available = max(
+                0,
+                int(book[5] or 0),
+            )
+        except (ValueError, TypeError, IndexError):
+            available = 0
+
+        return total, min(available, total)
+
+    def update_metrics(self):
+
+        total_titles = len(self.all_books)
+
+        total_copies = 0
+        available_copies = 0
+        low_stock = 0
+
+        for book in self.all_books:
+
+            if len(book) < 6:
+                continue
+
+            total, available = self._book_counts(book)
+
+            total_copies += total
+            available_copies += available
+
+            if 0 < available <= 2:
+                low_stock += 1
+
+        issued_copies = max(
+            0,
+            total_copies - available_copies,
+        )
+
+        self.metric_cards["TOTAL TITLES"].set_value(
+            f"{total_titles:,}"
+        )
+
+        self.metric_cards["TOTAL COPIES"].set_value(
+            f"{total_copies:,}"
+        )
+
+        self.metric_cards["AVAILABLE"].set_value(
+            f"{available_copies:,}"
+        )
+
+        self.metric_cards["ISSUED"].set_value(
+            f"{issued_copies:,}"
+        )
+
+        self.metric_cards["LOW STOCK"].set_value(
+            f"{low_stock:,}"
+        )
+
+    # ========================================================
+    # LOAD AND FILTER BOOKS
+    # ========================================================
 
     def load_books_to_table(self):
-        success, rows = self.db.get_books()
-        if not success:
-            QMessageBox.warning(self, "Failed", "Unable to load the books")
-            return 
-        self.table.setRowCount(len(rows))
-        for row_id, row_data in enumerate(rows):
-            for col_id, col_data in enumerate(row_data):
-                item = QTableWidgetItem(str(col_data) or "")
-                self.table.setItem(row_id, col_id, item)
 
-    def display_book_details(self, row):
-        id_item = self.table.item(row, 0)
-        if not id_item:
-            return
-        book_id = id_item.text()
-        success, book = self.db.get_book_details(book_id)
-        if not success:
-            QMessageBox.warning(self, "Failed", f"Unable to load book ({book_id}) details")
-            return
-            
-        clear_layout(self.detail_layout)
-        
-        lbl_header = QLabel("Book Control Center")
-        lbl_header.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: bold; border: none; background: transparent;")
-        
-        self.lbl_id = QLabel(str(book[0]))
-        self.lbl_title = QLabel(str(book[1]))
-        self.lbl_author = QLabel(str(book[2]))
-        self.lbl_publisher = QLabel(str(book[3]))
-        self.lbl_total = QLabel(str(book[4]))
-        self.lbl_available = QLabel(str(book[5]))
-        self.lbl_created = QLabel(str(book[6]))
-        
-        for lbl in (self.lbl_id, self.lbl_title, self.lbl_author, self.lbl_publisher, self.lbl_total, self.lbl_available, self.lbl_created):
-            lbl.setStyleSheet("color: #334155; font-size: 12px; border: none; background: transparent;")
-            lbl.setWordWrap(True)
-            
-        self.lbl_available.setStyleSheet("color: #10b981; font-weight: bold; font-size: 12px; border: none; background: transparent;")
+        selected_id = self.current_book_id
 
-        # --- LIVE CHECKOUT STATUS QUERY ---
-        status_text = "🟢 Available on Shelf"
-        status_style = "background-color: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; border-radius: 6px; padding: 8px; font-size: 12px; font-weight: 600;"
-        
         try:
-            cursor = self.db.conn.cursor()
-            cursor.execute("""
-                SELECT user_id, due_date FROM circulation_logs 
-                WHERE book_id = ? AND status = 'ISSUED' LIMIT 1
-            """, (book_id,))
-            active_loan = cursor.fetchone()
-            if active_loan:
-                borrower_id, due_date = active_loan
-                status_text = f"🔴 Checked Out\n• User ID: {borrower_id}\n• Due: {due_date}"
-                status_style = "background-color: #fef2f2; color: #991b1b; border: 1px solid #fecaca; border-radius: 6px; padding: 8px; font-size: 12px; font-weight: 600;"
-        except Exception:
-            pass
 
-        self.lbl_status_banner = QLabel(status_text)
-        self.lbl_status_banner.setWordWrap(True)
-        self.lbl_status_banner.setStyleSheet(status_style)
+            result = self.db.get_books()
 
-        # --- Action Buttons ---
-        issue_btn = QPushButton("📤 Issue Book")
-        return_btn = QPushButton("📥 Return Book")
-        barcode_btn = QPushButton("🖨️ Print Barcode")
-        history_btn = QPushButton("📜 View Audit History")
-        edit_btn = QPushButton("✏️ Edit Record")
-        delete_btn = QPushButton("🗑️ Delete Book")
-        
-        issue_btn.clicked.connect(lambda: self.handle_issue_book(book[0], book[1]))
-        return_btn.clicked.connect(lambda: self.handle_return_book(book[0], book[1]))
-        barcode_btn.clicked.connect(lambda: self.open_barcode_dialog_for_selected(book[0]))
-        history_btn.clicked.connect(lambda: self.open_book_history(book[0], book[1]))
-        edit_btn.clicked.connect(lambda: self.edit_book(book[0]))
-        delete_btn.clicked.connect(lambda: self.delete_book(book[0]))
-        
-        # Styles for buttons...
-        issue_btn.setStyleSheet("QPushButton { background-color: #2563eb; color: white; border-radius: 6px; font-weight: 600; font-size: 12px; padding: 8px 12px; text-align: left; border: none; } QPushButton:hover { background-color: #1d4ed8; }")
-        return_btn.setStyleSheet("QPushButton { background-color: #10b981; color: white; border-radius: 6px; font-weight: 600; font-size: 12px; padding: 8px 12px; text-align: left; border: none; } QPushButton:hover { background-color: #059669; }")
+            if (
+                not isinstance(result, tuple)
+                or len(result) != 2
+            ):
+                return
 
-        for btn in [barcode_btn, history_btn, edit_btn]:
-            btn.setStyleSheet("QPushButton { background-color: #f1f5f9; color: #1e293b; border: 1px solid #cbd5e1; border-radius: 6px; font-weight: 600; font-size: 12px; padding: 8px 12px; text-align: left; } QPushButton:hover { background-color: #e2e8f0; }")
+            success, rows = result
 
-        delete_btn.setStyleSheet("QPushButton { background-color: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); border-radius: 6px; font-weight: 600; font-size: 12px; padding: 8px 12px; text-align: left; } QPushButton:hover { background-color: #ef4444; color: white; }")
+            if not success:
+                return
 
-        self.detail_layout.addWidget(lbl_header)
-        self.detail_layout.addWidget(self.lbl_status_banner) # Add the gorgeous status card right at the top!
-        
-        form_layout = QFormLayout()
-        form_layout.setSpacing(6)
-        form_layout.addRow(QLabel("<b>ID:</b>"), self.lbl_id)
-        form_layout.addRow(QLabel("<b>Title:</b>"), self.lbl_title)
-        form_layout.addRow(QLabel("<b>Author:</b>"), self.lbl_author)
-        form_layout.addRow(QLabel("<b>Publisher:</b>"), self.lbl_publisher)
-        form_layout.addRow(QLabel("<b>Total:</b>"), self.lbl_total)
-        form_layout.addRow(QLabel("<b>Available:</b>"), self.lbl_available)
-        form_layout.addRow(QLabel("<b>Added:</b>"), self.lbl_created)
-        
-        for i in range(form_layout.rowCount()):
-            label_item = form_layout.itemAt(i, QFormLayout.ItemRole.LabelRole)
-            if label_item and label_item.widget():
-                label_item.widget().setStyleSheet("color: #64748b; font-size: 12px; border: none; background: transparent;")
+            self.all_books = list(rows or [])
 
-        self.detail_layout.addLayout(form_layout)
-        self.detail_layout.addStretch()
-        
-        self.detail_layout.addWidget(issue_btn)
-        self.detail_layout.addWidget(return_btn)
-        self.detail_layout.addWidget(barcode_btn)
-        self.detail_layout.addWidget(history_btn)
-        self.detail_layout.addWidget(edit_btn)
-        self.detail_layout.addWidget(delete_btn)
-            
-    def add_book(self):
-        dialog = BookDialog(self.db)
-        dialog.data_updated.connect(self.load_books_to_table)
-        dialog.exec()
-        
-    def filter_books(self):
-        query = self.search_input.text().lower().strip()
-        for row in range(self.table.rowCount()):
-            match_found = False
-            for col in range(self.table.columnCount()):
-                item = self.table.item(row, col)
-                if item and query in item.text().lower():
-                    match_found = True
-                    break
-            self.table.setRowHidden(row, not match_found)
-            
-    def handle_issue_book(self, book_id, book_title):
-        user_id, ok = QInputDialog.getText(self, "Issue Book", f"Enter User ID to issue '{book_title}':")
-        if not ok or not user_id.strip():
+            self.update_metrics()
+
+            self.apply_filters(
+                preserve_selection=False
+            )
+
+            if selected_id:
+                self.select_book_by_id(selected_id)
+
+        except Exception as exc:
+
+            QMessageBox.critical(
+                self,
+                "Catalog Loading Error",
+                str(exc),
+            )
+
+    def set_catalog_filter(self, key):
+
+        if key not in self.FILTERS:
             return
 
-        days_allowed, ok_days = QInputDialog.getInt(self, "Issue Duration", "Enter the number of days allowed?", 14, 1, 365, 1)
-        if not ok_days:
-            return
+        self.current_filter = key
 
-        success, msg = self.db.issue_book(book_id, user_id.strip(), days_allowed)
-        if success:
-            QMessageBox.information(self, "Success", f"Book successfully issued for {days_allowed} days!")
-            
-            current_row = self.table.currentRow()
-            self.load_books_to_table()
-            if current_row >= 0 and current_row < self.table.rowCount():
-                self.table.selectRow(current_row)
-                self.display_book_details(current_row)  # <--- Explicitly refresh the control center!
-            else:
-                self.show_default_inspector()
-        else:
-            QMessageBox.warning(self, "Action Failed", msg)
+        # Synchronize KPI card highlights
+        for card in self.metric_cards.values():
 
-    def handle_return_book(self, book_id, book_title):
-        user_id, ok = QInputDialog.getText(self, "Return Book", f"Enter User ID returning '{book_title}':")
-        if not ok or not user_id.strip():
-            return
+            card.set_selected(
+                card.filter_key == key
+            )
 
-        success, fine, msg = self.db.return_book(book_id, user_id.strip())
-        
-        if success:
-            if fine > 0.0:
-                QMessageBox.information(
-                    self, 
-                    "Book Returned with Fine", 
-                    f"Book returned successfully!\n\n⚠️ Overdue Fine Applied: ₹{fine:.2f}"
-                )
-            else:
-                QMessageBox.information(self, "Success", f"{msg}\nNo overdue fines.")
-            
-            current_row = self.table.currentRow()
-            self.load_books_to_table()
-            if current_row >= 0 and current_row < self.table.rowCount():
-                self.table.selectRow(current_row)
-                self.display_book_details(current_row)  # <--- Explicitly refresh the control center!
-            else:
-                self.show_default_inspector()
-        else:
-            QMessageBox.warning(self, "Action Failed", str(msg))
-            
-    def edit_book(self, book_id):
-        dialog = BookDialog(self.db, book_id=book_id)
-        dialog.exec()
-        self.load_books_to_table()
-        self.show_default_inspector()
-        
-    def delete_book(self, book_id):
-        confirm = QMessageBox.question(
-            self, "Confirm Deletion",
-            f"Are you sure you want to delete book {book_id}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        # Synchronize regular filter buttons
+        for filter_key, button in self.filter_buttons.items():
+
+            button.setChecked(
+                filter_key == key
+            )
+
+        self.apply_filters()
+
+    def reset_catalog_filter(self):
+
+        self.set_catalog_filter("ALL")
+
+    def apply_filters(
+        self,
+        *_args,
+        preserve_selection=True,
+    ):
+
+        selected_id = (
+            self.current_book_id
+            if preserve_selection
+            else None
         )
-        if confirm == QMessageBox.StandardButton.Yes:
-            success, message = self.db.delete_book(book_id)
-            if success:
-                QMessageBox.information(self, "Success", message)
-                self.show_default_inspector()
-                self.load_books_to_table()
-            else:
-                QMessageBox.warning(self, "Failed", message)
-                
-    def show_context_menu(self, pos):
-        """Displays a rich context menu with all book management and circulation actions."""
-        index = self.table.indexAt(pos)
-        if not index.isValid():
-            return
-            
-        row = index.row()
-        id_item = self.table.item(row, 0)
-        title_item = self.table.item(row, 1)
-        
-        if not id_item:
-            return
-            
-        book_id = id_item.text()
-        book_title = title_item.text() if title_item else "Unknown Title"
 
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #1e293b;
-                color: #f8fafc;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 6px 24px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #3b82f6;
-                color: white;
-            }
+        query = (
+            self.search_input.text()
+            .strip()
+            .casefold()
+        )
+
+        filtered = []
+
+        for book in self.all_books:
+
+            if len(book) < 7:
+                continue
+
+            total, available = self._book_counts(book)
+
+            # AVAILABLE
+            if self.current_filter == "AVAILABLE":
+
+                if available <= 0:
+                    continue
+
+            # ISSUED
+            elif self.current_filter == "ISSUED":
+
+                if available >= total:
+                    continue
+
+            # LOW STOCK
+            elif self.current_filter == "LOW_STOCK":
+
+                if available <= 0 or available > 2:
+                    continue
+
+            # SEARCH
+            searchable = " ".join(
+                str(value or "")
+                for value in book[:4]
+            ).casefold()
+
+            if query and query not in searchable:
+                continue
+
+            filtered.append(book)
+
+        self.populate_table(filtered)
+
+        if selected_id:
+            self.select_book_by_id(selected_id)
+
+    # ========================================================
+    # TABLE POPULATION
+    # ========================================================
+
+    def populate_table(self, rows):
+
+        self._updating_table = True
+        self.table.blockSignals(True)
+
+        try:
+
+            self.table.clearContents()
+            self.table.setRowCount(len(rows))
+
+            c = self._get_colors()
+
+            for row_index, book in enumerate(rows):
+
+                _, available = self._book_counts(book)
+
+                for col_idx, value in enumerate(book[:7]):
+
+                    item = QTableWidgetItem(
+                        str(
+                            value
+                            if value is not None
+                            else ""
+                        )
+                    )
+
+                    if col_idx in (0, 4, 5):
+
+                        item.setTextAlignment(
+                            Qt.AlignmentFlag.AlignCenter
+                        )
+
+                    if col_idx == 5:
+
+                        if available <= 0:
+                            color = c["danger"]
+
+                        elif available <= 2:
+                            color = c["warning"]
+
+                        else:
+                            color = c["success"]
+
+                        item.setForeground(
+                            QColor(color)
+                        )
+
+                    self.table.setItem(
+                        row_index,
+                        col_idx,
+                        item,
+                    )
+
+        finally:
+
+            self.table.blockSignals(False)
+            self._updating_table = False
+
+        self.lbl_count.setText(
+            f"{len(rows):,} titles"
+        )
+
+        if not rows:
+
+            self.current_book_id = None
+            self.show_default_inspector()
+
+    def select_book_by_id(self, book_id):
+
+        target = str(book_id)
+
+        for row in range(self.table.rowCount()):
+
+            item = self.table.item(row, 0)
+
+            if item and item.text() == target:
+
+                self.table.selectRow(row)
+                self.current_book_id = target
+
+                return True
+
+        return False
+
+    # ========================================================
+    # BOOK INSPECTOR
+    # ========================================================
+
+    def show_default_inspector(self):
+
+        self.current_book_id = None
+
+        clear_layout(self.overview_layout)
+        clear_layout(self.actions_layout)
+
+        c = self._get_colors()
+
+        label = QLabel(
+            "Select a book from the catalog to view its "
+            "information, availability and management actions."
+        )
+
+        label.setWordWrap(True)
+
+        label.setStyleSheet(
+            f"color: {c['muted']}; font-size: 12px;"
+        )
+
+        self.overview_layout.addWidget(label)
+        self.overview_layout.addStretch()
+
+    def display_book_details_by_id(self, book_id):
+
+        try:
+
+            success, book = self.db.get_book_details(
+                str(book_id)
+            )
+
+            if not success or not book:
+                return
+
+        except Exception:
+            return
+
+        self.current_book_id = str(book[0])
+
+        clear_layout(self.overview_layout)
+        clear_layout(self.actions_layout)
+
+        c = self._get_colors()
+
+        total, available = self._book_counts(book)
+
+        issued = max(
+            0,
+            total - available,
+        )
+
+        # STATUS
+        status = (
+            "AVAILABLE"
+            if available > 0
+            else "OUT OF STOCK"
+        )
+
+        status_label = QLabel(
+            f"{status}\n"
+            f"{available} of {total} copies available"
+        )
+
+        status_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+        status_label.setStyleSheet(f"""
+            background: {
+                c['success'] if available > 0
+                else c['danger']
+            };
+            color: white;
+            border-radius: 6px;
+            padding: 8px;
+            font-weight: 700;
+            font-size: 10px;
         """)
 
-        # Actions
-        issue_action = menu.addAction("📤 Issue Book")
-        return_action = menu.addAction("📥 Return Book")
-        menu.addSeparator()
-        barcode_action = menu.addAction("🖨️ Print Barcode")
-        edit_action = menu.addAction("✏️ Edit Book")
-        delete_action = menu.addAction("🗑️ Delete Book")
+        self.overview_layout.addWidget(
+            status_label
+        )
 
-        action = menu.exec(self.table.viewport().mapToGlobal(pos))
+        # BOOK INFORMATION
+        form = QFormLayout()
 
-        if action == issue_action:
-            self.handle_issue_book(book_id, book_title)
-        elif action == return_action:
-            self.handle_return_book(book_id, book_title)
-        elif action == barcode_action:
-            self.open_barcode_dialog_for_selected(book_id)
-        elif action == edit_action:
-            self.edit_book(book_id)
-        elif action == delete_action:
-            self.delete_book(book_id)
+        form.setContentsMargins(0, 4, 0, 4)
+        form.setVerticalSpacing(8)
 
-    def open_barcode_dialog_for_selected(self, book_id=""):
-        if book_id:
-            success, book = self.db.get_book_details(book_id)
-            if success and book:
-                dialog = BarcodeGeneratorDialog(
-                    self.db, 
-                    book_id=str(book[0]), 
-                    title=str(book[1]), 
-                    author=str(book[2]), 
-                    publisher=str(book[3]), 
-                    parent=self
+        fields = [
+            ("Book ID", book[0]),
+            ("Title", book[1]),
+            ("Author", book[2]),
+            ("Publisher", book[3]),
+            ("Total Copies", total),
+            ("Available", available),
+            ("Checked Out", issued),
+            ("Added On", book[6]),
+        ]
+
+        for key, value in fields:
+
+            key_label = QLabel(key)
+
+            value_label = QLabel(
+                str(
+                    value
+                    if value is not None
+                    else "—"
                 )
-                dialog.exec()
-            else:
-                QMessageBox.warning(self, "Error", "Could not fetch book details.")
-        else:
-            dialog = BarcodeGeneratorDialog(self.db, parent=self)
-            dialog.data_updated.connect(self.load_books_to_table)
-            dialog.exec()
+            )
+
+            key_label.setStyleSheet(
+                f"color: {c['muted']}; "
+                "font-size: 10px; font-weight: 600;"
+            )
+
+            value_label.setStyleSheet(
+                f"color: {c['text']}; "
+                "font-size: 11px; font-weight: 600;"
+            )
+
+            value_label.setWordWrap(True)
+
+            form.addRow(
+                key_label,
+                value_label,
+            )
+
+        self.overview_layout.addLayout(form)
+        self.overview_layout.addStretch()
+
+        # ACTIONS
+        actions = [
+            (
+                "Issue Book",
+                lambda: self.handle_issue_book(
+                    book[0],
+                    book[1],
+                ),
+                "PrimaryButton",
+            ),
+            (
+                "Return Book",
+                lambda: self.handle_return_book(
+                    book[0],
+                    book[1],
+                ),
+                "SecondaryButton",
+            ),
+            (
+                "Print Barcode",
+                lambda: self.open_barcode_dialog_for_selected(
+                    book[0]
+                ),
+                "SecondaryButton",
+            ),
+            (
+                "Audit History",
+                lambda: self.open_book_history(
+                    book[0],
+                    book[1],
+                ),
+                "SecondaryButton",
+            ),
+            (
+                "Edit Record",
+                lambda: self.edit_book(book[0]),
+                "SecondaryButton",
+            ),
+            (
+                "Delete Book",
+                lambda: self.delete_book(book[0]),
+                "DangerButton",
+            ),
+        ]
+
+        for text, callback, object_name in actions:
+
+            button = QPushButton(text)
+            button.setObjectName(object_name)
+            button.setMinimumHeight(32)
+
+            button.setCursor(
+                Qt.CursorShape.PointingHandCursor
+            )
+
+            button.clicked.connect(callback)
+
+            self.actions_layout.addWidget(button)
+
+        self.actions_layout.addStretch()
 
     def on_books_selection_changed(self):
-        """Triggers when rows are selected, handling single or batch selection cleanly."""
-        selected_indexes = self.table.selectionModel().selectedRows()
-        
-        if not selected_indexes:
+
+        if self._updating_table:
             return
-            
-        selected_rows = list(set(index.row() for index in selected_indexes))
-        
-        if len(selected_rows) == 1:
-            self.display_book_details(selected_rows[0])
-        else:
-            clear_layout(self.detail_layout)
-            
-            lbl_header = QLabel(f"Batch Actions ({len(selected_rows)} Books)")
-            lbl_header.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: bold; border: none; background: transparent;")
-            self.detail_layout.addWidget(lbl_header)
-            
-            hint = QLabel("Multiple books selected. Choose a batch operation to apply to all selected items simultaneously.")
-            hint.setWordWrap(True)
-            hint.setStyleSheet("color: #64748b; font-size: 13px; border: none; background: transparent; padding-top: 10px; padding-bottom: 10px;")
-            self.detail_layout.addWidget(hint)
-            
-            batch_issue_btn = QPushButton("📤 Batch Issue Books")
-            batch_return_btn = QPushButton("📥 Batch Return Books")
-            batch_delete_btn = QPushButton("🗑️ Batch Delete Selected")
-            
-            batch_issue_btn.clicked.connect(lambda: self.handle_batch_issue(selected_rows))
-            batch_return_btn.clicked.connect(lambda: self.handle_batch_return(selected_rows))
-            batch_delete_btn.clicked.connect(lambda: self.handle_batch_delete(selected_rows))
-            
-            batch_issue_btn.setStyleSheet("""
-                QPushButton { background-color: #2563eb; color: white; border-radius: 6px; font-weight: 600; font-size: 12px; padding: 10px; border: none; text-align: left; }
-                QPushButton:hover { background-color: #1d4ed8; }
-            """)
-            batch_return_btn.setStyleSheet("""
-                QPushButton { background-color: #10b981; color: white; border-radius: 6px; font-weight: 600; font-size: 12px; padding: 10px; border: none; text-align: left; }
-                QPushButton:hover { background-color: #059669; }
-            """)
-            batch_delete_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); border-radius: 6px; font-weight: 600; font-size: 12px; padding: 10px; text-align: left; }
-                QPushButton:hover { background-color: #ef4444; color: white; }
-            """)
-            
-            self.detail_layout.addStretch()
-            self.detail_layout.addWidget(batch_issue_btn)
-            self.detail_layout.addWidget(batch_return_btn)
-            self.detail_layout.addWidget(batch_delete_btn)
 
-    def handle_batch_issue(self, rows):
-        book_ids = [self.table.item(r, 0).text() for r in rows if self.table.item(r, 0)]
-        if not book_ids:
-            return
-            
-        user_id, ok = QInputDialog.getText(self, "Batch Issue", f"Enter User ID to issue these {len(book_ids)} books to:")
-        if not ok or not user_id.strip():
-            return
-            
-        days_allowed, ok_days = QInputDialog.getInt(self, "Issue Duration", "Days allowed for this batch?", 14, 1, 365, 1)
-        if not ok_days:
-            return
-            
-        success_count = 0
-        errors = []
+        rows = sorted({
+            index.row()
+            for index in self.table.selectionModel().selectedRows()
+        })
 
-        for b_id in book_ids:
-            success, err_msg = self.db.issue_book(b_id, user_id.strip(), days_allowed)
-            if success:
-                success_count += 1
-            else:
-                errors.append(f"• ID {b_id}: {err_msg or 'Unknown error'}")
-                
-        # Build message summary
-        msg = f"Successfully issued {success_count} out of {len(book_ids)} books to user {user_id.strip()}."
-        if errors:
-            msg += f"\n\nFailed items:\n" + "\n".join(errors)
-            QMessageBox.warning(self, "Batch Issue Completed with Errors", msg)
-        else:
-            QMessageBox.information(self, "Batch Complete", msg)
+        if not rows:
 
-        self.load_books_to_table()
-        self.show_default_inspector()
-
-    def handle_batch_return(self, rows):
-        """Processes return for multiple selected books and tallies total fines, capturing any errors."""
-        book_ids = [self.table.item(r, 0).text() for r in rows if self.table.item(r, 0)]
-        if not book_ids:
-            return
-            
-        user_id, ok = QInputDialog.getText(self, "Batch Return", f"Enter User ID returning these {len(book_ids)} books:")
-        if not ok or not user_id.strip():
-            return
-            
-        success_count = 0
-        total_fine = 0.0
-        errors = []
-        
-        for b_id in book_ids:
-            # Assuming return_book returns (success, fine, message)
-            res = self.db.return_book(b_id, user_id.strip())
-            if len(res) == 3:
-                success, fine, err_msg = res
-            else:
-                success, fine = res[0], res[1]
-                err_msg = "Return failed"
-
-            if success:
-                success_count += 1
-                total_fine += fine
-            else:
-                errors.append(f"• ID {b_id}: {err_msg or 'Not currently checked out by this user'}")
-                
-        msg = (
-            f"Successfully processed returns for {success_count} out of {len(book_ids)} books.\n"
-            f"Total Collected Fines: ₹{total_fine:.2f}"
-        )
-        if errors:
-            msg += f"\n\nFailed items:\n" + "\n".join(errors)
-            QMessageBox.warning(self, "Batch Return Completed with Errors", msg)
-        else:
-            QMessageBox.information(self, "Batch Return Complete", msg)
-
-        self.load_books_to_table()
-        self.show_default_inspector()
-
-    def handle_batch_delete(self, rows):
-        book_ids = [self.table.item(r, 0).text() for r in rows if self.table.item(r, 0)]
-        if not book_ids:
-            return
-            
-        confirm = QMessageBox.question(
-            self, "Confirm Batch Deletion",
-            f"Are you sure you want to delete {len(book_ids)} selected books? This action cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if confirm == QMessageBox.StandardButton.Yes:
-            success_count = 0
-            errors = []
-            
-            for b_id in book_ids:
-                success, err_msg = self.db.delete_book(b_id)
-                if success:
-                    success_count += 1
-                else:
-                    errors.append(f"• ID {b_id}: {err_msg or 'Cannot delete (possibly checked out)'}")
-                    
-            msg = f"Successfully removed {success_count} out of {len(book_ids)} books from the database."
-            if errors:
-                msg += f"\n\nFailed items:\n" + "\n".join(errors)
-                QMessageBox.warning(self, "Batch Deletion Completed with Errors", msg)
-            else:
-                QMessageBox.information(self, "Batch Deleted", msg)
-
-            self.load_books_to_table()
             self.show_default_inspector()
-            
-    def open_book_history(self, book_id, book_title):
-        dialog = BookHistoryDialog(self.db, book_id, book_title, parent=self)
-        dialog.exec()
-    def import_books_from_csv(self):
-        """Opens a file dialog to select a CSV file and batch-imports/updates books in the database."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Book Catalog CSV", "", "CSV Files (*.csv);;All Files (*)"
+
+        elif len(rows) == 1:
+
+            item = self.table.item(rows[0], 0)
+
+            if item:
+                self.display_book_details_by_id(
+                    item.text()
+                )
+
+        else:
+
+            self.current_book_id = None
+
+            clear_layout(self.overview_layout)
+            clear_layout(self.actions_layout)
+
+            label = QLabel(
+                f"{len(rows)} books selected. "
+                "Select one book to inspect its details."
+            )
+
+            label.setWordWrap(True)
+
+            self.overview_layout.addWidget(label)
+
+    # ========================================================
+    # BOOK OPERATIONS
+    # ========================================================
+
+    def add_book(self):
+
+        dialog = BookDialog(
+            self.db,
+            parent=self,
         )
-        
+
+        dialog.data_updated.connect(
+            self.load_books_to_table
+        )
+
+        dialog.exec()
+
+        self.load_books_to_table()
+
+    def handle_issue_book(self, book_id, book_title):
+
+        dialog = IssueBookDialog(
+            self.db,
+            self,
+        )
+
+        dialog.input_book.setText(
+            str(book_id)
+        )
+
+        if not dialog.exec():
+            return
+
+        bid, uid, days = dialog.get_data()
+
+        try:
+
+            try:
+                success, message = self.db.issue_book(
+                    bid,
+                    uid,
+                    days,
+                )
+
+            except TypeError:
+                success, message = self.db.issue_book(
+                    bid,
+                    uid,
+                )
+
+            if success:
+
+                QMessageBox.information(
+                    self,
+                    "Book Issued",
+                    f"'{book_title}' successfully issued.",
+                )
+
+                self.load_books_to_table()
+                self.select_book_by_id(book_id)
+
+            else:
+
+                QMessageBox.warning(
+                    self,
+                    "Issue Failed",
+                    str(message),
+                )
+
+        except Exception as exc:
+
+            QMessageBox.critical(
+                self,
+                "Issue Error",
+                str(exc),
+            )
+
+    def handle_return_book(self, book_id, book_title):
+
+        dialog = ReturnBookDialog(
+            self.db,
+            self,
+        )
+
+        dialog.input_book.setText(
+            str(book_id)
+        )
+
+        if not dialog.exec():
+            return
+
+        bid, uid = dialog.get_data()
+
+        try:
+
+            result = self.db.return_book(
+                bid,
+                uid,
+            )
+
+            if not isinstance(result, tuple) or len(result) < 2:
+                raise ValueError(
+                    "Unexpected return_book() response."
+                )
+
+            success, fine = result[0], result[1]
+
+            if success:
+
+                QMessageBox.information(
+                    self,
+                    "Book Returned",
+                    "Book returned successfully.\n"
+                    f"Fine: ₹{float(fine or 0):.2f}",
+                )
+
+                self.load_books_to_table()
+                self.select_book_by_id(book_id)
+
+            else:
+
+                QMessageBox.warning(
+                    self,
+                    "Return Failed",
+                    str(fine),
+                )
+
+        except Exception as exc:
+
+            QMessageBox.critical(
+                self,
+                "Return Error",
+                str(exc),
+            )
+
+    def edit_book(self, book_id):
+
+        dialog = BookDialog(
+            self.db,
+            book_id=book_id,
+            parent=self,
+        )
+
+        dialog.data_updated.connect(
+            self.load_books_to_table
+        )
+
+        dialog.exec()
+
+        self.load_books_to_table()
+        self.select_book_by_id(book_id)
+
+    def delete_book(self, book_id):
+
+        answer = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Are you sure you want to delete book {book_id}?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+
+            success, message = self.db.delete_book(
+                book_id
+            )
+
+            if success:
+
+                QMessageBox.information(
+                    self,
+                    "Deleted",
+                    str(message),
+                )
+
+                self.load_books_to_table()
+
+            else:
+
+                QMessageBox.warning(
+                    self,
+                    "Delete Failed",
+                    str(message),
+                )
+
+        except Exception as exc:
+
+            QMessageBox.critical(
+                self,
+                "Delete Error",
+                str(exc),
+            )
+
+    # ========================================================
+    # CONTEXT MENU
+    # ========================================================
+
+    def show_context_menu(self, position):
+
+        index = self.table.indexAt(position)
+
+        if not index.isValid():
+            return
+
+        row = index.row()
+
+        item = self.table.item(row, 0)
+
+        if not item:
+            return
+
+        book_id = item.text()
+
+        title_item = self.table.item(row, 1)
+
+        book_title = (
+            title_item.text()
+            if title_item
+            else ""
+        )
+
+        self.table.selectRow(row)
+
+        menu = QMenu(self)
+
+        issue = menu.addAction("Issue Book")
+        ret = menu.addAction("Return Book")
+
+        menu.addSeparator()
+
+        barcode = menu.addAction("Print Barcode")
+        history = menu.addAction("View Audit History")
+        edit = menu.addAction("Edit Book")
+        delete = menu.addAction("Delete Book")
+
+        action = menu.exec(
+            self.table.viewport().mapToGlobal(position)
+        )
+
+        if action == issue:
+            self.handle_issue_book(
+                book_id,
+                book_title,
+            )
+
+        elif action == ret:
+            self.handle_return_book(
+                book_id,
+                book_title,
+            )
+
+        elif action == barcode:
+            self.open_barcode_dialog_for_selected(
+                book_id
+            )
+
+        elif action == history:
+            self.open_book_history(
+                book_id,
+                book_title,
+            )
+
+        elif action == edit:
+            self.edit_book(book_id)
+
+        elif action == delete:
+            self.delete_book(book_id)
+
+    # ========================================================
+    # BARCODE AND HISTORY
+    # ========================================================
+
+    def open_barcode_dialog_for_selected(self, book_id=""):
+
+        if book_id:
+
+            try:
+
+                success, book = self.db.get_book_details(
+                    str(book_id)
+                )
+
+                if not success or not book:
+                    return
+
+                dialog = BarcodeGeneratorDialog(
+                    self.db,
+                    book_id=str(book[0]),
+                    title=str(book[1]),
+                    author=str(book[2]),
+                    publisher=str(book[3]),
+                    parent=self,
+                )
+
+            except Exception as exc:
+
+                QMessageBox.critical(
+                    self,
+                    "Barcode Error",
+                    str(exc),
+                )
+
+                return
+
+        else:
+
+            dialog = BarcodeGeneratorDialog(
+                self.db,
+                parent=self,
+            )
+
+        dialog.data_updated.connect(
+            self.load_books_to_table
+        )
+
+        dialog.exec()
+
+    def open_book_history(self, book_id, book_title):
+
+        BookHistoryDialog(
+            self.db,
+            book_id,
+            book_title,
+            parent=self,
+        ).exec()
+
+    # ========================================================
+    # CSV IMPORT
+    # ========================================================
+
+    def import_books_from_csv(self):
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Book Catalog",
+            "",
+            "CSV Files (*.csv);;All Files (*)",
+        )
+
         if not file_path:
             return
 
-        imported_count = 0
-        error_count = 0
+        required_aliases = {
+            "id": ("book_id", "id"),
+            "title": ("title",),
+            "author": ("author",),
+            "publisher": ("publisher",),
+            "copies": (
+                "total_copies",
+                "copies",
+                "total",
+            ),
+        }
+
         books_to_insert = []
-        
-        # Get today's clean date (YYYY-MM-DD format without seconds/time)
+        errors = []
+
         current_date = date.today().isoformat()
 
         try:
-            with open(file_path, mode='r', encoding='utf-8-sig') as file:
-                reader = csv.reader(file)
-                rows = list(reader)
-                
-                if len(rows) < 2:
-                    QMessageBox.warning(self, "Invalid CSV", "The CSV file is empty or missing data rows.")
-                    return
 
-                # Clean header row to strip invisible characters, BOMs, or quotes
-                header = [h.lower().strip().replace('\ufeff', '').replace('"', '') for h in rows[0]]
-                
-                # Identify column positions (supporting both 'book_id' and 'id')
-                id_idx = header.index('book_id') if 'book_id' in header else (header.index('id') if 'id' in header else -1)
-                title_idx = header.index('title') if 'title' in header else -1
-                author_idx = header.index('author') if 'author' in header else -1
-                pub_idx = header.index('publisher') if 'publisher' in header else -1
-                copies_idx = header.index('total_copies') if 'total_copies' in header else -1
+            with open(
+                file_path,
+                "r",
+                newline="",
+                encoding="utf-8-sig",
+            ) as csv_file:
 
-                if id_idx == -1 or title_idx == -1:
+                reader = csv.DictReader(csv_file)
+
+                if not reader.fieldnames:
+
                     QMessageBox.warning(
-                        self, 
-                        "Missing Mandatory Headers", 
-                        f"The CSV file must contain both 'book_id' (or 'id') and 'title' column headers.\nFound headers: {header}"
+                        self,
+                        "Invalid CSV",
+                        "The selected CSV file has no header row.",
                     )
+
                     return
 
-                for r in rows[1:]:
-                    if not r or len(r) <= max(id_idx, title_idx):
-                        error_count += 1
+                normalized_headers = {
+                    str(name).strip().casefold(): name
+                    for name in reader.fieldnames
+                    if name
+                }
+
+                def find_column(aliases):
+
+                    for alias in aliases:
+
+                        if alias in normalized_headers:
+                            return normalized_headers[alias]
+
+                    return None
+
+                id_col = find_column(
+                    required_aliases["id"]
+                )
+
+                title_col = find_column(
+                    required_aliases["title"]
+                )
+
+                author_col = find_column(
+                    required_aliases["author"]
+                )
+
+                publisher_col = find_column(
+                    required_aliases["publisher"]
+                )
+
+                copies_col = find_column(
+                    required_aliases["copies"]
+                )
+
+                if not id_col or not title_col:
+
+                    QMessageBox.warning(
+                        self,
+                        "Missing CSV Headers",
+                        "Required columns: book_id (or id), title",
+                    )
+
+                    return
+
+                seen_ids = set()
+
+                for line_number, row in enumerate(
+                    reader,
+                    start=2,
+                ):
+
+                    book_id = str(
+                        row.get(id_col, "") or ""
+                    ).strip()
+
+                    title = str(
+                        row.get(title_col, "") or ""
+                    ).strip()
+
+                    author = (
+                        str(row.get(author_col, "") or "").strip()
+                        if author_col
+                        else ""
+                    )
+
+                    publisher = (
+                        str(row.get(publisher_col, "") or "").strip()
+                        if publisher_col
+                        else ""
+                    )
+
+                    copies_text = (
+                        str(row.get(copies_col, "") or "").strip()
+                        if copies_col
+                        else "1"
+                    )
+
+                    if not book_id or not title:
+
+                        errors.append(
+                            f"Line {line_number}: "
+                            "Book ID and title are required."
+                        )
+
                         continue
 
-                    b_id = r[id_idx].strip() if len(r) > id_idx else ""
-                    title = r[title_idx].strip() if len(r) > title_idx else ""
-                    author = r[author_idx].strip() if author_idx != -1 and len(r) > author_idx and r[author_idx].strip() else "Unknown Author"
-                    publisher = r[pub_idx].strip() if pub_idx != -1 and len(r) > pub_idx and r[pub_idx].strip() else "Unknown Publisher"
-                    
-                    copies_str = r[copies_idx].strip() if copies_idx != -1 and len(r) > copies_idx and r[copies_idx].strip() else "1"
+                    if book_id in seen_ids:
+
+                        errors.append(
+                            f"Line {line_number}: "
+                            f"Duplicate ID '{book_id}' in CSV."
+                        )
+
+                        continue
+
+                    seen_ids.add(book_id)
+
                     try:
-                        total_copies = int(copies_str)
+
+                        copies = int(
+                            copies_text or "1"
+                        )
+
+                        if copies < 1:
+                            raise ValueError
+
                     except ValueError:
-                        total_copies = 1
 
-                    available_copies = total_copies
+                        errors.append(
+                            f"Line {line_number}: "
+                            "Invalid total copies value."
+                        )
 
-                    if b_id and title:
-                        # Append with the clean date string instead of a timestamp with seconds
-                        books_to_insert.append((b_id, title, author, publisher, total_copies, available_copies, current_date))
-                    else:
-                        error_count += 1
+                        continue
 
-            if books_to_insert:
-                cursor = self.db.conn.cursor()
-                
-                # UPSERT query including the clean 'added_on' date column
-                cursor.executemany("""
-                    INSERT INTO books (id, title, author, publisher, total_copies, available_copies, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        total_copies = total_copies + excluded.total_copies,
-                        available_copies = available_copies + excluded.total_copies,
-                        title = COALESCE(excluded.title, title),
-                        author = COALESCE(excluded.author, author),
-                        publisher = COALESCE(excluded.publisher, publisher)
-                """, books_to_insert)
-                
-                self.db.conn.commit()
-                imported_count = len(books_to_insert)
+                    books_to_insert.append((
+                        book_id,
+                        title,
+                        author or "Unknown",
+                        publisher or "Unknown",
+                        copies,
+                        copies,
+                        current_date,
+                    ))
 
-            msg = f"Successfully processed {imported_count} catalog records!"
-            if error_count > 0:
-                msg += f"\n(Skipped {error_count} rows due to missing 'book_id' or 'title')."
-                
-            QMessageBox.information(self, "Import Complete", msg)
+            if not books_to_insert:
+
+                QMessageBox.warning(
+                    self,
+                    "Nothing to Import",
+                    "No valid book records were found.",
+                )
+
+                return
+
+            success, result = self.db.import_books_batch(
+                books_to_insert
+            )
+
+            if not success:
+
+                QMessageBox.critical(
+                    self,
+                    "Import Failed",
+                    str(result),
+                )
+
+                return
+
+            message = (
+                f"Successfully imported "
+                f"{int(result or 0)} book records."
+            )
+
+            if errors:
+
+                message += (
+                    f"\n\nSkipped {len(errors)} invalid record(s)."
+                    "\n\nFirst errors:\n"
+                    + "\n".join(errors[:10])
+                )
+
+                if len(errors) > 10:
+                    message += (
+                        f"\n...and {len(errors) - 10} more."
+                    )
+
+            QMessageBox.information(
+                self,
+                "Import Completed",
+                message,
+            )
+
             self.load_books_to_table()
 
-        except Exception as e:
-            QMessageBox.critical(self, "Import Error", f"An error occurred while processing the file:\n{e}")
+        except Exception as exc:
+
+            QMessageBox.critical(
+                self,
+                "CSV Import Error",
+                f"Unable to import file:\n\n{exc}",
+            )
+
+    # ========================================================
+    # CSV EXPORT
+    # ========================================================
+
+    def export_books_to_csv(self):
+
+        if not self.all_books:
+
+            QMessageBox.information(
+                self,
+                "Export Catalog",
+                "There are no book records to export.",
+            )
+
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Book Catalog",
+            str(Path.home() / "book_catalog.csv"),
+            "CSV Files (*.csv)",
+        )
+
+        if not file_path:
+            return
+
+        if not file_path.lower().endswith(".csv"):
+            file_path += ".csv"
+
+        try:
+
+            with open(
+                file_path,
+                "w",
+                newline="",
+                encoding="utf-8-sig",
+            ) as file:
+
+                writer = csv.writer(file)
+
+                writer.writerow(self.HEADERS)
+                writer.writerows(self.all_books)
+
+            QMessageBox.information(
+                self,
+                "Export Completed",
+                f"Successfully exported records to:\n{file_path}",
+            )
+
+        except Exception as exc:
+
+            QMessageBox.critical(
+                self,
+                "Export Failed",
+                str(exc),
+            )
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    def closeEvent(self, event):
+
+        if self.theme_manager:
+
+            try:
+
+                self.theme_manager.themeChanged.disconnect(
+                    self.apply_theme
+                )
+
+            except (TypeError, RuntimeError):
+                pass
+
+        super().closeEvent(event)

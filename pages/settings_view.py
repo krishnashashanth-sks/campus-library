@@ -1,205 +1,1312 @@
+import os
+import sqlite3
+import datetime
+
+from PyQt6.QtCore import Qt, QSignalBlocker
+from PyQt6.QtGui import QFont, QFontDatabase
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QHBoxLayout, QGroupBox, QLineEdit,
-    QPushButton, QVBoxLayout, QFileDialog, QMessageBox,
-    QDoubleSpinBox, QSpinBox
+    QWidget, QLabel, QHBoxLayout, QVBoxLayout,
+    QLineEdit, QCheckBox, QPushButton, QFileDialog,
+    QMessageBox, QDoubleSpinBox, QSpinBox, QComboBox,
+    QScrollArea, QFrame, QInputDialog, QApplication,
+    QGridLayout, QSizePolicy
 )
 
+from dialogs import DepartmentManagerDialog
+
+
 class SettingsView(QWidget):
+
+    DEFAULTS = {
+        "daily_fine": 10.00,
+        "default_days": 14,
+        "theme_mode": "Dark",
+    }
+
+    THEMES = ("Dark", "Light", "System")
+
+    FONT_SIZES = {
+        "page_title": 26,
+        "page_subtitle": 12,
+        "section_title": 16,
+        "section_description": 12,
+        "card_title": 14,
+        "field_label": 13,
+        "body": 13,
+        "helper": 12,
+        "button": 13,
+        "input": 13,
+    }
+
     def __init__(self, db):
         super().__init__()
+
         self.db = db
+        self._loading_settings = False
+        self._saving_settings = False
+        self._theme_manager = None
+        self.font_family = self.get_application_font()
+
+        self.setObjectName("SettingsView")
+
         self.init_ui()
+        self.setup_typography()
+        self.connect_theme_manager()
         self.load_settings()
+
+    # =========================================================
+    # TYPOGRAPHY
+    # =========================================================
+
+    @staticmethod
+    def get_application_font():
+        available_fonts = set(QFontDatabase.families())
+
+        if "Segoe UI Variable" in available_fonts:
+            return "Segoe UI Variable"
+
+        if "Segoe UI" in available_fonts:
+            return "Segoe UI"
+
+        if "Arial" in available_fonts:
+            return "Arial"
+
+        return QApplication.font().family()
+
+    def make_font(self, size=13, weight=QFont.Weight.Normal):
+        font = QFont(self.font_family)
+        font.setPointSizeF(size * 72 / 96)
+        font.setWeight(weight)
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        return font
+
+    def setup_typography(self):
+        self.setFont(self.make_font(13))
+
+        font_map = {
+            "PageTitle": (26, QFont.Weight.Bold),
+            "PageSubtitle": (12, QFont.Weight.Normal),
+            "SectionTitle": (16, QFont.Weight.DemiBold),
+            "SectionDescription": (12, QFont.Weight.Normal),
+            "CardTitle": (14, QFont.Weight.DemiBold),
+            "FieldLabel": (13, QFont.Weight.DemiBold),
+            "MutedLabel": (12, QFont.Weight.Normal),
+            "DangerTitle": (14, QFont.Weight.Bold),
+        }
+
+        for label in self.findChildren(QLabel):
+            settings = font_map.get(label.objectName())
+
+            if settings:
+                size, weight = settings
+                label.setFont(self.make_font(size, weight))
+            else:
+                label.setFont(
+                    self.make_font(13, QFont.Weight.Normal)
+                )
+
+        for button in self.findChildren(QPushButton):
+            button.setFont(
+                self.make_font(13, QFont.Weight.DemiBold)
+            )
+
+        for field in self.findChildren(QLineEdit):
+            field.setFont(
+                self.make_font(13, QFont.Weight.Normal)
+            )
+
+        for combo in self.findChildren(QComboBox):
+            combo.setFont(
+                self.make_font(13, QFont.Weight.Normal)
+            )
+
+        for spin in self.findChildren(QSpinBox):
+            spin.setFont(
+                self.make_font(13, QFont.Weight.Normal)
+            )
+
+        for spin in self.findChildren(QDoubleSpinBox):
+            spin.setFont(
+                self.make_font(13, QFont.Weight.Normal)
+            )
+
+        for checkbox in self.findChildren(QCheckBox):
+            checkbox.setFont(
+                self.make_font(13, QFont.Weight.Normal)
+            )
+
+    # =========================================================
+    # THEME MANAGEMENT
+    # =========================================================
+
+    def get_theme_manager(self):
+        app = QApplication.instance()
+
+        manager = getattr(app, "theme_manager", None) if app else None
+
+        if manager:
+            return manager
+
+        parent = self.parent()
+
+        while parent:
+            manager = getattr(parent, "theme_manager", None)
+
+            if manager:
+                return manager
+
+            parent = parent.parent()
+
+        return None
+
+    def connect_theme_manager(self):
+        self._theme_manager = self.get_theme_manager()
+
+        if self._theme_manager:
+            signal = getattr(
+                self._theme_manager,
+                "themeChanged",
+                None
+            )
+
+            if signal:
+                try:
+                    signal.connect(self.on_global_theme_changed)
+                except (TypeError, RuntimeError):
+                    pass
+
+    def apply_selected_theme(self, theme_name):
+        manager = self._theme_manager or self.get_theme_manager()
+        self._theme_manager = manager
+
+        if not manager:
+            return False
+
+        try:
+            manager.set_theme(theme_name)
+            return True
+
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "Theme Error",
+                f"Unable to change application theme:\n\n{error}"
+            )
+            return False
+
+    def on_global_theme_changed(self, theme_name):
+        self.update_theme_description()
+
+    def on_theme_changed(self, theme_name):
+        if self._loading_settings:
+            return
+
+        self.apply_selected_theme(theme_name)
+        self.update_theme_description()
+
+    def update_theme_description(self):
+        theme = self.combo_theme.currentText()
+
+        descriptions = {
+            "Dark": "Dark appearance is selected.",
+            "Light": "Light appearance is selected.",
+            "System": "The application follows the system theme.",
+        }
+
+        self.theme_description.setText(
+            descriptions.get(
+                theme,
+                "Configure the application appearance."
+            )
+        )
+
+    # =========================================================
+    # UI HELPERS
+    # =========================================================
+
+    def create_card_frame(self, object_name="SettingsCard"):
+        frame = QFrame()
+        frame.setObjectName(object_name)
+        frame.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred
+        )
+        return frame
+
+    def create_section_header(self, title, description=""):
+        wrapper = QWidget()
+        wrapper.setObjectName("SettingsSectionHeader")
+
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 8, 0, 3)
+        layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("SectionTitle")
+
+        layout.addWidget(title_label)
+
+        if description:
+            desc = QLabel(description)
+            desc.setObjectName("SectionDescription")
+            desc.setWordWrap(True)
+            layout.addWidget(desc)
+
+        return wrapper
+
+    def create_info_frame(self, text):
+        frame = QFrame()
+        frame.setObjectName("InfoFrame")
+
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(13, 11, 13, 11)
+
+        label = QLabel(text)
+        label.setObjectName("MutedLabel")
+        label.setWordWrap(True)
+
+        layout.addWidget(label)
+        return frame
+
+    def create_field_label(self, text):
+        label = QLabel(text)
+        label.setObjectName("FieldLabel")
+        return label
+
+    def create_button(self, text, object_name="SecondaryButton"):
+        button = QPushButton(text)
+        button.setObjectName(object_name)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setMinimumHeight(40)
+        return button
+
+    def create_password_field(self, placeholder):
+        field = QLineEdit()
+        field.setObjectName("PasswordField")
+        field.setPlaceholderText(placeholder)
+        field.setEchoMode(QLineEdit.EchoMode.Password)
+        field.setMinimumHeight(40)
+        field.setClearButtonEnabled(True)
+        return field
+
+    def create_password_row(self, label_text, placeholder):
+        wrapper = QWidget()
+
+        layout = QHBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        label = self.create_field_label(label_text)
+        label.setMinimumWidth(155)
+
+        field = self.create_password_field(placeholder)
+
+        toggle = self.create_button("Show", "SmallButton")
+        toggle.setCheckable(True)
+        toggle.setMinimumWidth(65)
+
+        def toggle_visibility(visible):
+            field.setEchoMode(
+                QLineEdit.EchoMode.Normal
+                if visible
+                else QLineEdit.EchoMode.Password
+            )
+
+            toggle.setText("Hide" if visible else "Show")
+
+        toggle.toggled.connect(toggle_visibility)
+
+        layout.addWidget(label)
+        layout.addWidget(field, 1)
+        layout.addWidget(toggle)
+
+        return wrapper, field
+
+    def create_separator(self):
+        line = QFrame()
+        line.setObjectName("SettingsSeparator")
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Plain)
+        return line
+
+    # =========================================================
+    # MAIN INTERFACE
+    # =========================================================
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(25, 22, 25, 20)
+        main_layout.setSpacing(15)
 
-        # Page Header
-        lbl_title = QLabel("Application Settings")
-        lbl_title.setStyleSheet("font-size: 20px; font-weight: bold; border: none;")
-        main_layout.addWidget(lbl_title)
+        # Header
+        header = QHBoxLayout()
 
-        # 1. Circulation & Fine Rules
-        group_rules = QGroupBox("Circulation & Fine Rules")
-        rules_layout = QVBoxLayout(group_rules)
+        title_group = QVBoxLayout()
+        title_group.setSpacing(5)
 
-        fine_layout = QHBoxLayout()
-        fine_layout.addWidget(QLabel("Daily Fine Amount (Rs):"))
+        title = QLabel("Settings & Configuration")
+        title.setObjectName("PageTitle")
+
+        subtitle = QLabel(
+            "Manage application preferences, circulation policies, "
+            "academic records, security and database maintenance."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
+
+        title_group.addWidget(title)
+        title_group.addWidget(subtitle)
+
+        header.addLayout(title_group)
+        header.addStretch()
+
+        main_layout.addLayout(header)
+
+        # Scrollable content
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("SettingsScrollArea")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        self.container = QWidget()
+        self.container.setObjectName("SettingsContainer")
+
+        self.content_layout = QVBoxLayout(self.container)
+        self.content_layout.setContentsMargins(2, 5, 12, 15)
+        self.content_layout.setSpacing(12)
+
+        self.build_department_section()
+        self.build_rollover_section()
+        self.build_appearance_section()
+        self.build_circulation_section()
+        self.build_database_section()
+        self.build_security_section()
+
+        self.content_layout.addStretch()
+
+        self.scroll.setWidget(self.container)
+        main_layout.addWidget(self.scroll, 1)
+
+        # Action bar
+        action_frame = self.create_card_frame("SettingsActionBar")
+
+        action_layout = QHBoxLayout(action_frame)
+        action_layout.setContentsMargins(15, 12, 15, 12)
+        action_layout.setSpacing(10)
+
+        self.btn_reset = self.create_button(
+            "Reset Defaults",
+            "SecondaryButton"
+        )
+        self.btn_reset.clicked.connect(self.reset_defaults)
+
+        self.btn_save = self.create_button(
+            "Save All Settings",
+            "PrimaryButton"
+        )
+        self.btn_save.clicked.connect(self.save_settings)
+
+        action_layout.addWidget(self.btn_reset)
+        action_layout.addStretch()
+        action_layout.addWidget(self.btn_save)
+
+        main_layout.addWidget(action_frame)
+
+    # =========================================================
+    # 1. DEPARTMENT MANAGEMENT
+    # =========================================================
+
+    def build_department_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Academic Departments",
+                "Manage the academic branches and departments "
+                "available in your institution."
+            )
+        )
+
+        card = self.create_card_frame()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setSpacing(12)
+
+        layout.addWidget(
+            self.create_info_frame(
+                "Add, edit and remove academic departments. "
+                "Department changes are managed separately from "
+                "general application settings."
+            )
+        )
+
+        self.btn_manage_depts = self.create_button(
+            "Manage Departments",
+            "PrimaryButton"
+        )
+        self.btn_manage_depts.clicked.connect(
+            self.open_department_manager
+        )
+
+        layout.addWidget(self.btn_manage_depts)
+        self.content_layout.addWidget(card)
+
+    # =========================================================
+    # 2. ACADEMIC ROLLOVER
+    # =========================================================
+
+    def build_rollover_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Academic Year Rollover",
+                "Archive graduating students and remove eligible "
+                "records from the active database."
+            )
+        )
+
+        card = self.create_card_frame()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setSpacing(13)
+
+        layout.addWidget(
+            self.create_info_frame(
+                "This operation exports graduating student records "
+                "to a CSV archive before removing eligible records "
+                "from the active database."
+            )
+        )
+
+        self.chk_skip_active = QCheckBox(
+            "Skip students who currently have active loans"
+        )
+        self.chk_skip_active.setChecked(True)
+
+        layout.addWidget(self.chk_skip_active)
+
+        self.btn_archive_batch = self.create_button(
+            "Export & Clear Graduating Batch",
+            "SecondaryButton"
+        )
+        self.btn_archive_batch.clicked.connect(
+            self.handle_batch_rollover_action
+        )
+
+        layout.addWidget(self.btn_archive_batch)
+        self.content_layout.addWidget(card)
+
+    # =========================================================
+    # 3. APPEARANCE
+    # =========================================================
+
+    def build_appearance_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Appearance & Interface",
+                "Configure the visual appearance of the application."
+            )
+        )
+
+        card = self.create_card_frame()
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setSpacing(15)
+
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(5)
+
+        label = self.create_field_label("Application Theme")
+
+        self.theme_description = QLabel(
+            "Choose the appearance used throughout the application."
+        )
+        self.theme_description.setObjectName("MutedLabel")
+        self.theme_description.setWordWrap(True)
+
+        text_layout.addWidget(label)
+        text_layout.addWidget(self.theme_description)
+
+        self.combo_theme = QComboBox()
+        self.combo_theme.addItems(self.THEMES)
+        self.combo_theme.setMinimumWidth(180)
+        self.combo_theme.setMinimumHeight(40)
+        self.combo_theme.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.combo_theme.currentTextChanged.connect(
+            self.on_theme_changed
+        )
+
+        layout.addLayout(text_layout, 1)
+        layout.addWidget(self.combo_theme)
+
+        self.content_layout.addWidget(card)
+
+    # =========================================================
+    # 4. CIRCULATION POLICIES
+    # =========================================================
+
+    def build_circulation_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Circulation Policies",
+                "Configure borrowing duration and overdue fine calculation."
+            )
+        )
+
+        card = self.create_card_frame()
+        layout = QGridLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setHorizontalSpacing(22)
+        layout.setVerticalSpacing(13)
+
+        fine_label = self.create_field_label("Daily Overdue Fine")
+
         self.spin_daily_fine = QDoubleSpinBox()
-        self.spin_daily_fine.setRange(0.00, 1000.00)
+        self.spin_daily_fine.setRange(0, 1000)
+        self.spin_daily_fine.setDecimals(2)
         self.spin_daily_fine.setSingleStep(0.50)
-        self.spin_daily_fine.setFixedWidth(120)
-        fine_layout.addWidget(self.spin_daily_fine)
-        fine_layout.addStretch()
-        rules_layout.addLayout(fine_layout)
+        self.spin_daily_fine.setPrefix("₹ ")
+        self.spin_daily_fine.setMinimumHeight(40)
 
-        days_layout = QHBoxLayout()
-        days_layout.addWidget(QLabel("Default Borrowing Duration:"))
+        fine_description = QLabel(
+            "Amount charged for each overdue day."
+        )
+        fine_description.setObjectName("MutedLabel")
+
+        days_label = self.create_field_label("Default Loan Duration")
+
         self.spin_default_days = QSpinBox()
         self.spin_default_days.setRange(1, 365)
         self.spin_default_days.setSuffix(" days")
-        self.spin_default_days.setFixedWidth(120)
-        days_layout.addWidget(self.spin_default_days)
-        days_layout.addStretch()
-        rules_layout.addLayout(days_layout)
+        self.spin_default_days.setMinimumHeight(40)
 
-        main_layout.addWidget(group_rules)
+        days_description = QLabel(
+            "Default number of days allowed for borrowing."
+        )
+        days_description.setObjectName("MutedLabel")
 
-        # 2. Database Maintenance
-        group_database = QGroupBox("Database Maintenance")
-        db_layout = QVBoxLayout(group_database)
-        db_layout.setSpacing(10)
+        layout.addWidget(fine_label, 0, 0)
+        layout.addWidget(days_label, 0, 1)
 
-        self.db_backup_btn = QPushButton("Back Up Database File")
+        layout.addWidget(self.spin_daily_fine, 1, 0)
+        layout.addWidget(self.spin_default_days, 1, 1)
+
+        layout.addWidget(fine_description, 2, 0)
+        layout.addWidget(days_description, 2, 1)
+
+        self.content_layout.addWidget(card)
+
+    # =========================================================
+    # 5. DATABASE MAINTENANCE
+    # =========================================================
+
+    def build_database_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Database Maintenance",
+                "Back up your library database and manage circulation logs."
+            )
+        )
+
+        card = self.create_card_frame()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setSpacing(15)
+
+        backup_row = QHBoxLayout()
+        backup_row.setSpacing(15)
+
+        backup_text = QVBoxLayout()
+        backup_text.setSpacing(5)
+
+        backup_title = self.create_field_label("Database Backup")
+
+        backup_desc = QLabel(
+            "Create an independent copy of the current SQLite database."
+        )
+        backup_desc.setObjectName("MutedLabel")
+        backup_desc.setWordWrap(True)
+
+        backup_text.addWidget(backup_title)
+        backup_text.addWidget(backup_desc)
+
+        self.db_backup_btn = self.create_button(
+            "Create Backup",
+            "SecondaryButton"
+        )
         self.db_backup_btn.clicked.connect(self.database_backup)
-        db_layout.addWidget(self.db_backup_btn)
 
-        lbl_info = QLabel("Danger zone: Permanent deletion of circulation logs (cannot be undone)")
-        lbl_info.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold; border: none;")
-        db_layout.addWidget(lbl_info)
+        backup_row.addLayout(backup_text, 1)
+        backup_row.addWidget(self.db_backup_btn)
 
-        clear_logs_btn = QPushButton("Clear All Circulation Logs")
-        clear_logs_btn.setStyleSheet("background-color: #ef4444; color: white;")
-        clear_logs_btn.clicked.connect(self.clear_all_logs)
-        db_layout.addWidget(clear_logs_btn)
+        layout.addLayout(backup_row)
+        layout.addWidget(self.create_separator())
 
-        main_layout.addWidget(group_database)
+        danger_frame = self.create_card_frame("DangerFrame")
 
-        # 3. Security & Password Section
-        group_security = QGroupBox("Admin Password Security")
-        sec_layout = QVBoxLayout(group_security)
-        sec_layout.setSpacing(14)
+        danger_layout = QVBoxLayout(danger_frame)
+        danger_layout.setContentsMargins(14, 13, 14, 13)
+        danger_layout.setSpacing(10)
 
-        row_cur = QHBoxLayout()
-        lbl_cur = QLabel("Current Password:")
-        lbl_cur.setFixedWidth(140)
-        self.input_cur_psw = QLineEdit()
-        self.input_cur_psw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.input_cur_psw.setPlaceholderText("Enter current password")
-        row_cur.addWidget(lbl_cur)
-        row_cur.addWidget(self.input_cur_psw)
+        danger_title = QLabel("Danger Zone")
+        danger_title.setObjectName("DangerTitle")
 
-        row_new = QHBoxLayout()
-        lbl_new = QLabel("New Password:")
-        lbl_new.setFixedWidth(140)
-        self.input_new_psw = QLineEdit()
-        self.input_new_psw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.input_new_psw.setPlaceholderText("Enter new password")
-        row_new.addWidget(lbl_new)
-        row_new.addWidget(self.input_new_psw)
+        danger_desc = QLabel(
+            "Permanently delete all circulation activity logs. "
+            "This operation cannot be undone."
+        )
+        danger_desc.setWordWrap(True)
+        danger_desc.setObjectName("MutedLabel")
 
-        row_con = QHBoxLayout()
-        lbl_con = QLabel("Confirm Password:")
-        lbl_con.setFixedWidth(140)
-        self.input_con_psw = QLineEdit()
-        self.input_con_psw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.input_con_psw.setPlaceholderText("Re-enter new password")
-        row_con.addWidget(lbl_con)
-        row_con.addWidget(self.input_con_psw)
+        self.clear_logs_btn = self.create_button(
+            "Clear All Circulation Logs",
+            "DangerButton"
+        )
+        self.clear_logs_btn.clicked.connect(self.clear_all_logs)
 
-        sec_layout.addLayout(row_cur)
-        sec_layout.addLayout(row_new)
-        sec_layout.addLayout(row_con)
+        danger_layout.addWidget(danger_title)
+        danger_layout.addWidget(danger_desc)
+        danger_layout.addWidget(self.clear_logs_btn)
 
-        btn_change = QPushButton("Update Password")
-        btn_change.clicked.connect(self.change_password)
-        sec_layout.addWidget(btn_change)
+        layout.addWidget(danger_frame)
+        self.content_layout.addWidget(card)
 
-        main_layout.addWidget(group_security)
-        main_layout.addStretch()
+    # =========================================================
+    # 6. ADMINISTRATOR SECURITY
+    # =========================================================
 
-        # Save Settings Action Button
-        bottom_layout = QHBoxLayout()
-        self.btn_reset = QPushButton("Reset All Settings")
-        self.btn_reset.setStyleSheet("background-color: #10b981; color: white; min-height: 38px; font-size: 14px;")
-        self.btn_reset.clicked.connect(self.reset_settings)
-        bottom_layout.addWidget(self.btn_reset)
+    def build_security_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Administrator Security",
+                "Update the administrator password used for "
+                "protected system operations."
+            )
+        )
 
-        self.btn_save = QPushButton("Save All Settings")
-        self.btn_save.setStyleSheet("background-color: #10b981; color: white; min-height: 38px; font-size: 14px;")
-        self.btn_save.clicked.connect(self.save_settings)
-        bottom_layout.addWidget(self.btn_save)
+        card = self.create_card_frame()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setSpacing(13)
 
-        main_layout.addLayout(bottom_layout)
+        layout.addWidget(
+            self.create_info_frame(
+                "Leave all password fields empty if you do not "
+                "want to change the administrator password."
+            )
+        )
+
+        current_row, self.input_cur_psw = self.create_password_row(
+            "Current Password",
+            "Enter current administrator password"
+        )
+
+        new_row, self.input_new_psw = self.create_password_row(
+            "New Password",
+            "Enter new password"
+        )
+
+        confirm_row, self.input_con_psw = self.create_password_row(
+            "Confirm Password",
+            "Re-enter new password"
+        )
+
+        layout.addWidget(current_row)
+        layout.addWidget(new_row)
+        layout.addWidget(confirm_row)
+
+        self.content_layout.addWidget(card)
+
+    # =========================================================
+    # DEPARTMENT MANAGER
+    # =========================================================
+
+    def open_department_manager(self):
+        try:
+            dialog = DepartmentManagerDialog(self.db, self)
+            dialog.exec()
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Department Manager Error",
+                f"Unable to open department manager:\n\n{error}"
+            )
+
+    # =========================================================
+    # LOAD SETTINGS
+    # =========================================================
 
     def load_settings(self):
-        fine_val = self.db.get_setting('daily_fine', 10.00)
-        default_days = self.db.get_setting('default_days', 14)
+        self._loading_settings = True
 
         try:
-            self.spin_daily_fine.setValue(float(fine_val))
-            self.spin_default_days.setValue(int(default_days))
-        except (ValueError, TypeError):
-            pass
+            fine = self.db.get_setting(
+                "daily_fine",
+                self.DEFAULTS["daily_fine"]
+            )
 
-    def save_settings(self):
-        fine_val = self.spin_daily_fine.value()
-        days_val = self.spin_default_days.value()
+            days = self.db.get_setting(
+                "default_days",
+                self.DEFAULTS["default_days"]
+            )
 
-        self.db.set_setting("daily_fine", fine_val)
-        self.db.set_setting("default_days", days_val)
+            theme = self.db.get_setting(
+                "theme_mode",
+                self.DEFAULTS["theme_mode"]
+            )
 
-        QMessageBox.information(self, "Settings Saved", "Your settings have been saved successfully!")
+            fine = float(fine)
+            days = int(days)
 
-    def reset_settings(self):
-        self.db.set_setting("daily_fine", 10.00)
-        self.db.set_setting("default_days", 14)
+            legacy_themes = {
+                "Dark Slate (Default)": "Dark",
+                "Classic Dark": "Dark",
+                "Light Modern": "Light",
+            }
 
-        QMessageBox.information(self, "Settings Reset", "Your settings have been reset successfully!")
-        self.load_settings()
+            theme = legacy_themes.get(theme, theme)
 
-    def database_backup(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Database Backup", "library_backup.db", "Database Files (*.db)")
-        if path:
-            try:
-                with open("local_library.db", "rb") as src, open(path, "wb") as dst:
-                    dst.write(src.read())
-                QMessageBox.information(self, "Success", f"Database backed up to:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to back up database:\n{e}")
+            if theme not in self.THEMES:
+                theme = self.DEFAULTS["theme_mode"]
 
-    def clear_all_logs(self):
-        reply = QMessageBox.warning(
-            self, "Confirm Deletion",
-            "Are you sure you want to delete all circulation logs?\nThis action cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            self.spin_daily_fine.setValue(fine)
+            self.spin_default_days.setValue(days)
+            self.combo_theme.setCurrentText(theme)
+
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "Settings Loading Error",
+                f"Some settings could not be loaded:\n\n{error}"
+            )
+
+        finally:
+            self._loading_settings = False
+
+        self.update_theme_description()
+        self.apply_selected_theme(self.combo_theme.currentText())
+
+    # =========================================================
+    # ADMINISTRATOR AUTHORIZATION
+    # =========================================================
+
+    def verify_admin_password(self, title, message):
+        password, ok = QInputDialog.getText(
+            self,
+            title,
+            message,
+            QLineEdit.EchoMode.Password
+        )
+
+        if not ok:
+            return False
+
+        try:
+            stored_password = self.db.get_setting(
+                "admin_password",
+                "admin123"
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Authorization Error",
+                f"Unable to verify administrator credentials:\n\n{error}"
+            )
+            return False
+
+        if password != str(stored_password):
+            QMessageBox.warning(
+                self,
+                "Access Denied",
+                "Incorrect administrator password."
+            )
+            return False
+
+        return True
+
+    # =========================================================
+    # ACADEMIC ROLLOVER
+    # =========================================================
+
+    def handle_batch_rollover_action(self):
+        if not self.verify_admin_password(
+            "Administrator Authorization",
+            "Enter the administrator password:"
+        ):
+            return
+
+        current_year = datetime.date.today().year
+        graduating_batch = current_year - 3
+
+        skip_active = self.chk_skip_active.isChecked()
+
+        confirm = QMessageBox.warning(
+            self,
+            "Confirm Academic Rollover",
+            (
+                f"Graduating batch: {graduating_batch}\n\n"
+                "This operation will export graduating student "
+                "records and remove eligible records from the "
+                "active database.\n\n"
+                f"Students with active loans will "
+                f"{'be skipped' if skip_active else 'not be skipped'}.\n\n"
+                "Create a database backup before continuing.\n\n"
+                "Continue?"
+            ),
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
-        if reply == QMessageBox.StandardButton.Yes:
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Archive Destination"
+        )
+
+        if not folder_path:
+            return
+
+        self.btn_archive_batch.setEnabled(False)
+
+        try:
+            success, count, message = (
+                self.db.export_and_delete_final_year_students(
+                    folder_path,
+                    skip_active_loans=skip_active
+                )
+            )
+
+            if success:
+                filename = (
+                    f"Graduated_Batch_{graduating_batch}_Archive.csv"
+                )
+
+                QMessageBox.information(
+                    self,
+                    "Rollover Completed",
+                    (
+                        f"{message}\n\n"
+                        f"Archived records: {count}\n"
+                        f"Archive file: {filename}\n"
+                        f"Destination: {folder_path}"
+                    )
+                )
+
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Rollover Not Completed",
+                    str(message)
+                )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Rollover Error",
+                f"Academic rollover failed:\n\n{error}"
+            )
+
+        finally:
+            self.btn_archive_batch.setEnabled(True)
+
+    # =========================================================
+    # DATABASE BACKUP
+    # =========================================================
+
+    def database_backup(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Create Database Backup",
+            "library_backup.db",
+            "SQLite Database (*.db);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        source_conn = getattr(self.db, "conn", None)
+
+        if source_conn is None:
+            QMessageBox.critical(
+                self,
+                "Backup Failed",
+                "The active database connection is unavailable."
+            )
+            return
+
+        absolute_path = os.path.abspath(file_path)
+
+        source_database = getattr(self.db, "db_path", None)
+
+        if source_database:
             try:
-                cursor = self.db.conn.cursor()
-                cursor.execute("DELETE FROM circulation_logs")
-                self.db.conn.commit()
-                QMessageBox.information(self, "Success", "Circulation logs cleared successfully.")
-            except Exception as e:
-                self.db.conn.rollback()
-                QMessageBox.critical(self, "Database Error", f"Unable to clear logs: {e}")
+                if os.path.samefile(
+                    absolute_path,
+                    os.path.abspath(str(source_database))
+                ):
+                    QMessageBox.warning(
+                        self,
+                        "Invalid Backup Location",
+                        "The backup destination cannot be the active database."
+                    )
+                    return
+            except (OSError, ValueError):
+                pass
 
-    def change_password(self):
-        cur_psw = self.input_cur_psw.text().strip()
-        new_psw = self.input_new_psw.text().strip()
-        con_psw = self.input_con_psw.text().strip()
+        if os.path.exists(absolute_path):
+            confirm = QMessageBox.question(
+                self,
+                "Overwrite Backup",
+                "A file already exists at this location.\n\nReplace it?",
+                QMessageBox.StandardButton.Yes |
+                QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
 
-        if not cur_psw or not new_psw or not con_psw:
-            QMessageBox.warning(self, "Validation Error", "Please fill in all password fields.")
-            return
-        if new_psw != con_psw:
-            QMessageBox.warning(self, "Validation Error", "New password and confirm password must match.")
-            return
-        if len(new_psw) < 4:
-            QMessageBox.warning(self, "Validation Error", "Password must be at least 4 characters long.")
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        destination_conn = None
+
+        try:
+            destination_conn = sqlite3.connect(absolute_path)
+
+            source_conn.backup(destination_conn)
+            destination_conn.commit()
+
+            result = destination_conn.execute(
+                "PRAGMA integrity_check"
+            ).fetchone()
+
+            if not result or result[0] != "ok":
+                raise sqlite3.DatabaseError(
+                    "The backup integrity check failed."
+                )
+
+            QMessageBox.information(
+                self,
+                "Backup Successful",
+                (
+                    "Database backup created and verified successfully.\n\n"
+                    f"Saved to:\n{absolute_path}"
+                )
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Backup Failed",
+                f"Unable to create database backup:\n\n{error}"
+            )
+
+        finally:
+            if destination_conn:
+                destination_conn.close()
+
+    # =========================================================
+    # CLEAR CIRCULATION LOGS
+    # =========================================================
+
+    def clear_all_logs(self):
+        if not self.verify_admin_password(
+            "Administrator Authorization",
+            "Enter the administrator password:"
+        ):
             return
 
-        stored_psw = self.db.get_setting("admin_password", "admin123")
-        if stored_psw != cur_psw:
-            QMessageBox.critical(self, "Access Denied", "Incorrect current password.")
+        confirm = QMessageBox.warning(
+            self,
+            "Permanent Deletion",
+            (
+                "You are about to permanently delete all "
+                "circulation activity logs.\n\n"
+                "This operation cannot be undone.\n\n"
+                "Create a database backup before continuing.\n\n"
+                "Are you absolutely sure?"
+            ),
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if confirm != QMessageBox.StandardButton.Yes:
             return
 
-        self.db.set_setting("admin_password", new_psw)
-        QMessageBox.information(self, "Success", "Password updated successfully!")
+        self.clear_logs_btn.setEnabled(False)
+
+        try:
+            success, message = self.db.clear_all_logs()
+
+            if success:
+                QMessageBox.information(
+                    self,
+                    "Logs Cleared",
+                    str(message)
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Deletion Failed",
+                    str(message)
+                )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Database Error",
+                f"Unable to clear circulation logs:\n\n{error}"
+            )
+
+        finally:
+            self.clear_logs_btn.setEnabled(True)
+
+    # =========================================================
+    # RESET DEFAULTS
+    # =========================================================
+
+    def reset_defaults(self):
+        confirm = QMessageBox.question(
+            self,
+            "Reset Application Settings",
+            (
+                "Restore the default circulation and appearance settings?\n\n"
+                "This will not delete books, users or circulation logs.\n\n"
+                "Click Save All Settings to persist the changes."
+            ),
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self.spin_daily_fine.setValue(
+            self.DEFAULTS["daily_fine"]
+        )
+
+        self.spin_default_days.setValue(
+            self.DEFAULTS["default_days"]
+        )
+
+        self.chk_skip_active.setChecked(True)
+
+        blocker = QSignalBlocker(self.combo_theme)
+        self.combo_theme.setCurrentText(
+            self.DEFAULTS["theme_mode"]
+        )
+        del blocker
+
+        self.apply_selected_theme(
+            self.DEFAULTS["theme_mode"]
+        )
+
+        self.update_theme_description()
 
         self.input_cur_psw.clear()
         self.input_new_psw.clear()
         self.input_con_psw.clear()
+
+        QMessageBox.information(
+            self,
+            "Defaults Restored",
+            (
+                "Default values have been restored in the interface.\n\n"
+                "Click Save All Settings to save them permanently."
+            )
+        )
+
+    # =========================================================
+    # VALIDATION
+    # =========================================================
+
+    def validate_settings(self):
+        fine = self.spin_daily_fine.value()
+        days = self.spin_default_days.value()
+        theme = self.combo_theme.currentText()
+
+        if fine < 0:
+            QMessageBox.warning(
+                self,
+                "Invalid Fine",
+                "The daily overdue fine cannot be negative."
+            )
+            return False
+
+        if not 1 <= days <= 365:
+            QMessageBox.warning(
+                self,
+                "Invalid Loan Duration",
+                "The loan duration must be between 1 and 365 days."
+            )
+            return False
+
+        if theme not in self.THEMES:
+            QMessageBox.warning(
+                self,
+                "Invalid Theme",
+                "Select a valid application theme."
+            )
+            return False
+
+        return True
+
+    def validate_password_change(self):
+        current_password = self.input_cur_psw.text()
+        new_password = self.input_new_psw.text()
+        confirm_password = self.input_con_psw.text()
+
+        if not any((
+            current_password,
+            new_password,
+            confirm_password
+        )):
+            return True
+
+        if not all((
+            current_password,
+            new_password,
+            confirm_password
+        )):
+            QMessageBox.warning(
+                self,
+                "Incomplete Password Details",
+                "Complete all three password fields."
+            )
+            return False
+
+        if new_password != confirm_password:
+            QMessageBox.warning(
+                self,
+                "Password Mismatch",
+                "The new password and confirmation do not match."
+            )
+            return False
+
+        if len(new_password) < 8:
+            QMessageBox.warning(
+                self,
+                "Weak Password",
+                "The new password must contain at least 8 characters."
+            )
+            return False
+
+        try:
+            stored_password = self.db.get_setting(
+                "admin_password",
+                "admin123"
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Password Verification Error",
+                str(error)
+            )
+            return False
+
+        if current_password != str(stored_password):
+            QMessageBox.warning(
+                self,
+                "Incorrect Password",
+                "The current administrator password is incorrect."
+            )
+            return False
+
+        return True
+
+    # =========================================================
+    # SAVE SETTINGS
+    # =========================================================
+
+    def save_settings(self):
+        if self._saving_settings:
+            return
+
+        if not self.validate_settings():
+            return
+
+        if not self.validate_password_change():
+            return
+
+        self._saving_settings = True
+        self.btn_save.setEnabled(False)
+
+        try:
+            self.db.set_setting(
+                "daily_fine",
+                self.spin_daily_fine.value()
+            )
+
+            self.db.set_setting(
+                "default_days",
+                self.spin_default_days.value()
+            )
+
+            theme_name = self.combo_theme.currentText()
+
+            self.db.set_setting(
+                "theme_mode",
+                theme_name
+            )
+
+            new_password = self.input_new_psw.text()
+
+            if new_password:
+                self.db.set_setting(
+                    "admin_password",
+                    new_password
+                )
+
+            self.apply_selected_theme(theme_name)
+            self.update_theme_description()
+
+            self.input_cur_psw.clear()
+            self.input_new_psw.clear()
+            self.input_con_psw.clear()
+
+            QMessageBox.information(
+                self,
+                "Settings Saved",
+                "Application settings have been saved successfully."
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                (
+                    "Unable to save all settings.\n\n"
+                    f"Error: {error}\n\n"
+                    "Check your saved settings before retrying."
+                )
+            )
+
+        finally:
+            self._saving_settings = False
+            self.btn_save.setEnabled(True)
+
+    # =========================================================
+    # CLEANUP
+    # =========================================================
+
+    def closeEvent(self, event):
+        manager = self._theme_manager
+
+        if manager:
+            signal = getattr(manager, "themeChanged", None)
+
+            if signal:
+                try:
+                    signal.disconnect(self.on_global_theme_changed)
+                except (TypeError, RuntimeError):
+                    pass
+
+        super().closeEvent(event)
