@@ -1377,6 +1377,7 @@ class LoginDialog(QDialog):
         super().__init__(parent)
 
         self.db = db
+        self._verification_in_progress = False
 
         configure_dialog(
             self,
@@ -1414,12 +1415,18 @@ class LoginDialog(QDialog):
             self.verify_password
         )
 
-        self.btn_login.setDefault(True)
+        self.btn_login.setDefault(False)
+        self.btn_login.setAutoDefault(False)
         layout.addWidget(self.btn_login)
 
         self.input_admin_password.setFocus()
 
     def verify_password(self):
+        if self._verification_in_progress:
+            return
+
+        self._verification_in_progress = True
+
         try:
             password = self.db.get_setting(
                 "admin_password",
@@ -1442,6 +1449,8 @@ class LoginDialog(QDialog):
 
         except Exception as error:
             show_error(self, "Authentication Error", error)
+        finally:
+            self._verification_in_progress = False
 
 
 # ============================================================

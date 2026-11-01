@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QSizePolicy,
     QMessageBox,
-    QApplication
+    QApplication,
 )
 
 from PyQt6.QtGui import QIcon, QFont
@@ -21,7 +21,7 @@ from PyQt6.QtCore import (
     Qt,
     QPropertyAnimation,
     QEasingCurve,
-    QParallelAnimationGroup
+    QParallelAnimationGroup,
 )
 
 from pages.bookcatalog_view import CatalogView
@@ -34,6 +34,9 @@ from pages.dashboard_view import DashboardView
 
 class MainWindow(QMainWindow):
 
+    SIDEBAR_WIDTH = 230
+    SIDEBAR_COLLAPSED_WIDTH = 0
+
     def __init__(self, db):
 
         super().__init__()
@@ -41,6 +44,8 @@ class MainWindow(QMainWindow):
         self.db = db
         self.sidebar_expanded = True
         self.anim_group = None
+        self.nav_buttons = []
+        self.page_views = []
 
         app = QApplication.instance()
 
@@ -50,8 +55,12 @@ class MainWindow(QMainWindow):
             None
         )
 
-        self.setWindowTitle("Library Management System")
+        self.setWindowTitle(
+            "Library Management System"
+        )
+
         self.setMinimumSize(1024, 640)
+        self.resize(1440, 900)
 
         self.load_saved_theme()
 
@@ -59,12 +68,16 @@ class MainWindow(QMainWindow):
         self.initialize_ui()
 
         if self.theme_manager:
-            self.theme_manager.themeChanged.connect(
-                self.apply_shell_theme
-            )
+            try:
+                self.theme_manager.themeChanged.connect(
+                    self.apply_shell_theme
+                )
+            except Exception as error:
+                print(
+                    f"Theme signal connection warning: {error}"
+                )
 
         self.apply_shell_theme()
-
         self.switch_page(0)
 
     # ========================================================
@@ -83,7 +96,7 @@ class MainWindow(QMainWindow):
             legacy_themes = {
                 "Dark Slate (Default)": "Dark",
                 "Classic Dark": "Dark",
-                "Light Modern": "Light"
+                "Light Modern": "Light",
             }
 
             saved_theme = legacy_themes.get(
@@ -91,116 +104,277 @@ class MainWindow(QMainWindow):
                 saved_theme
             )
 
-            if saved_theme not in ("Dark", "Light", "System"):
+            if saved_theme not in (
+                "Dark",
+                "Light",
+                "System"
+            ):
                 saved_theme = "Dark"
 
             if self.theme_manager:
-                self.theme_manager.set_theme(saved_theme)
+                self.theme_manager.set_theme(
+                    saved_theme
+                )
 
         except Exception as error:
 
-            print(f"Theme initialization warning: {error}")
+            print(
+                f"Theme initialization warning: {error}"
+            )
+
+    def get_theme_colors(self):
+
+        fallback_colors = {
+            "window": "#111827",
+            "surface": "#1B2433",
+            "surface_alt": "#273449",
+            "input": "#202C3D",
+            "text": "#F3F6FC",
+            "muted": "#9AA8BC",
+            "border": "#344155",
+            "primary": "#5577F5",
+            "primary_hover": "#4263DB",
+        }
+
+        if not self.theme_manager:
+            return fallback_colors
+
+        try:
+
+            active_theme = (
+                self.theme_manager.get_active_theme()
+            )
+
+            colors = self.theme_manager.COLORS.get(
+                active_theme
+            )
+
+            if not colors:
+                return fallback_colors
+
+            # Fill missing color values safely.
+            result = fallback_colors.copy()
+            result.update(colors)
+
+            return result
+
+        except Exception as error:
+
+            print(
+                f"Theme color warning: {error}"
+            )
+
+            return fallback_colors
 
     def apply_shell_theme(self, active_theme=None):
-        """Apply theme-specific colors to the main window shell."""
+        """
+        Apply theme-specific colors to the main window shell.
+        """
 
         if not self.theme_manager:
             return
 
-        active_theme = (
-            active_theme
-            or self.theme_manager.get_active_theme()
-        )
+        try:
 
-        colors = self.theme_manager.COLORS[active_theme]
+            if active_theme is None:
+                active_theme = (
+                    self.theme_manager.get_active_theme()
+                )
 
-        self.setStyleSheet(f"""
-            QWidget#MainCentralWidget {{
-                background-color: {colors["window"]};
-            }}
+            colors = self.theme_manager.COLORS.get(
+                active_theme
+            )
 
-            QFrame#TopBar {{
-                background-color: {colors["surface"]};
-                border-bottom: 1px solid {colors["border"]};
-            }}
+            if not colors:
+                colors = self.get_theme_colors()
 
-            QFrame#SideBar {{
-                background-color: {colors["surface"]};
-                border-right: 1px solid {colors["border"]};
-            }}
+            window = colors.get(
+                "window",
+                "#111827"
+            )
 
-            QPushButton#SidebarToggle {{
-                background-color: {colors["input"]};
-                color: {colors["text"]};
-                border: 1px solid {colors["border"]};
-                border-radius: 8px;
-                font-size: 18px;
-            }}
+            surface = colors.get(
+                "surface",
+                "#1B2433"
+            )
 
-            QPushButton#SidebarToggle:hover {{
-                background-color: {colors["surface_alt"]};
-                border-color: {colors["primary"]};
-            }}
+            surface_alt = colors.get(
+                "surface_alt",
+                "#273449"
+            )
 
-            QPushButton#NavigationButton {{
-                background-color: transparent;
-                color: {colors["muted"]};
-                border: 1px solid transparent;
-                text-align: left;
-                padding-left: 16px;
-                font-size: 14px;
-                font-weight: 600;
-                min-height: 44px;
-                margin: 3px 12px;
-                border-radius: 8px;
-            }}
+            input_color = colors.get(
+                "input",
+                surface_alt
+            )
 
-            QPushButton#NavigationButton:hover {{
-                background-color: {colors["surface_alt"]};
-                color: {colors["text"]};
-            }}
+            text = colors.get(
+                "text",
+                "#F3F6FC"
+            )
 
-            QPushButton#NavigationButton:checked {{
-                background-color: {colors["primary"]};
-                color: #FFFFFF;
-                border: 1px solid {colors["primary_hover"]};
-            }}
+            muted = colors.get(
+                "muted",
+                "#9AA8BC"
+            )
 
-            QPushButton#ExitButton {{
-                background-color: rgba(239, 68, 68, 0.10);
-                color: #EF4444;
-                text-align: left;
-                padding-left: 16px;
-                min-height: 44px;
-                margin: 4px 12px;
-                border-radius: 8px;
-                font-weight: 600;
-                font-size: 14px;
-                border: 1px solid rgba(239, 68, 68, 0.25);
-            }}
+            border = colors.get(
+                "border",
+                "#344155"
+            )
 
-            QPushButton#ExitButton:hover {{
-                background-color: #DC2626;
-                color: #FFFFFF;
-                border-color: #DC2626;
-            }}
+            primary = colors.get(
+                "primary",
+                "#5577F5"
+            )
 
-            QLabel#MainTitle {{
-                color: {colors["text"]};
-                border: none;
-                background: transparent;
-            }}
+            primary_hover = colors.get(
+                "primary_hover",
+                "#4263DB"
+            )
 
-            QLabel#SystemStatusBadge {{
-                background-color: rgba(16, 185, 129, 0.12);
-                color: #10B981;
-                font-size: 12px;
-                font-weight: 600;
-                padding: 6px 12px;
-                border-radius: 14px;
-                border: 1px solid rgba(16, 185, 129, 0.3);
-            }}
-        """)
+            success = colors.get(
+                "success",
+                "#16A34A"
+            )
+
+            self.setStyleSheet(f"""
+
+                /* Main window */
+
+                QMainWindow {{
+                    background-color: {window};
+                }}
+
+                QWidget#MainCentralWidget {{
+                    background-color: {window};
+                    color: {text};
+                }}
+
+                /* Top bar */
+
+                QFrame#TopBar {{
+                    background-color: {surface};
+                    border-bottom: 1px solid {border};
+                }}
+
+                QLabel#MainTitle {{
+                    color: {text};
+                    background-color: transparent;
+                    border: none;
+                    font-size: 17px;
+                    font-weight: 700;
+                }}
+
+                /* Sidebar toggle */
+
+                QPushButton#SidebarToggle {{
+                    background-color: {input_color};
+                    color: {text};
+                    border: 1px solid {border};
+                    border-radius: 9px;
+                    font-size: 19px;
+                    font-weight: 600;
+                }}
+
+                QPushButton#SidebarToggle:hover {{
+                    background-color: {surface_alt};
+                    border-color: {primary};
+                }}
+
+                QPushButton#SidebarToggle:pressed {{
+                    background-color: {primary};
+                    color: #FFFFFF;
+                }}
+
+                /* Librarian greeting */
+
+                QLabel#SystemStatusBadge {{
+                    background-color: {surface_alt};
+                    color: {success};
+                    font-size: 12px;
+                    font-weight: 600;
+                    padding: 7px 14px;
+                    min-height: 20px;
+                    border-radius: 15px;
+                    border: 1px solid {border};
+                }}
+
+                /* Sidebar */
+
+                QFrame#SideBar {{
+                    background-color: {surface};
+                    border-right: 1px solid {border};
+                }}
+
+                QPushButton#NavigationButton {{
+                    background-color: transparent;
+                    color: {muted};
+                    border: 1px solid transparent;
+                    text-align: left;
+                    padding-left: 16px;
+                    padding-right: 10px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    min-height: 44px;
+                    margin: 3px 12px;
+                    border-radius: 9px;
+                }}
+
+                QPushButton#NavigationButton:hover {{
+                    background-color: {surface_alt};
+                    color: {text};
+                }}
+
+                QPushButton#NavigationButton:checked {{
+                    background-color: {primary};
+                    color: #FFFFFF;
+                    border: 1px solid {primary_hover};
+                    font-weight: 700;
+                }}
+
+                QPushButton#NavigationButton:focus {{
+                    outline: none;
+                }}
+
+                /* Exit button */
+
+                QPushButton#ExitButton {{
+                    background-color: rgba(239, 68, 68, 0.10);
+                    color: #EF6464;
+                    text-align: left;
+                    padding-left: 16px;
+                    min-height: 44px;
+                    margin: 4px 12px;
+                    border-radius: 9px;
+                    font-weight: 600;
+                    font-size: 13px;
+                    border: 1px solid rgba(239, 68, 68, 0.25);
+                }}
+
+                QPushButton#ExitButton:hover {{
+                    background-color: #DC2626;
+                    color: #FFFFFF;
+                    border-color: #DC2626;
+                }}
+
+                /* Pages container */
+
+                QStackedWidget#MainPages {{
+                    background-color: {window};
+                    border: none;
+                }}
+
+            """)
+
+            # Update the shell background palette.
+            self.setAutoFillBackground(True)
+
+        except Exception as error:
+
+            print(
+                f"Shell theme application error: {error}"
+            )
 
     # ========================================================
     # RESOURCE MANAGEMENT
@@ -218,7 +392,10 @@ class MainWindow(QMainWindow):
 
         return os.path.join(
             base_dir,
-            *relative_path.replace("\\", "/").split("/")
+            *relative_path.replace(
+                "\\",
+                "/"
+            ).split("/")
         )
 
     def initialize_window_icon(self):
@@ -228,7 +405,10 @@ class MainWindow(QMainWindow):
         )
 
         if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+
+            self.setWindowIcon(
+                QIcon(icon_path)
+            )
 
     # ========================================================
     # MAIN USER INTERFACE
@@ -237,13 +417,21 @@ class MainWindow(QMainWindow):
     def initialize_ui(self):
 
         main_widget = QWidget()
-        main_widget.setObjectName("MainCentralWidget")
+
+        main_widget.setObjectName(
+            "MainCentralWidget"
+        )
 
         self.setCentralWidget(main_widget)
 
-        main_layout = QVBoxLayout(main_widget)
+        main_layout = QVBoxLayout(
+            main_widget
+        )
 
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setContentsMargins(
+            0, 0, 0, 0
+        )
+
         main_layout.setSpacing(0)
 
         self.create_topbar(main_layout)
@@ -256,21 +444,41 @@ class MainWindow(QMainWindow):
     def create_topbar(self, parent_layout):
 
         topbar = QFrame()
-        topbar.setObjectName("TopBar")
-        topbar.setFixedHeight(68)
 
-        top_layout = QHBoxLayout(topbar)
+        topbar.setObjectName(
+            "TopBar"
+        )
 
-        top_layout.setContentsMargins(16, 0, 24, 0)
-        top_layout.setSpacing(14)
+        topbar.setFixedHeight(72)
+
+        top_layout = QHBoxLayout(
+            topbar
+        )
+
+        top_layout.setContentsMargins(
+            18, 0, 24, 0
+        )
+
+        top_layout.setSpacing(15)
+
+        # Sidebar toggle
 
         self.toggle_btn = QPushButton("☰")
 
-        self.toggle_btn.setObjectName("SidebarToggle")
-        self.toggle_btn.setFixedSize(42, 42)
+        self.toggle_btn.setObjectName(
+            "SidebarToggle"
+        )
+
+        self.toggle_btn.setFixedSize(
+            42, 42
+        )
 
         self.toggle_btn.setCursor(
             Qt.CursorShape.PointingHandCursor
+        )
+
+        self.toggle_btn.setFocusPolicy(
+            Qt.FocusPolicy.NoFocus
         )
 
         self.toggle_btn.setToolTip(
@@ -281,21 +489,35 @@ class MainWindow(QMainWindow):
             self.toggle_sidebar
         )
 
-        top_layout.addWidget(self.toggle_btn)
+        top_layout.addWidget(
+            self.toggle_btn
+        )
+
+        # Application title
 
         title_label = QLabel(
             "Library Management System"
         )
 
-        title_label.setObjectName("MainTitle")
-
-        title_label.setFont(
-            QFont("Segoe UI", 16, QFont.Weight.Bold)
+        title_label.setObjectName(
+            "MainTitle"
         )
 
-        top_layout.addWidget(title_label)
+        title_label.setFont(
+            QFont(
+                "Segoe UI",
+                16,
+                QFont.Weight.Bold
+            )
+        )
+
+        top_layout.addWidget(
+            title_label
+        )
 
         top_layout.addStretch()
+
+        # Librarian greeting
 
         self.status_badge = QLabel(
             "● Hi, Librarian!"
@@ -305,9 +527,17 @@ class MainWindow(QMainWindow):
             "SystemStatusBadge"
         )
 
-        # top_layout.addWidget(self.status_badge)
+        self.status_badge.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
 
-        parent_layout.addWidget(topbar)
+        top_layout.addWidget(
+            self.status_badge
+        )
+
+        parent_layout.addWidget(
+            topbar
+        )
 
     # ========================================================
     # CONTENT AREA
@@ -317,15 +547,28 @@ class MainWindow(QMainWindow):
 
         content_widget = QWidget()
 
-        content_layout = QHBoxLayout(content_widget)
+        content_layout = QHBoxLayout(
+            content_widget
+        )
 
-        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setContentsMargins(
+            0, 0, 0, 0
+        )
+
         content_layout.setSpacing(0)
 
-        self.create_sidebar(content_layout)
-        self.create_pages(content_layout)
+        self.create_sidebar(
+            content_layout
+        )
 
-        parent_layout.addWidget(content_widget)
+        self.create_pages(
+            content_layout
+        )
+
+        parent_layout.addWidget(
+            content_widget,
+            1
+        )
 
     # ========================================================
     # SIDEBAR
@@ -334,23 +577,35 @@ class MainWindow(QMainWindow):
     def create_sidebar(self, parent_layout):
 
         self.sidebar = QFrame()
-        self.sidebar.setObjectName("SideBar")
 
-        self.sidebar.setMinimumWidth(230)
-        self.sidebar.setMaximumWidth(230)
+        self.sidebar.setObjectName(
+            "SideBar"
+        )
+
+        self.sidebar.setMinimumWidth(
+            self.SIDEBAR_WIDTH
+        )
+
+        self.sidebar.setMaximumWidth(
+            self.SIDEBAR_WIDTH
+        )
 
         self.sidebar.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
             QSizePolicy.Policy.Expanding
         )
 
-        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout = QVBoxLayout(
+            self.sidebar
+        )
 
         sidebar_layout.setContentsMargins(
-            0, 14, 0, 14
+            0, 18, 0, 14
         )
 
         sidebar_layout.setSpacing(4)
+
+        # Navigation items
 
         navigation_items = [
             ("📊  Dashboard", 0),
@@ -358,7 +613,7 @@ class MainWindow(QMainWindow):
             ("👥  Users Details", 2),
             ("🔄  Circulation", 3),
             ("📈  Reports", 4),
-            ("⚙️  Settings", 5)
+            ("⚙️  Settings", 5),
         ]
 
         self.nav_buttons = []
@@ -367,11 +622,20 @@ class MainWindow(QMainWindow):
 
             button = QPushButton(title)
 
-            button.setObjectName("NavigationButton")
+            button.setObjectName(
+                "NavigationButton"
+            )
+
             button.setCheckable(True)
+
+            button.setAutoExclusive(False)
 
             button.setCursor(
                 Qt.CursorShape.PointingHandCursor
+            )
+
+            button.setFocusPolicy(
+                Qt.FocusPolicy.NoFocus
             )
 
             button.clicked.connect(
@@ -379,7 +643,9 @@ class MainWindow(QMainWindow):
                 self.switch_page(idx)
             )
 
-            sidebar_layout.addWidget(button)
+            sidebar_layout.addWidget(
+                button
+            )
 
             self.nav_buttons.append(
                 (button, index)
@@ -393,26 +659,41 @@ class MainWindow(QMainWindow):
             self.reports_btn,
             self.settings_btn
         ) = [
-            button for button, _ in self.nav_buttons
+            button
+            for button, _ in self.nav_buttons
         ]
 
         sidebar_layout.addStretch()
 
-        exit_btn = QPushButton("⏻  Exit System")
+        # Exit button
 
-        exit_btn.setObjectName("ExitButton")
+        exit_btn = QPushButton(
+            "⏻  Exit System"
+        )
+
+        exit_btn.setObjectName(
+            "ExitButton"
+        )
 
         exit_btn.setCursor(
             Qt.CursorShape.PointingHandCursor
+        )
+
+        exit_btn.setFocusPolicy(
+            Qt.FocusPolicy.NoFocus
         )
 
         exit_btn.clicked.connect(
             self.confirm_exit
         )
 
-        sidebar_layout.addWidget(exit_btn)
+        sidebar_layout.addWidget(
+            exit_btn
+        )
 
-        parent_layout.addWidget(self.sidebar)
+        parent_layout.addWidget(
+            self.sidebar
+        )
 
     # ========================================================
     # PAGE INITIALIZATION
@@ -422,8 +703,15 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget()
 
+        self.pages.setObjectName(
+            "MainPages"
+        )
+
         # Dashboard
-        self.dashboard_view = DashboardView(self.db)
+
+        self.dashboard_view = DashboardView(
+            self.db
+        )
 
         if hasattr(
             self.dashboard_view,
@@ -435,7 +723,10 @@ class MainWindow(QMainWindow):
             )
 
         # Other pages
-        self.catalog_view = CatalogView(self.db)
+
+        self.catalog_view = CatalogView(
+            self.db
+        )
 
         self.usermanagement_view = UserManagementView(
             self.db
@@ -454,42 +745,52 @@ class MainWindow(QMainWindow):
         )
 
         # Register pages in navigation order.
+
         self.page_views = [
             self.dashboard_view,
             self.catalog_view,
             self.usermanagement_view,
             self.circulation_view,
             self.reports_view,
-            self.settings_view
+            self.settings_view,
         ]
 
         for page in self.page_views:
             self.pages.addWidget(page)
 
-        parent_layout.addWidget(self.pages)
+        parent_layout.addWidget(
+            self.pages,
+            1
+        )
 
     # ========================================================
     # DASHBOARD NAVIGATION
     # ========================================================
 
-    def handle_dashboard_navigation(self, view_name: str):
+    def handle_dashboard_navigation(
+        self,
+        view_name: str
+    ):
 
         route_map = {
             "dashboard": 0,
             "catalog": 1,
             "books": 1,
             "users": 2,
+            "user management": 2,
             "circulation": 3,
             "reports": 4,
-            "settings": 5
+            "settings": 5,
         }
 
         target_index = route_map.get(
-            str(view_name).lower()
+            str(view_name).strip().lower()
         )
 
         if target_index is not None:
-            self.switch_page(target_index)
+            self.switch_page(
+                target_index
+            )
 
     # ========================================================
     # PAGE REFRESH
@@ -504,7 +805,7 @@ class MainWindow(QMainWindow):
                     "refresh_dashboard",
                     "load_dashboard_data",
                     "load_data",
-                    "update_stats"
+                    "update_stats",
                 )
             ),
 
@@ -531,7 +832,7 @@ class MainWindow(QMainWindow):
             5: (
                 self.settings_view,
                 ("load_settings",)
-            )
+            ),
         }
 
         if index not in refresh_methods:
@@ -563,10 +864,15 @@ class MainWindow(QMainWindow):
 
     def switch_page(self, index):
 
+        if not hasattr(self, "pages"):
+            return
+
         if not 0 <= index < self.pages.count():
             return
 
-        self.pages.setCurrentIndex(index)
+        self.pages.setCurrentIndex(
+            index
+        )
 
         for button, button_index in self.nav_buttons:
 
@@ -582,13 +888,23 @@ class MainWindow(QMainWindow):
 
     def toggle_sidebar(self):
 
+        if self.anim_group and (
+            self.anim_group.state()
+            == QParallelAnimationGroup.State.Running
+        ):
+            self.anim_group.stop()
+
         target_width = (
-            0 if self.sidebar_expanded else 230
+            self.SIDEBAR_COLLAPSED_WIDTH
+            if self.sidebar_expanded
+            else self.SIDEBAR_WIDTH
         )
 
-        current_width = self.sidebar.width()
+        current_width = self.sidebar.maximumWidth()
 
-        self.anim_group = QParallelAnimationGroup(self)
+        self.anim_group = QParallelAnimationGroup(
+            self
+        )
 
         for property_name in (
             b"minimumWidth",
@@ -597,21 +913,31 @@ class MainWindow(QMainWindow):
 
             animation = QPropertyAnimation(
                 self.sidebar,
-                property_name
+                property_name,
+                self
             )
 
             animation.setDuration(240)
 
-            animation.setStartValue(current_width)
-            animation.setEndValue(target_width)
+            animation.setStartValue(
+                current_width
+            )
+
+            animation.setEndValue(
+                target_width
+            )
 
             animation.setEasingCurve(
                 QEasingCurve.Type.InOutCubic
             )
 
-            self.anim_group.addAnimation(animation)
+            self.anim_group.addAnimation(
+                animation
+            )
 
-        self.sidebar_expanded = not self.sidebar_expanded
+        self.sidebar_expanded = (
+            not self.sidebar_expanded
+        )
 
         self.anim_group.start()
 

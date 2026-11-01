@@ -3,7 +3,6 @@ import sqlite3
 import datetime
 
 from PyQt6.QtCore import Qt, QSignalBlocker
-from PyQt6.QtGui import QFont, QFontDatabase
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QHBoxLayout, QVBoxLayout,
     QLineEdit, QCheckBox, QPushButton, QFileDialog,
@@ -25,19 +24,6 @@ class SettingsView(QWidget):
 
     THEMES = ("Dark", "Light", "System")
 
-    FONT_SIZES = {
-        "page_title": 26,
-        "page_subtitle": 12,
-        "section_title": 16,
-        "section_description": 12,
-        "card_title": 14,
-        "field_label": 13,
-        "body": 13,
-        "helper": 12,
-        "button": 13,
-        "input": 13,
-    }
-
     def __init__(self, db):
         super().__init__()
 
@@ -45,95 +31,13 @@ class SettingsView(QWidget):
         self._loading_settings = False
         self._saving_settings = False
         self._theme_manager = None
-        self.font_family = self.get_application_font()
 
         self.setObjectName("SettingsView")
 
         self.init_ui()
-        self.setup_typography()
+        self.apply_theme()
         self.connect_theme_manager()
         self.load_settings()
-
-    # =========================================================
-    # TYPOGRAPHY
-    # =========================================================
-
-    @staticmethod
-    def get_application_font():
-        available_fonts = set(QFontDatabase.families())
-
-        if "Segoe UI Variable" in available_fonts:
-            return "Segoe UI Variable"
-
-        if "Segoe UI" in available_fonts:
-            return "Segoe UI"
-
-        if "Arial" in available_fonts:
-            return "Arial"
-
-        return QApplication.font().family()
-
-    def make_font(self, size=13, weight=QFont.Weight.Normal):
-        font = QFont(self.font_family)
-        font.setPointSizeF(size * 72 / 96)
-        font.setWeight(weight)
-        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        return font
-
-    def setup_typography(self):
-        self.setFont(self.make_font(13))
-
-        font_map = {
-            "PageTitle": (26, QFont.Weight.Bold),
-            "PageSubtitle": (12, QFont.Weight.Normal),
-            "SectionTitle": (16, QFont.Weight.DemiBold),
-            "SectionDescription": (12, QFont.Weight.Normal),
-            "CardTitle": (14, QFont.Weight.DemiBold),
-            "FieldLabel": (13, QFont.Weight.DemiBold),
-            "MutedLabel": (12, QFont.Weight.Normal),
-            "DangerTitle": (14, QFont.Weight.Bold),
-        }
-
-        for label in self.findChildren(QLabel):
-            settings = font_map.get(label.objectName())
-
-            if settings:
-                size, weight = settings
-                label.setFont(self.make_font(size, weight))
-            else:
-                label.setFont(
-                    self.make_font(13, QFont.Weight.Normal)
-                )
-
-        for button in self.findChildren(QPushButton):
-            button.setFont(
-                self.make_font(13, QFont.Weight.DemiBold)
-            )
-
-        for field in self.findChildren(QLineEdit):
-            field.setFont(
-                self.make_font(13, QFont.Weight.Normal)
-            )
-
-        for combo in self.findChildren(QComboBox):
-            combo.setFont(
-                self.make_font(13, QFont.Weight.Normal)
-            )
-
-        for spin in self.findChildren(QSpinBox):
-            spin.setFont(
-                self.make_font(13, QFont.Weight.Normal)
-            )
-
-        for spin in self.findChildren(QDoubleSpinBox):
-            spin.setFont(
-                self.make_font(13, QFont.Weight.Normal)
-            )
-
-        for checkbox in self.findChildren(QCheckBox):
-            checkbox.setFont(
-                self.make_font(13, QFont.Weight.Normal)
-            )
 
     # =========================================================
     # THEME MANAGEMENT
@@ -170,10 +74,169 @@ class SettingsView(QWidget):
             )
 
             if signal:
-                try:
-                    signal.connect(self.on_global_theme_changed)
-                except (TypeError, RuntimeError):
-                    pass
+                signal.connect(self.on_global_theme_changed)
+
+    def apply_theme(self, *_):
+        manager = self._theme_manager or self.get_theme_manager()
+        theme = getattr(manager, "active_theme", "Dark")
+        colors = getattr(manager, "COLORS", {}).get(theme)
+
+        if colors is None:
+            palette = QApplication.palette()
+            colors = {
+                "window": palette.color(
+                    palette.ColorRole.Window
+                ).name(),
+                "surface": palette.color(
+                    palette.ColorRole.Button
+                ).name(),
+                "surface_alt": palette.color(
+                    palette.ColorRole.AlternateBase
+                ).name(),
+                "input": palette.color(
+                    palette.ColorRole.Base
+                ).name(),
+                "border": palette.color(
+                    palette.ColorRole.Mid
+                ).name(),
+                "text": palette.color(
+                    palette.ColorRole.Text
+                ).name(),
+                "muted": palette.color(
+                    palette.ColorRole.PlaceholderText
+                ).name(),
+                "primary": palette.color(
+                    palette.ColorRole.Highlight
+                ).name(),
+                "primary_hover": palette.color(
+                    palette.ColorRole.Highlight
+                ).darker(115).name(),
+                "danger": "#DC2626",
+            }
+
+        c = colors
+        self.setStyleSheet(f"""
+            QWidget#SettingsView {{
+                background-color: {c["window"]};
+                color: {c["text"]};
+                font-family: "Segoe UI";
+                font-size: 12px;
+            }}
+
+            QLabel {{
+                color: {c["text"]};
+                background: transparent;
+                border: none;
+            }}
+
+            QLabel#PageTitle {{
+                color: {c["text"]};
+                font-size: 23px;
+                font-weight: 700;
+            }}
+
+            QLabel#PageSubtitle,
+            QLabel#SectionDescription,
+            QLabel#MutedLabel {{
+                color: {c["muted"]};
+                font-size: 12px;
+            }}
+
+            QLabel#SectionTitle {{
+                color: {c["text"]};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+
+            QLabel#FieldLabel {{
+                color: {c["text"]};
+                font-size: 12px;
+                font-weight: 600;
+            }}
+
+            QLabel#DangerTitle {{
+                color: {c["danger"]};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+
+            QFrame#SettingsCard,
+            QFrame#SettingsActionBar {{
+                background-color: {c["surface"]};
+                border: 1px solid {c["border"]};
+                border-radius: 10px;
+            }}
+
+            QFrame#InfoFrame {{
+                background-color: {c["surface_alt"]};
+                border: 1px solid {c["border"]};
+                border-radius: 8px;
+            }}
+
+            QFrame#DangerFrame {{
+                background-color: {c["surface_alt"]};
+                border: 1px solid {c["danger"]};
+                border-radius: 8px;
+            }}
+
+            QFrame#SettingsSeparator {{
+                color: {c["border"]};
+            }}
+
+            QPushButton {{
+                color: {c["text"]};
+                font-size: 12px;
+                font-weight: 600;
+                border-radius: 7px;
+                padding: 8px 13px;
+            }}
+
+            QPushButton#PrimaryButton {{
+                background-color: {c["primary"]};
+                color: white;
+                border: none;
+            }}
+
+            QPushButton#PrimaryButton:hover {{
+                background-color: {c["primary_hover"]};
+            }}
+
+            QPushButton#SecondaryButton,
+            QPushButton#SmallButton {{
+                background-color: {c["surface_alt"]};
+                border: 1px solid {c["border"]};
+            }}
+
+            QPushButton#SecondaryButton:hover,
+            QPushButton#SmallButton:hover {{
+                border-color: {c["primary"]};
+            }}
+
+            QPushButton#DangerButton {{
+                background-color: {c["danger"]};
+                color: white;
+                border: none;
+            }}
+
+            QLineEdit,
+            QComboBox,
+            QSpinBox,
+            QDoubleSpinBox {{
+                background-color: {c["input"]};
+                color: {c["text"]};
+                border: 1px solid {c["border"]};
+                border-radius: 7px;
+                padding: 7px 10px;
+                font-size: 12px;
+            }}
+
+            QLineEdit:focus,
+            QComboBox:focus,
+            QSpinBox:focus,
+            QDoubleSpinBox:focus {{
+                border-color: {c["primary"]};
+            }}
+        """)
 
     def apply_selected_theme(self, theme_name):
         manager = self._theme_manager or self.get_theme_manager()
@@ -195,6 +258,7 @@ class SettingsView(QWidget):
             return False
 
     def on_global_theme_changed(self, theme_name):
+        self.apply_theme()
         self.update_theme_description()
 
     def on_theme_changed(self, theme_name):
@@ -335,14 +399,14 @@ class SettingsView(QWidget):
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(25, 22, 25, 20)
-        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(12)
 
         # Header
         header = QHBoxLayout()
 
         title_group = QVBoxLayout()
-        title_group.setSpacing(5)
+        title_group.setSpacing(2)
 
         title = QLabel("Settings & Configuration")
         title.setObjectName("PageTitle")
