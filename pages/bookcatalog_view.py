@@ -1,10 +1,9 @@
-
 import csv
 from datetime import date
+import openpyxl
+from PyQt6.QtCore import QEvent, QPoint, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor
 from pathlib import Path
-
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -184,7 +183,7 @@ class CatalogView(QWidget):
     FILTERS = {
         "ALL": "All Titles",
         "AVAILABLE": "Available",
-        "ISSUED": "Checked Out",
+        "ISSUED": "Issued",
         "LOW_STOCK": "Low Stock",
     }
 
@@ -201,6 +200,9 @@ class CatalogView(QWidget):
         self._updating_table = False
 
         self.metric_cards = {}
+        self._metrics_columns = None
+        self._compact_layout = None
+        self._control_center_expanded = True
 
         app = QApplication.instance()
         self.theme_manager = (
@@ -232,6 +234,12 @@ class CatalogView(QWidget):
 
         self.lbl_title = QLabel("Book Catalog")
         self.lbl_title.setObjectName("PageTitle")
+        self.lbl_title.setWordWrap(True)
+        self.lbl_title.setMinimumWidth(0)
+        self.lbl_title.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
 
         self.lbl_subtitle = QLabel(
             "Manage physical inventory, import and export CSV data, "
@@ -239,12 +247,16 @@ class CatalogView(QWidget):
         )
         self.lbl_subtitle.setObjectName("PageSubtitle")
         self.lbl_subtitle.setWordWrap(True)
+        self.lbl_subtitle.setMinimumWidth(0)
+        self.lbl_subtitle.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
 
         title_column.addWidget(self.lbl_title)
         title_column.addWidget(self.lbl_subtitle)
 
-        header.addLayout(title_column)
-        header.addStretch()
+        header.addLayout(title_column, 1)
 
         self.refresh_btn = QPushButton("↻ Refresh")
         self.refresh_btn.setObjectName("SecondaryButton")
@@ -257,6 +269,21 @@ class CatalogView(QWidget):
         )
 
         header.addWidget(self.refresh_btn)
+
+        self.control_center_btn = QPushButton("Hide Details")
+        self.control_center_btn.setObjectName("SecondaryButton")
+        self.control_center_btn.setMinimumHeight(35)
+        self.control_center_btn.setToolTip(
+            "Show or hide the Book Control Center"
+        )
+        self.control_center_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.control_center_btn.clicked.connect(
+            self.toggle_control_center
+        )
+        header.addWidget(self.control_center_btn)
+
         main_layout.addLayout(header)
 
         # ====================================================
@@ -323,11 +350,8 @@ class CatalogView(QWidget):
                 index,
             )
 
-        metrics_grid.setColumnStretch(0, 1)
-        metrics_grid.setColumnStretch(1, 1)
-        metrics_grid.setColumnStretch(2, 1)
-        metrics_grid.setColumnStretch(3, 1)
-        metrics_grid.setColumnStretch(4, 1)
+        self.metrics_grid = metrics_grid
+        self._reflow_metric_cards(5)
 
         main_layout.addLayout(metrics_grid)
 
@@ -367,11 +391,11 @@ class CatalogView(QWidget):
             self.export_books_to_csv
         )
 
-        self.import_btn = QPushButton("Import CSV")
+        self.import_btn = QPushButton("Import CSV / XLSX")
         self.import_btn.setObjectName("SecondaryButton")
         self.import_btn.setMinimumHeight(36)
         self.import_btn.clicked.connect(
-            self.import_books_from_csv
+            self.import_books_from_file
         )
 
         self.addbook_btn = QPushButton("+ Add New Book")
@@ -453,6 +477,23 @@ class CatalogView(QWidget):
         self.table.setColumnCount(len(self.HEADERS))
         self.table.setHorizontalHeaderLabels(self.HEADERS)
 
+        # Configure Header Resizing
+        header_view = self.table.horizontalHeader()
+
+        # Fixed data columns avoid rescanning thousands of rows for width hints.
+        for column in (0, 4, 5, 6):
+            header_view.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Interactive,
+            )
+
+        # Stretch the text columns to fill the remaining empty space
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)          # Title
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)          # Author
+        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)          # Publisher
+        for column, width in ((0, 105), (4, 95), (5, 90), (6, 115)):
+            self.table.setColumnWidth(column, width)
+
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -467,18 +508,14 @@ class CatalogView(QWidget):
 
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
+        self.table.setMouseTracking(True)
+        self.table.viewport().setMouseTracking(True)
 
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(43)
 
-        header = self.table.horizontalHeader()
-
-        header.setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-
-        header.setMinimumSectionSize(65)
-        header.setHighlightSections(False)
+        header_view.setMinimumSectionSize(65)
+        header_view.setHighlightSections(False)
 
         self.table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
@@ -491,6 +528,12 @@ class CatalogView(QWidget):
         self.table.itemSelectionChanged.connect(
             self.on_books_selection_changed
         )
+        self.table.cellEntered.connect(
+            self.show_book_hover_preview
+        )
+        self.table.viewport().installEventFilter(self)
+
+        self._create_book_hover_preview()
 
         content_layout.addWidget(self.table, 1)
 
@@ -502,7 +545,7 @@ class CatalogView(QWidget):
         self.detail_container.setObjectName("BookInspector")
 
         self.detail_container.setMinimumWidth(265)
-        self.detail_container.setMaximumWidth(330)
+        self.detail_container.setMaximumWidth(360)
 
         self.detail_container.setSizePolicy(
             QSizePolicy.Policy.Preferred,
@@ -578,6 +621,61 @@ class CatalogView(QWidget):
         )
 
         self.show_default_inspector()
+
+    def _reflow_metric_cards(self, columns):
+        if self._metrics_columns == columns:
+            return
+
+        cards = list(self.metric_cards.values())
+        for card in cards:
+            self.metrics_grid.removeWidget(card)
+
+        for column in range(len(cards)):
+            self.metrics_grid.setColumnStretch(column, 0)
+
+        for index, card in enumerate(cards):
+            self.metrics_grid.addWidget(
+                card,
+                index // columns,
+                index % columns,
+            )
+
+        for column in range(columns):
+            self.metrics_grid.setColumnStretch(column, 1)
+
+        self._metrics_columns = columns
+
+    def toggle_control_center(self):
+        self._control_center_expanded = not self._control_center_expanded
+        self.detail_container.setVisible(self._control_center_expanded)
+        self.control_center_btn.setText(
+            "Hide Details"
+            if self._control_center_expanded
+            else "Show Details"
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+        compact = self.width() < 1080
+        if compact != self._compact_layout:
+            self._compact_layout = compact
+            self._control_center_expanded = not compact
+            self.detail_container.setVisible(
+                self._control_center_expanded
+            )
+            self.control_center_btn.setText(
+                "Hide Details"
+                if self._control_center_expanded
+                else "Show Details"
+            )
+
+        columns = (
+            2 if self.width() < 850
+            else 3 if self.width() < 1050
+            else 5
+        )
+        self._reflow_metric_cards(columns)
 
     # ========================================================
     # THEME MANAGEMENT
@@ -688,6 +786,37 @@ class CatalogView(QWidget):
                 background-color: {c["surface"]};
                 border: 1px solid {c["border"]};
                 border-radius: 10px;
+            }}
+
+            QFrame#BookHoverPreview {{
+                background-color: {c["surface"]};
+                border: 1px solid {c["border"]};
+                border-left: 4px solid {c["primary"]};
+                border-radius: 10px;
+            }}
+
+            QLabel#BookPreviewTitle {{
+                color: {c["text"]};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+
+            QLabel#BookPreviewStatus {{
+                color: {c["success"]};
+                font-size: 10px;
+                font-weight: 700;
+            }}
+
+            QLabel#BookPreviewKey {{
+                color: {c["muted"]};
+                font-size: 10px;
+                font-weight: 600;
+            }}
+
+            QLabel#BookPreviewValue {{
+                color: {c["text"]};
+                font-size: 11px;
+                font-weight: 600;
             }}
 
             QLineEdit#CatalogSearch {{
@@ -815,6 +944,135 @@ class CatalogView(QWidget):
     # INVENTORY HELPERS
     # ========================================================
 
+    def _create_book_hover_preview(self):
+
+        self.hover_preview = QFrame(
+            self,
+            Qt.WindowType.ToolTip,
+        )
+        self.hover_preview.setObjectName("BookHoverPreview")
+        self.hover_preview.setAttribute(
+            Qt.WidgetAttribute.WA_ShowWithoutActivating
+        )
+        self.hover_preview.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.hover_preview.setFixedWidth(330)
+
+        layout = QVBoxLayout(self.hover_preview)
+        layout.setContentsMargins(15, 13, 15, 13)
+        layout.setSpacing(8)
+
+        self.hover_preview_title = QLabel()
+        self.hover_preview_title.setObjectName("BookPreviewTitle")
+        self.hover_preview_title.setWordWrap(True)
+        layout.addWidget(self.hover_preview_title)
+
+        self.hover_preview_status = QLabel()
+        self.hover_preview_status.setObjectName("BookPreviewStatus")
+        layout.addWidget(self.hover_preview_status)
+
+        details = QFormLayout()
+        details.setContentsMargins(0, 2, 0, 0)
+        details.setHorizontalSpacing(12)
+        details.setVerticalSpacing(6)
+
+        self.hover_preview_values = {}
+        for field in (
+            "Book ID", "Author", "Publisher",
+            "Total Copies", "Available", "Added On",
+        ):
+            key_label = QLabel(field)
+            key_label.setObjectName("BookPreviewKey")
+
+            value_label = QLabel()
+            value_label.setObjectName("BookPreviewValue")
+            value_label.setWordWrap(True)
+
+            details.addRow(key_label, value_label)
+            self.hover_preview_values[field] = value_label
+
+        layout.addLayout(details)
+        self.hover_preview.hide()
+
+    def show_book_hover_preview(self, row, _column):
+
+        id_item = self.table.item(row, 0)
+        if not id_item:
+            self.hover_preview.hide()
+            return
+
+        book_id = id_item.text()
+        if (
+            self.detail_container.isVisible()
+            and self.current_book_id == book_id
+        ):
+            self.hover_preview.hide()
+            return
+
+        book = [
+            self.table.item(row, column).text()
+            if self.table.item(row, column)
+            else ""
+            for column in range(len(self.HEADERS))
+        ]
+        total, available = self._book_counts(book)
+
+        self.hover_preview_title.setText(book[1] or "Untitled book")
+        self.hover_preview_status.setText(
+            "AVAILABLE" if available > 0 else "OUT OF STOCK"
+        )
+
+        values = {
+            "Book ID": book[0],
+            "Author": book[2] or "—",
+            "Publisher": book[3] or "—",
+            "Total Copies": str(total),
+            "Available": str(available),
+            "Added On": book[6] or "—",
+        }
+        for field, value in values.items():
+            self.hover_preview_values[field].setText(value)
+
+        c = self._get_colors()
+        status_color = c["success"] if available > 0 else c["danger"]
+        self.hover_preview_status.setStyleSheet(
+            f"color: {status_color}; font-size: 10px; font-weight: 700;"
+        )
+
+        self.hover_preview.adjustSize()
+        item_rect = self.table.visualItemRect(id_item)
+        position = self.table.viewport().mapToGlobal(
+            QPoint(item_rect.left(), item_rect.bottom())
+        ) + QPoint(12, 8)
+
+        screen = QApplication.screenAt(QCursor.pos())
+        if screen:
+            bounds = screen.availableGeometry()
+            if position.x() + self.hover_preview.width() > bounds.right():
+                position.setX(
+                    bounds.right() - self.hover_preview.width()
+                )
+            if position.y() + self.hover_preview.height() > bounds.bottom():
+                position.setY(
+                    self.table.viewport().mapToGlobal(
+                        QPoint(item_rect.left(), item_rect.top())
+                    ).y() - self.hover_preview.height() - 8
+                )
+
+        self.hover_preview.move(position)
+        self.hover_preview.show()
+        self.hover_preview.raise_()
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is self.table.viewport()
+            and event.type() == QEvent.Type.Leave
+        ):
+            self.hover_preview.hide()
+
+        return super().eventFilter(watched, event)
+
     @staticmethod
     def _book_counts(book):
 
@@ -854,7 +1112,7 @@ class CatalogView(QWidget):
             total_copies += total
             available_copies += available
 
-            if 0 < available <= 2:
+            if available <= 2:
                 low_stock += 1
 
         issued_copies = max(
@@ -993,7 +1251,7 @@ class CatalogView(QWidget):
             # LOW STOCK
             elif self.current_filter == "LOW_STOCK":
 
-                if available <= 0 or available > 2:
+                if available > 2:
                     continue
 
             # SEARCH
@@ -1018,8 +1276,10 @@ class CatalogView(QWidget):
 
     def populate_table(self, rows):
 
+        self.hover_preview.hide()
         self._updating_table = True
         self.table.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
 
         try:
 
@@ -1072,6 +1332,7 @@ class CatalogView(QWidget):
         finally:
 
             self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
             self._updating_table = False
 
         self.lbl_count.setText(
@@ -1200,7 +1461,7 @@ class CatalogView(QWidget):
             ("Publisher", book[3]),
             ("Total Copies", total),
             ("Available", available),
-            ("Checked Out", issued),
+            ("Issued", issued),
             ("Added On", book[6]),
         ]
 
@@ -1239,7 +1500,7 @@ class CatalogView(QWidget):
         # ACTIONS
         actions = [
             (
-                "Issue Book",
+                "Issue Books",
                 lambda: self.handle_issue_book(
                     book[0],
                     book[1],
@@ -1247,7 +1508,7 @@ class CatalogView(QWidget):
                 "PrimaryButton",
             ),
             (
-                "Return Book",
+                "Return Books",
                 lambda: self.handle_return_book(
                     book[0],
                     book[1],
@@ -1301,6 +1562,8 @@ class CatalogView(QWidget):
 
         if self._updating_table:
             return
+
+        self.hover_preview.hide()
 
         rows = sorted({
             index.row()
@@ -1566,8 +1829,8 @@ class CatalogView(QWidget):
 
         menu = QMenu(self)
 
-        issue = menu.addAction("Issue Book")
-        ret = menu.addAction("Return Book")
+        issue = menu.addAction("Issue Books")
+        ret = menu.addAction("Return Books")
 
         menu.addSeparator()
 
@@ -1668,16 +1931,15 @@ class CatalogView(QWidget):
         ).exec()
 
     # ========================================================
-    # CSV IMPORT
+    # CSV / XLSX IMPORT
     # ========================================================
 
-    def import_books_from_csv(self):
-
+    def import_books_from_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Import Book Catalog",
             "",
-            "CSV Files (*.csv);;All Files (*)",
+            "Data Files (*.csv *.xlsx);;CSV Files (*.csv);;Excel Files (*.xlsx);;All Files (*)",
         )
 
         if not file_path:
@@ -1697,213 +1959,145 @@ class CatalogView(QWidget):
 
         books_to_insert = []
         errors = []
-
         current_date = date.today().isoformat()
 
         try:
+            # 1. PARSE DATA BASED ON FILE TYPE
+            rows = []
+            fieldnames = []
 
-            with open(
-                file_path,
-                "r",
-                newline="",
-                encoding="utf-8-sig",
-            ) as csv_file:
-
-                reader = csv.DictReader(csv_file)
-
-                if not reader.fieldnames:
-
-                    QMessageBox.warning(
+            if file_path.lower().endswith(".xlsx"):
+                if openpyxl is None:
+                    QMessageBox.critical(
                         self,
-                        "Invalid CSV",
-                        "The selected CSV file has no header row.",
+                        "Missing Dependency",
+                        "Please install 'openpyxl' to import Excel files:\npip install openpyxl"
                     )
-
                     return
 
-                normalized_headers = {
-                    str(name).strip().casefold(): name
-                    for name in reader.fieldnames
-                    if name
-                }
+                wb = openpyxl.load_workbook(file_path, data_only=True)
+                sheet = wb.active
+                excel_rows = list(sheet.iter_rows(values_only=True))
 
-                def find_column(aliases):
+                if excel_rows:
+                    # Convert headers to strings, handling potential empty cells
+                    fieldnames = [str(cell).strip() if cell else "" for cell in excel_rows[0]]
 
-                    for alias in aliases:
+                    # Create dictionary for each row to mimic csv.DictReader
+                    for row_data in excel_rows[1:]:
+                        row_dict = {
+                            fieldnames[i]: (str(cell).strip() if cell is not None else "")
+                            for i, cell in enumerate(row_data) if i < len(fieldnames)
+                        }
+                        rows.append(row_dict)
+            else:
+                # Handle CSV
+                with open(file_path, "r", newline="", encoding="utf-8-sig") as csv_file:
+                    reader = csv.DictReader(csv_file)
+                    fieldnames = reader.fieldnames or []
+                    rows = list(reader)
 
-                        if alias in normalized_headers:
-                            return normalized_headers[alias]
-
-                    return None
-
-                id_col = find_column(
-                    required_aliases["id"]
+            # 2. VALIDATE HEADERS
+            if not fieldnames:
+                QMessageBox.warning(
+                    self,
+                    "Invalid File",
+                    "The selected file has no header row or is empty.",
                 )
+                return
 
-                title_col = find_column(
-                    required_aliases["title"]
+            normalized_headers = {
+                str(name).strip().casefold(): name
+                for name in fieldnames
+                if name
+            }
+
+            def find_column(aliases):
+                for alias in aliases:
+                    if alias in normalized_headers:
+                        return normalized_headers[alias]
+                return None
+
+            id_col = find_column(required_aliases["id"])
+            title_col = find_column(required_aliases["title"])
+            author_col = find_column(required_aliases["author"])
+            publisher_col = find_column(required_aliases["publisher"])
+            copies_col = find_column(required_aliases["copies"])
+
+            if not id_col or not title_col:
+                QMessageBox.warning(
+                    self,
+                    "Missing Headers",
+                    "Required columns: book_id (or id), title",
                 )
+                return
 
-                author_col = find_column(
-                    required_aliases["author"]
-                )
+            # 3. PROCESS ROWS
+            seen_ids = set()
 
-                publisher_col = find_column(
-                    required_aliases["publisher"]
-                )
+            for line_number, row in enumerate(rows, start=2):
+                book_id = str(row.get(id_col, "") or "").strip()
+                title = str(row.get(title_col, "") or "").strip()
 
-                copies_col = find_column(
-                    required_aliases["copies"]
-                )
+                author = str(row.get(author_col, "") or "").strip() if author_col else ""
+                publisher = str(row.get(publisher_col, "") or "").strip() if publisher_col else ""
+                copies_text = str(row.get(copies_col, "") or "").strip() if copies_col else "1"
 
-                if not id_col or not title_col:
+                if not book_id or not title:
+                    errors.append(f"Line {line_number}: Book ID and title are required.")
+                    continue
 
-                    QMessageBox.warning(
-                        self,
-                        "Missing CSV Headers",
-                        "Required columns: book_id (or id), title",
-                    )
+                if book_id in seen_ids:
+                    errors.append(f"Line {line_number}: Duplicate ID '{book_id}' in file.")
+                    continue
 
-                    return
+                seen_ids.add(book_id)
 
-                seen_ids = set()
+                try:
+                    copies = int(copies_text or "1")
+                    if copies < 1:
+                        raise ValueError
+                except ValueError:
+                    errors.append(f"Line {line_number}: Invalid total copies value.")
+                    continue
 
-                for line_number, row in enumerate(
-                    reader,
-                    start=2,
-                ):
+                books_to_insert.append((
+                    book_id,
+                    title,
+                    author or "Unknown",
+                    publisher or "Unknown",
+                    copies,
+                    copies,
+                    current_date,
+                ))
 
-                    book_id = str(
-                        row.get(id_col, "") or ""
-                    ).strip()
-
-                    title = str(
-                        row.get(title_col, "") or ""
-                    ).strip()
-
-                    author = (
-                        str(row.get(author_col, "") or "").strip()
-                        if author_col
-                        else ""
-                    )
-
-                    publisher = (
-                        str(row.get(publisher_col, "") or "").strip()
-                        if publisher_col
-                        else ""
-                    )
-
-                    copies_text = (
-                        str(row.get(copies_col, "") or "").strip()
-                        if copies_col
-                        else "1"
-                    )
-
-                    if not book_id or not title:
-
-                        errors.append(
-                            f"Line {line_number}: "
-                            "Book ID and title are required."
-                        )
-
-                        continue
-
-                    if book_id in seen_ids:
-
-                        errors.append(
-                            f"Line {line_number}: "
-                            f"Duplicate ID '{book_id}' in CSV."
-                        )
-
-                        continue
-
-                    seen_ids.add(book_id)
-
-                    try:
-
-                        copies = int(
-                            copies_text or "1"
-                        )
-
-                        if copies < 1:
-                            raise ValueError
-
-                    except ValueError:
-
-                        errors.append(
-                            f"Line {line_number}: "
-                            "Invalid total copies value."
-                        )
-
-                        continue
-
-                    books_to_insert.append((
-                        book_id,
-                        title,
-                        author or "Unknown",
-                        publisher or "Unknown",
-                        copies,
-                        copies,
-                        current_date,
-                    ))
-
+            # 4. DATABASE INSERTION
             if not books_to_insert:
-
                 QMessageBox.warning(
                     self,
                     "Nothing to Import",
                     "No valid book records were found.",
                 )
-
                 return
 
-            success, result = self.db.import_books_batch(
-                books_to_insert
-            )
+            success, result = self.db.import_books_batch(books_to_insert)
 
             if not success:
-
-                QMessageBox.critical(
-                    self,
-                    "Import Failed",
-                    str(result),
-                )
-
+                QMessageBox.critical(self, "Import Failed", str(result))
                 return
 
-            message = (
-                f"Successfully imported "
-                f"{int(result or 0)} book records."
-            )
+            message = f"Successfully imported {int(result or 0)} book records."
 
             if errors:
-
-                message += (
-                    f"\n\nSkipped {len(errors)} invalid record(s)."
-                    "\n\nFirst errors:\n"
-                    + "\n".join(errors[:10])
-                )
-
+                message += f"\n\nSkipped {len(errors)} invalid record(s).\n\nFirst errors:\n" + "\n".join(errors[:10])
                 if len(errors) > 10:
-                    message += (
-                        f"\n...and {len(errors) - 10} more."
-                    )
+                    message += f"\n...and {len(errors) - 10} more."
 
-            QMessageBox.information(
-                self,
-                "Import Completed",
-                message,
-            )
-
+            QMessageBox.information(self, "Import Completed", message)
             self.load_books_to_table()
 
         except Exception as exc:
-
-            QMessageBox.critical(
-                self,
-                "CSV Import Error",
-                f"Unable to import file:\n\n{exc}",
-            )
+            QMessageBox.critical(self, "Import Error", f"Unable to import file:\n\n{exc}")
 
     # ========================================================
     # CSV EXPORT
@@ -1912,13 +2106,11 @@ class CatalogView(QWidget):
     def export_books_to_csv(self):
 
         if not self.all_books:
-
             QMessageBox.information(
                 self,
                 "Export Catalog",
                 "There are no book records to export.",
             )
-
             return
 
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1935,7 +2127,6 @@ class CatalogView(QWidget):
             file_path += ".csv"
 
         try:
-
             with open(
                 file_path,
                 "w",
@@ -1944,7 +2135,6 @@ class CatalogView(QWidget):
             ) as file:
 
                 writer = csv.writer(file)
-
                 writer.writerow(self.HEADERS)
                 writer.writerows(self.all_books)
 
@@ -1955,7 +2145,6 @@ class CatalogView(QWidget):
             )
 
         except Exception as exc:
-
             QMessageBox.critical(
                 self,
                 "Export Failed",

@@ -1,7 +1,7 @@
 import csv
 from datetime import datetime, date
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, QPoint, Qt
 from PyQt6.QtGui import QColor, QFont, QCursor
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -34,9 +34,10 @@ class ClickableMetricCard(QFrame):
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setMinimumHeight(94)
         self.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Fixed
         )
+        self.setMinimumWidth(0)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 12, 15, 12)
@@ -44,6 +45,7 @@ class ClickableMetricCard(QFrame):
 
         self.lbl_title = QLabel(title)
         self.lbl_title.setObjectName("MetricTitle")
+        self.lbl_title.setWordWrap(True)
         self.lbl_title.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents
         )
@@ -56,6 +58,7 @@ class ClickableMetricCard(QFrame):
 
         self.lbl_subtitle = QLabel(subtitle)
         self.lbl_subtitle.setObjectName("MetricSubtitle")
+        self.lbl_subtitle.setWordWrap(True)
         self.lbl_subtitle.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents
         )
@@ -131,12 +134,12 @@ class CirculationView(QWidget):
 
     HEADERS = [
         "Log ID", "Book ID", "User ID", "Status",
-        "Checkout Date", "Due Date", "Return Date", "Fine"
+        "Issue Date", "Due Date", "Return Date", "Fine"
     ]
 
     FILTERS = [
         ("ALL", "All Transactions"),
-        ("ISSUED", "Active Loans"),
+        ("ISSUED", "Issued Books"),
         ("OVERDUE", "Overdue"),
         ("RETURNED_TODAY", "Returned Today"),
         ("RETURNED_HISTORY", "Return History"),
@@ -152,6 +155,9 @@ class CirculationView(QWidget):
         self.filtered_logs = []
         self.current_filter = "ALL"
         self.colors = {}
+        self._metrics_columns = None
+        self._filter_compact_mode = None
+        self._control_center_expanded = True
 
         self._updating_table = False
 
@@ -243,6 +249,36 @@ class CirculationView(QWidget):
                 background-color: {c['surface']};
                 border: 1px solid {c['border']};
                 border-radius: 10px;
+            }}
+
+            QFrame#CirculationHoverPreview {{
+                background-color: {c['surface']};
+                border: 1px solid {c['border']};
+                border-left: 4px solid {c['primary']};
+                border-radius: 10px;
+            }}
+
+            QLabel#CirculationPreviewTitle {{
+                color: {c['text']};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+
+            QLabel#CirculationPreviewStatus {{
+                font-size: 10px;
+                font-weight: 700;
+            }}
+
+            QLabel#CirculationPreviewKey {{
+                color: {c['muted']};
+                font-size: 10px;
+                font-weight: 600;
+            }}
+
+            QLabel#CirculationPreviewValue {{
+                color: {c['text']};
+                font-size: 11px;
+                font-weight: 600;
             }}
 
             QLineEdit#CirculationSearch {{
@@ -416,17 +452,28 @@ class CirculationView(QWidget):
 
         self.lbl_title = QLabel("Circulation Management")
         self.lbl_title.setObjectName("PageTitle")
+        self.lbl_title.setWordWrap(True)
+        self.lbl_title.setMinimumWidth(0)
+        self.lbl_title.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
 
         self.lbl_subtitle = QLabel(
-            "Monitor book loans, manage returns and track overdue transactions."
+            "Issue books, manage returns, and track overdue books."
         )
         self.lbl_subtitle.setObjectName("PageSubtitle")
+        self.lbl_subtitle.setWordWrap(True)
+        self.lbl_subtitle.setMinimumWidth(0)
+        self.lbl_subtitle.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
 
         title_column.addWidget(self.lbl_title)
         title_column.addWidget(self.lbl_subtitle)
 
-        header_layout.addLayout(title_column)
-        header_layout.addStretch()
+        header_layout.addLayout(title_column, 1)
 
         self.btn_refresh = QPushButton("↻ Refresh")
         self.btn_refresh.setObjectName("SecondaryButton")
@@ -437,6 +484,21 @@ class CirculationView(QWidget):
         self.btn_refresh.clicked.connect(self.load_circulation)
 
         header_layout.addWidget(self.btn_refresh)
+
+        self.control_center_btn = QPushButton("Hide Details")
+        self.control_center_btn.setObjectName("SecondaryButton")
+        self.control_center_btn.setMinimumHeight(36)
+        self.control_center_btn.setToolTip(
+            "Show or hide the Transaction Control Center"
+        )
+        self.control_center_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.control_center_btn.clicked.connect(
+            self.toggle_control_center
+        )
+        header_layout.addWidget(self.control_center_btn)
+
         main_layout.addLayout(header_layout)
 
         # KPI CARDS
@@ -450,13 +512,13 @@ class CirculationView(QWidget):
         )
 
         self.metric_active = ClickableMetricCard(
-            "ISSUED", "ACTIVE LOANS", "0",
-            "Currently issued", "#16A34A",
+            "ISSUED", "ISSUED BOOKS", "0",
+            "Books currently issued", "#16A34A",
             self.handle_card_click
         )
 
         self.metric_overdue = ClickableMetricCard(
-            "OVERDUE", "OVERDUE LOANS", "0",
+            "OVERDUE", "OVERDUE BOOKS", "0",
             "Past their due date", "#DC2626",
             self.handle_card_click
         )
@@ -477,6 +539,9 @@ class CirculationView(QWidget):
         for column, card in enumerate(self.metric_cards.values()):
             metrics_layout.addWidget(card, 0, column)
 
+        self.metrics_grid = metrics_layout
+        self._metrics_columns = None
+        self._reflow_metric_cards(4)
         main_layout.addLayout(metrics_layout)
 
         # TOOLBAR
@@ -484,7 +549,7 @@ class CirculationView(QWidget):
         toolbar.setObjectName("CirculationToolbar")
 
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(10, 9, 10, 9)
+        toolbar_layout.setContentsMargins(10, 8, 10, 8)
         toolbar_layout.setSpacing(8)
 
         self.search_input = QLineEdit()
@@ -493,24 +558,24 @@ class CirculationView(QWidget):
             "Search Log ID, Book ID, User ID or status..."
         )
         self.search_input.setClearButtonEnabled(True)
-        self.search_input.setMinimumHeight(38)
+        self.search_input.setMinimumHeight(36)
         self.search_input.textChanged.connect(self.apply_filters)
 
         self.btn_export = QPushButton("Export CSV")
         self.btn_export.setObjectName("SecondaryButton")
-        self.btn_export.setMinimumHeight(38)
+        self.btn_export.setMinimumHeight(36)
         self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_export.clicked.connect(self.export_csv)
 
-        self.btn_issue = QPushButton("+ Issue Book")
+        self.btn_issue = QPushButton("+ Issue Books")
         self.btn_issue.setObjectName("PrimaryButton")
-        self.btn_issue.setMinimumHeight(38)
+        self.btn_issue.setMinimumHeight(36)
         self.btn_issue.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_issue.clicked.connect(self.open_issue_wizard)
 
-        self.btn_return = QPushButton("Process Return")
+        self.btn_return = QPushButton("Return Books")
         self.btn_return.setObjectName("SuccessButton")
-        self.btn_return.setMinimumHeight(38)
+        self.btn_return.setMinimumHeight(36)
         self.btn_return.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_return.clicked.connect(self.open_return_wizard)
 
@@ -535,6 +600,11 @@ class CirculationView(QWidget):
             button = QPushButton(label)
             button.setObjectName("FilterButton")
             button.setCheckable(True)
+            button.setMinimumWidth(0)
+            button.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Fixed,
+            )
             button.setChecked(key == "ALL")
             button.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -575,6 +645,8 @@ class CirculationView(QWidget):
         )
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
+        self.table.setMouseTracking(True)
+        self.table.viewport().setMouseTracking(True)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(42)
 
@@ -582,6 +654,7 @@ class CirculationView(QWidget):
         header.setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
+        header.setMinimumSectionSize(65)
         header.setHighlightSections(False)
 
         self.table.setContextMenuPolicy(
@@ -593,6 +666,11 @@ class CirculationView(QWidget):
         self.table.itemSelectionChanged.connect(
             self.on_circulation_selection_changed
         )
+        self.table.cellEntered.connect(
+            self.show_transaction_hover_preview
+        )
+        self.table.viewport().installEventFilter(self)
+        self._create_transaction_hover_preview()
 
         content_layout.addWidget(self.table, 1)
 
@@ -600,7 +678,7 @@ class CirculationView(QWidget):
         self.detail_container = QFrame()
         self.detail_container.setObjectName("CirculationInspector")
         self.detail_container.setMinimumWidth(275)
-        self.detail_container.setMaximumWidth(340)
+        self.detail_container.setMaximumWidth(360)
         self.detail_container.setSizePolicy(
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Expanding
@@ -639,6 +717,210 @@ class CirculationView(QWidget):
         main_layout.addLayout(content_layout, 1)
 
         self.show_default_inspector()
+
+    def _reflow_metric_cards(self, columns):
+        if self._metrics_columns == columns:
+            return
+
+        cards = list(self.metric_cards.values())
+        for card in cards:
+            self.metrics_grid.removeWidget(card)
+
+        for column in range(len(cards)):
+            self.metrics_grid.setColumnStretch(column, 0)
+
+        for index, card in enumerate(cards):
+            self.metrics_grid.addWidget(
+                card,
+                index // columns,
+                index % columns,
+            )
+
+        for column in range(columns):
+            self.metrics_grid.setColumnStretch(column, 1)
+
+        self._metrics_columns = columns
+
+    def toggle_control_center(self):
+        self._control_center_expanded = not self._control_center_expanded
+        self.detail_container.setVisible(self._control_center_expanded)
+        self.control_center_btn.setText(
+            "Hide Details"
+            if self._control_center_expanded
+            else "Show Details"
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+        compact = self.width() < 1180
+
+        if compact != self._filter_compact_mode:
+            compact_labels = {
+                "ALL": "All",
+                "ISSUED": "Issued",
+                "OVERDUE": "Overdue",
+                "RETURNED_TODAY": "Returned Today",
+                "RETURNED_HISTORY": "History",
+            }
+            labels = (
+                compact_labels
+                if compact
+                else dict(self.FILTERS)
+            )
+            for key, button in self.filter_buttons.items():
+                button.setText(labels[key])
+            self._filter_compact_mode = compact
+
+        columns = (
+            2 if self.width() < 850
+            else 3 if self.width() < 1050
+            else 4
+        )
+        self._reflow_metric_cards(columns)
+
+    def _create_transaction_hover_preview(self):
+        self.hover_preview = QFrame(
+            self,
+            Qt.WindowType.ToolTip,
+        )
+        self.hover_preview.setObjectName("CirculationHoverPreview")
+        self.hover_preview.setAttribute(
+            Qt.WidgetAttribute.WA_ShowWithoutActivating
+        )
+        self.hover_preview.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.hover_preview.setFixedWidth(330)
+
+        layout = QVBoxLayout(self.hover_preview)
+        layout.setContentsMargins(15, 13, 15, 13)
+        layout.setSpacing(8)
+
+        self.hover_preview_title = QLabel()
+        self.hover_preview_title.setObjectName(
+            "CirculationPreviewTitle"
+        )
+        self.hover_preview_title.setWordWrap(True)
+        layout.addWidget(self.hover_preview_title)
+
+        self.hover_preview_status = QLabel()
+        self.hover_preview_status.setObjectName(
+            "CirculationPreviewStatus"
+        )
+        layout.addWidget(self.hover_preview_status)
+
+        details = QFormLayout()
+        details.setContentsMargins(0, 2, 0, 0)
+        details.setHorizontalSpacing(12)
+        details.setVerticalSpacing(6)
+
+        self.hover_preview_values = {}
+        for field in (
+            "Book ID", "User ID", "Issue Date", "Due Date",
+            "Return Date", "Fine",
+        ):
+            key_label = QLabel(field)
+            key_label.setObjectName("CirculationPreviewKey")
+
+            value_label = QLabel()
+            value_label.setObjectName("CirculationPreviewValue")
+            value_label.setWordWrap(True)
+
+            details.addRow(key_label, value_label)
+            self.hover_preview_values[field] = value_label
+
+        layout.addLayout(details)
+        self.hover_preview.hide()
+
+    def show_transaction_hover_preview(self, row, _column):
+        id_item = self.table.item(row, 0)
+        if not id_item:
+            self.hover_preview.hide()
+            return
+
+        record = id_item.data(Qt.ItemDataRole.UserRole)
+        if not record or len(record) < 8:
+            self.hover_preview.hide()
+            return
+
+        log_id = record[0]
+        if (
+            self.detail_container.isVisible()
+            and self._get_selected_log_ids() == [str(log_id)]
+        ):
+            self.hover_preview.hide()
+            return
+
+        (
+            _log_id, book_id, user_id, issue_date,
+            due_date, return_date, fine, _status,
+        ) = record
+        display_status = self._display_status(record)
+        try:
+            fine_value = float(fine or 0)
+        except (TypeError, ValueError):
+            fine_value = 0.0
+
+        values = {
+            "Book ID": book_id,
+            "User ID": user_id,
+            "Issue Date": issue_date,
+            "Due Date": due_date,
+            "Return Date": return_date or "—",
+            "Fine": f"₹{fine_value:.2f}",
+        }
+
+        self.hover_preview_title.setText(
+            f"Transaction #{log_id}"
+        )
+        self.hover_preview_status.setText(display_status)
+        status_color = (
+            self.colors["danger"] if display_status == "OVERDUE"
+            else self.colors["success"] if display_status == "ISSUED"
+            else self.colors["muted"]
+        )
+        self.hover_preview_status.setStyleSheet(
+            f"color: {status_color};"
+        )
+
+        for field, value in values.items():
+            self.hover_preview_values[field].setText(
+                self._date_text(value) or "—"
+            )
+
+        self.hover_preview.adjustSize()
+        item_rect = self.table.visualItemRect(id_item)
+        position = self.table.viewport().mapToGlobal(
+            QPoint(item_rect.left(), item_rect.bottom())
+        ) + QPoint(12, 8)
+
+        screen = QApplication.screenAt(QCursor.pos())
+        if screen:
+            bounds = screen.availableGeometry()
+            if position.x() + self.hover_preview.width() > bounds.right():
+                position.setX(
+                    bounds.right() - self.hover_preview.width()
+                )
+            if position.y() + self.hover_preview.height() > bounds.bottom():
+                position.setY(
+                    self.table.viewport().mapToGlobal(
+                        QPoint(item_rect.left(), item_rect.top())
+                    ).y() - self.hover_preview.height() - 8
+                )
+
+        self.hover_preview.move(position)
+        self.hover_preview.show()
+        self.hover_preview.raise_()
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is self.table.viewport()
+            and event.type() == QEvent.Type.Leave
+        ):
+            self.hover_preview.hide()
+
+        return super().eventFilter(watched, event)
 
     # ---------------------------------------------------------
     # DATE AND STATUS HELPERS
@@ -844,6 +1126,7 @@ class CirculationView(QWidget):
     def populate_table(self, rows):
         self._updating_table = True
         self.table.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
 
         try:
             self.table.clearContents()
@@ -918,6 +1201,7 @@ class CirculationView(QWidget):
 
         finally:
             self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
             self._updating_table = False
 
         self.lbl_count.setText(
@@ -1071,7 +1355,7 @@ class CirculationView(QWidget):
             ("Log ID", log_id),
             ("Book ID", book_id),
             ("User ID", user_id),
-            ("Checkout", checkout),
+            ("Issue Date", checkout),
             ("Due Date", due),
             ("Returned", returned or "—"),
             ("Fine", f"₹{fine_value:.2f}"),

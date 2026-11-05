@@ -395,7 +395,7 @@ class MetricDetailDialog(QDialog):
         "Available": 1.00,
         "Created On": 1.20,
         "Added On": 1.20,
-        "Checkout Date": 1.30,
+        "Issue Date": 1.30,
         "Due Date": 1.20,
         "Return Date": 1.25,
         "Fine Amount": 1.15,
@@ -425,10 +425,19 @@ class MetricDetailDialog(QDialog):
         self.title_label.setObjectName("DialogTitle")
         self.layout_main.addWidget(self.title_label)
 
+        self.search_input = QLineEdit()
+        self.search_input.setObjectName("RecordSearch")
+        self.search_input.setPlaceholderText(
+            "Search by ID, title, author or any field..."
+        )
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMinimumHeight(36)
+        self.search_input.textChanged.connect(self.apply_search)
+        self.layout_main.addWidget(self.search_input)
+
         self.table = QTableWidget()
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
-        self.table.setRowCount(len(self.rows))
 
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(
@@ -456,36 +465,14 @@ class MetricDetailDialog(QDialog):
         header.setMinimumSectionSize(65)
         header.setHighlightSections(False)
 
-        for row_index, row_data in enumerate(self.rows):
-            for column_index in range(len(headers)):
-                value = (
-                    row_data[column_index]
-                    if column_index < len(row_data)
-                    else ""
-                )
-
-                item = QTableWidgetItem(safe_text(value))
-
-                if column_index == 0:
-                    item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignVCenter
-                        | Qt.AlignmentFlag.AlignLeft
-                    )
-
-                self.table.setItem(
-                    row_index,
-                    column_index,
-                    item,
-                )
-
         self.layout_main.addWidget(self.table, 1)
+        self.visible_rows = list(self.rows)
 
         footer = QHBoxLayout()
 
-        self.count_label = QLabel(
-            f"{len(self.rows)} record(s)"
-        )
+        self.count_label = QLabel()
         self.count_label.setObjectName("RecordCount")
+        self.populate_table()
 
         footer.addWidget(self.count_label)
         footer.addStretch()
@@ -516,6 +503,51 @@ class MetricDetailDialog(QDialog):
                 )
             except (TypeError, RuntimeError):
                 pass
+
+    def apply_search(self, text):
+        query = text.strip().casefold()
+
+        if query:
+            self.visible_rows = [
+                row for row in self.rows
+                if any(
+                    query in safe_text(value).casefold()
+                    for value in row
+                )
+            ]
+        else:
+            self.visible_rows = list(self.rows)
+
+        self.populate_table()
+
+    def populate_table(self):
+        self.table.setRowCount(len(self.visible_rows))
+
+        for row_index, row_data in enumerate(self.visible_rows):
+            for column_index in range(len(self.headers)):
+                value = (
+                    row_data[column_index]
+                    if column_index < len(row_data)
+                    else ""
+                )
+
+                item = QTableWidgetItem(safe_text(value))
+
+                if column_index == 0:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignVCenter
+                        | Qt.AlignmentFlag.AlignLeft
+                    )
+
+                self.table.setItem(row_index, column_index, item)
+
+        query = self.search_input.text().strip()
+        if query:
+            self.count_label.setText(
+                f"{len(self.visible_rows)} of {len(self.rows)} record(s)"
+            )
+        else:
+            self.count_label.setText(f"{len(self.rows)} record(s)")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -586,6 +618,19 @@ class MetricDetailDialog(QDialog):
                 font-weight: 600;
                 background: transparent;
                 border: none;
+            }}
+
+            QLineEdit#RecordSearch {{
+                background-color: {c['surface']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                border-radius: 7px;
+                padding: 7px 10px;
+                font-size: 12px;
+            }}
+
+            QLineEdit#RecordSearch:focus {{
+                border: 1px solid {c['primary']};
             }}
 
             QTableWidget {{
@@ -1445,24 +1490,24 @@ class DashboardView(QWidget):
                 SUCCESS, 0, 2, self.show_total_copies_drilldown, True,
             ),
             (
-                "active_loans", "Active Loans", "0",
-                "Currently checked out", "🔄",
-                INFO, 0, 3, self.show_active_loans_drilldown, False,
+                "unpaid_fines", "Unpaid Fines", "₹0.00",
+                "Pending collection", "💳",
+                WARNING, 0, 3, self.show_fines_drilldown, False,
+            ),
+            (
+                "active_loans", "Issued Books", "0",
+                "Currently issued", "🔄",
+                INFO, 1, 0, self.show_active_loans_drilldown, False,
             ),
             (
                 "issued_today", "Issued Today", "0",
-                "Checkouts today", "📈",
-                SUCCESS, 1, 0, self.show_issued_today_drilldown, False,
+                "Books issued today", "📈",
+                SUCCESS, 1, 1, self.show_issued_today_drilldown, False,
             ),
             (
                 "overdue_books", "Overdue Books", "0",
                 "Action required", "⚠️",
-                DANGER, 1, 1, self.show_overdue_drilldown, False,
-            ),
-            (
-                "unpaid_fines", "Unpaid Fines", "₹0.00",
-                "Pending collection", "💳",
-                WARNING, 1, 2, self.show_fines_drilldown, False,
+                DANGER, 1, 2, self.show_overdue_drilldown, False,
             ),
             (
                 "today_due", "Due Today", "0",
@@ -1779,12 +1824,12 @@ class DashboardView(QWidget):
             )
 
     # --------------------------------------------------------
-    # ACTIVE LOANS
+    # ISSUED BOOKS
     # --------------------------------------------------------
 
     def show_active_loans_drilldown(self):
         self._show_date_report(
-            "Currently Active Loans",
+            "Issued Books",
             self.db.get_active_loans_report,
         )
 
@@ -1824,7 +1869,7 @@ class DashboardView(QWidget):
                     title,
                     [
                         "Book ID", "User ID",
-                        "Checkout Date", "Due Date",
+                        "Issue Date", "Due Date",
                     ],
                     rows,
                 )

@@ -4,14 +4,16 @@ import datetime
 
 from PyQt6.QtCore import Qt, QSignalBlocker
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QHBoxLayout, QVBoxLayout,
+    QDialog, QWidget, QLabel, QHBoxLayout, QVBoxLayout,
     QLineEdit, QCheckBox, QPushButton, QFileDialog,
     QMessageBox, QDoubleSpinBox, QSpinBox, QComboBox,
     QScrollArea, QFrame, QInputDialog, QApplication,
     QGridLayout, QSizePolicy
 )
 
-from dialogs import DepartmentManagerDialog
+from dialogs import DepartmentManagerDialog, RecoveryCodeSetupDialog
+from email_service import LibraryEmailService, SMTP_CREDENTIAL_TARGET
+from secure_storage import delete_secret, store_secret
 
 
 class SettingsView(QWidget):
@@ -446,7 +448,9 @@ class SettingsView(QWidget):
         self.build_rollover_section()
         self.build_appearance_section()
         self.build_circulation_section()
+        self.build_email_section()
         self.build_database_section()
+        self.build_cloud_backup_section()
         self.build_security_section()
 
         self.content_layout.addStretch()
@@ -543,7 +547,7 @@ class SettingsView(QWidget):
         )
 
         self.chk_skip_active = QCheckBox(
-            "Skip students who currently have active loans"
+            "Skip students with issued books"
         )
         self.chk_skip_active.setChecked(True)
 
@@ -661,6 +665,431 @@ class SettingsView(QWidget):
         layout.addWidget(days_description, 2, 1)
 
         self.content_layout.addWidget(card)
+
+    def build_email_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Email Notifications & Complaints",
+                "Send due-date reminders to users and forward submitted "
+                "complaints to the library contact.",
+            )
+        )
+
+        card = self.create_card_frame()
+        layout = QGridLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setHorizontalSpacing(16)
+        layout.setVerticalSpacing(10)
+
+        self.email_sender_input = QLineEdit()
+        self.email_sender_input.setPlaceholderText(
+            "Gmail address used to send messages"
+        )
+        self.library_contact_input = QLineEdit()
+        self.library_contact_input.setPlaceholderText(
+            "Library inbox for complaints"
+        )
+        self.smtp_app_password_input = QLineEdit()
+        self.smtp_app_password_input.setEchoMode(
+            QLineEdit.EchoMode.Password
+        )
+        self.smtp_app_password_input.setPlaceholderText(
+            "Gmail app password (saved in Windows Credential Manager)"
+        )
+
+        layout.addWidget(self.create_field_label("Gmail sender"), 0, 0)
+        layout.addWidget(self.create_field_label("Library contact"), 0, 1)
+        layout.addWidget(self.email_sender_input, 1, 0)
+        layout.addWidget(self.library_contact_input, 1, 1)
+        layout.addWidget(
+            self.create_field_label("Gmail app password"),
+            2,
+            0,
+            1,
+            2,
+        )
+        layout.addWidget(self.smtp_app_password_input, 3, 0, 1, 2)
+
+        actions = QHBoxLayout()
+        self.save_email_btn = self.create_button(
+            "Save Email Settings",
+            "SecondaryButton",
+        )
+        self.save_email_btn.clicked.connect(self.save_email_settings)
+        self.test_email_btn = self.create_button(
+            "Send Test Email",
+            "SecondaryButton",
+        )
+        self.test_email_btn.clicked.connect(self.send_test_email)
+        self.clear_email_secret_btn = self.create_button(
+            "Remove Saved App Password",
+            "SecondaryButton",
+        )
+        self.clear_email_secret_btn.clicked.connect(
+            self.remove_email_secret
+        )
+
+        actions.addWidget(self.save_email_btn)
+        actions.addWidget(self.test_email_btn)
+        actions.addWidget(self.clear_email_secret_btn)
+        actions.addStretch()
+        layout.addLayout(actions, 4, 0, 1, 2)
+
+        self.email_reminders_checkbox = QCheckBox(
+            "Send one reminder on the due date and one when a loan becomes overdue"
+        )
+        layout.addWidget(
+            self.email_reminders_checkbox,
+            5,
+            0,
+            1,
+            2,
+        )
+
+        self.content_layout.addWidget(card)
+
+    def build_cloud_backup_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Encrypted Google Drive Backup",
+                "Connect a Google account and upload an encrypted "
+                "SQLite backup to its Drive.",
+            )
+        )
+
+        card = self.create_card_frame()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setSpacing(10)
+
+        description = QLabel(
+            "The backup is encrypted before upload. Its encryption key "
+            "is kept in this Windows account's Credential Manager; "
+            "backups cannot be restored if that Windows profile and key "
+            "are lost."
+        )
+        description.setObjectName("MutedLabel")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        actions = QHBoxLayout()
+        self.drive_backup_btn = self.create_button(
+            "Back Up to Google Drive",
+            "SecondaryButton",
+        )
+        self.drive_backup_btn.clicked.connect(
+            self.backup_to_google_drive
+        )
+        actions.addWidget(self.drive_backup_btn)
+        self.drive_restore_btn = self.create_button(
+            "Restore Backup to a Separate File",
+            "SecondaryButton",
+        )
+        self.drive_restore_btn.clicked.connect(
+            self.restore_from_google_drive
+        )
+        actions.addWidget(self.drive_restore_btn)
+        self.drive_key_btn = self.create_button(
+            "Export Backup Recovery Key",
+            "SecondaryButton",
+        )
+        self.drive_key_btn.clicked.connect(
+            self.export_drive_recovery_key
+        )
+        actions.addWidget(self.drive_key_btn)
+        self.auto_drive_backup_checkbox = QCheckBox(
+            "Automatically upload one encrypted backup per day while the app is running"
+        )
+        self.save_drive_settings_btn = self.create_button(
+            "Save Backup Settings",
+            "SecondaryButton",
+        )
+        self.save_drive_settings_btn.clicked.connect(
+            self.save_drive_backup_settings
+        )
+        layout.addWidget(self.auto_drive_backup_checkbox)
+        layout.addWidget(self.save_drive_settings_btn)
+        actions.addStretch()
+        layout.addLayout(actions)
+        self.content_layout.addWidget(card)
+
+    def save_email_settings(self):
+        sender = self.email_sender_input.text().strip().casefold()
+        library_contact = (
+            self.library_contact_input.text().strip().casefold()
+        )
+        for label, address in (
+            ("Gmail sender", sender),
+            ("Library contact", library_contact),
+        ):
+            if address and (
+                "@" not in address
+                or address.startswith("@")
+                or "." not in address.rsplit("@", 1)[-1]
+            ):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Email Address",
+                    f"Enter a valid {label} email address.",
+                )
+                return False
+
+        password = self.smtp_app_password_input.text().strip()
+        try:
+            if password:
+                store_secret(
+                    SMTP_CREDENTIAL_TARGET,
+                    "".join(password.split()),
+                    sender,
+                )
+
+            for key, value in (
+                ("email_sender", sender),
+                ("library_contact_email", library_contact),
+                (
+                    "due_email_reminders_enabled",
+                    "1" if self.email_reminders_checkbox.isChecked() else "0",
+                ),
+            ):
+                if not self.db.set_setting(key, value):
+                    raise RuntimeError(f"Unable to save {key}.")
+
+            self.smtp_app_password_input.clear()
+            QMessageBox.information(
+                self,
+                "Email Settings Saved",
+                "Email settings saved. The app password is protected "
+                "by Windows Credential Manager.",
+            )
+            return True
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Email Settings Error",
+                str(error),
+            )
+            return False
+
+    def send_test_email(self):
+        if not self.email_sender_input.text().strip():
+            QMessageBox.warning(
+                self,
+                "Email Setup Required",
+                "Enter the Gmail sender address first.",
+            )
+            return
+
+        if not self.save_email_settings():
+            return
+
+        try:
+            LibraryEmailService(self.db).send(
+                self.email_sender_input.text().strip(),
+                "Library email configuration test",
+                "Your library email service is configured successfully.",
+            )
+            QMessageBox.information(
+                self,
+                "Test Email Sent",
+                "A test email was sent to the configured Gmail sender.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Email Test Failed",
+                str(error),
+            )
+
+    def remove_email_secret(self):
+        answer = QMessageBox.question(
+            self,
+            "Remove App Password",
+            "Remove the saved Gmail app password? Automated email "
+            "notifications will stop until a new password is saved.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            delete_secret(SMTP_CREDENTIAL_TARGET)
+            QMessageBox.information(
+                self,
+                "App Password Removed",
+                "The Gmail app password was removed from Windows "
+                "Credential Manager.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Credential Error",
+                str(error),
+            )
+
+    def backup_to_google_drive(self):
+        client_secret_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Google OAuth Desktop Client JSON",
+            "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+
+        try:
+            from google_drive_backup import (
+                upload_encrypted_database_backup,
+            )
+
+            result = upload_encrypted_database_backup(
+                self.db,
+                client_secret_file or None,
+            )
+            self.db.set_setting(
+                "google_drive_last_backup",
+                datetime.date.today().isoformat(),
+            )
+            QMessageBox.information(
+                self,
+                "Google Drive Backup Complete",
+                f"Encrypted backup uploaded:\n{result.get('name', 'Library backup')}",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Google Drive Backup Failed",
+                str(error),
+            )
+
+    def save_drive_backup_settings(self):
+        try:
+            if not self.db.set_setting(
+                "google_drive_auto_backup_enabled",
+                "1" if self.auto_drive_backup_checkbox.isChecked() else "0",
+            ):
+                raise RuntimeError("Unable to save Google Drive backup settings.")
+            QMessageBox.information(
+                self,
+                "Backup Settings Saved",
+                "Automatic backup settings were saved. Automatic uploads "
+                "run once per day while the application is open and Drive "
+                "has already been connected.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Backup Settings Error",
+                str(error),
+            )
+
+    def restore_from_google_drive(self):
+        client_secret_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Google OAuth Desktop Client JSON (or cancel if already connected)",
+            "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+
+        try:
+            from google_drive_backup import list_drive_backups
+
+            backups = list_drive_backups(client_secret_file or None)
+            if not backups:
+                QMessageBox.information(
+                    self,
+                    "No Backups Found",
+                    "No encrypted library backups were found in this Drive.",
+                )
+                return
+
+            choices = [
+                f"{item['name']}  ·  {item.get('createdTime', '')}"
+                for item in backups
+            ]
+            selected, accepted = QInputDialog.getItem(
+                self,
+                "Choose a Backup",
+                "Google Drive backup:",
+                choices,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+
+            selected_index = choices.index(selected)
+            backup = backups[selected_index]
+            destination, _ = QFileDialog.getSaveFileName(
+                self,
+                "Restore Backup to a Separate File",
+                str(os.path.expanduser("~/library_restored.db")),
+                "SQLite Database (*.db)",
+            )
+            if not destination:
+                return
+            if not destination.lower().endswith(".db"):
+                destination += ".db"
+
+            recovery_key_file, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Backup Recovery Key (optional on this Windows account)",
+                "",
+                "Recovery Key (*.txt);;All Files (*)",
+            )
+
+            from google_drive_backup import download_and_decrypt_backup
+
+            restored_path = download_and_decrypt_backup(
+                backup["id"],
+                destination,
+                client_secret_file or None,
+                recovery_key_file or None,
+                getattr(self.db, "database_path", None),
+            )
+            QMessageBox.information(
+                self,
+                "Backup Restored",
+                "The backup was downloaded, decrypted, and integrity-checked.\n\n"
+                f"Restored database:\n{restored_path}\n\n"
+                "The running application was not changed.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Google Drive Restore Failed",
+                str(error),
+            )
+
+    def export_drive_recovery_key(self):
+        destination, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Google Drive Backup Recovery Key",
+            str(os.path.expanduser("~/library_backup_recovery_key.txt")),
+            "Recovery Key (*.txt)",
+        )
+        if not destination:
+            return
+        if not destination.lower().endswith(".txt"):
+            destination += ".txt"
+
+        try:
+            from google_drive_backup import export_backup_recovery_key
+
+            export_backup_recovery_key(destination)
+            QMessageBox.warning(
+                self,
+                "Protect Your Recovery Key",
+                "The recovery key was exported. Keep it offline in a "
+                "secure location separate from this computer and Google "
+                "Drive. Anyone with both a backup and this key can read "
+                "the database.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Recovery Key Export Failed",
+                str(error),
+            )
 
     # =========================================================
     # 5. DATABASE MAINTENANCE
@@ -781,6 +1210,15 @@ class SettingsView(QWidget):
         layout.addWidget(new_row)
         layout.addWidget(confirm_row)
 
+        self.btn_recovery_code = self.create_button(
+            "Generate / Replace Recovery Code",
+            "SecondaryButton",
+        )
+        self.btn_recovery_code.clicked.connect(
+            self.generate_recovery_code
+        )
+        layout.addWidget(self.btn_recovery_code)
+
         self.content_layout.addWidget(card)
 
     # =========================================================
@@ -821,6 +1259,19 @@ class SettingsView(QWidget):
                 "theme_mode",
                 self.DEFAULTS["theme_mode"]
             )
+            email_sender = self.db.get_setting("email_sender", "")
+            library_contact = self.db.get_setting(
+                "library_contact_email",
+                "",
+            )
+            reminders_enabled = self.db.get_setting(
+                "due_email_reminders_enabled",
+                "0",
+            )
+            auto_backup_enabled = self.db.get_setting(
+                "google_drive_auto_backup_enabled",
+                "0",
+            )
 
             fine = float(fine)
             days = int(days)
@@ -839,6 +1290,18 @@ class SettingsView(QWidget):
             self.spin_daily_fine.setValue(fine)
             self.spin_default_days.setValue(days)
             self.combo_theme.setCurrentText(theme)
+            self.email_sender_input.setText(email_sender or "")
+            self.library_contact_input.setText(
+                library_contact or ""
+            )
+            self.email_reminders_checkbox.setChecked(
+                str(reminders_enabled).casefold()
+                in ("1", "true", "yes")
+            )
+            self.auto_drive_backup_checkbox.setChecked(
+                str(auto_backup_enabled).casefold()
+                in ("1", "true", "yes")
+            )
 
         except Exception as error:
             QMessageBox.warning(
@@ -869,11 +1332,7 @@ class SettingsView(QWidget):
             return False
 
         try:
-            stored_password = self.db.get_setting(
-                "admin_password",
-                "admin123"
-            )
-
+            valid_password = self.db.verify_admin_password(password)
         except Exception as error:
             QMessageBox.critical(
                 self,
@@ -882,7 +1341,7 @@ class SettingsView(QWidget):
             )
             return False
 
-        if password != str(stored_password):
+        if not valid_password:
             QMessageBox.warning(
                 self,
                 "Access Denied",
@@ -891,6 +1350,37 @@ class SettingsView(QWidget):
             return False
 
         return True
+
+    def generate_recovery_code(self):
+        if not self.verify_admin_password(
+            "Administrator Authorization",
+            "Enter the current administrator password to replace "
+            "the recovery code:"
+        ):
+            return
+
+        dialog = RecoveryCodeSetupDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            if not self.db.set_admin_recovery_code(
+                dialog.recovery_code
+            ):
+                raise RuntimeError("The recovery code could not be saved.")
+
+            QMessageBox.information(
+                self,
+                "Recovery Code Saved",
+                "The new recovery code is active. The previous code "
+                "can no longer be used.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Recovery Code Error",
+                f"Unable to save the recovery code:\n\n{error}",
+            )
 
     # =========================================================
     # ACADEMIC ROLLOVER
@@ -916,7 +1406,7 @@ class SettingsView(QWidget):
                 "This operation will export graduating student "
                 "records and remove eligible records from the "
                 "active database.\n\n"
-                f"Students with active loans will "
+                f"Students with issued books will "
                 f"{'be skipped' if skip_active else 'not be skipped'}.\n\n"
                 "Create a database backup before continuing.\n\n"
                 "Continue?"
@@ -1263,11 +1753,9 @@ class SettingsView(QWidget):
             return False
 
         try:
-            stored_password = self.db.get_setting(
-                "admin_password",
-                "admin123"
+            valid_password = self.db.verify_admin_password(
+                current_password
             )
-
         except Exception as error:
             QMessageBox.critical(
                 self,
@@ -1276,7 +1764,7 @@ class SettingsView(QWidget):
             )
             return False
 
-        if current_password != str(stored_password):
+        if not valid_password:
             QMessageBox.warning(
                 self,
                 "Incorrect Password",
@@ -1321,13 +1809,18 @@ class SettingsView(QWidget):
                 theme_name
             )
 
+            self.db.set_setting(
+                "due_email_reminders_enabled",
+                "1" if self.email_reminders_checkbox.isChecked() else "0",
+            )
+
             new_password = self.input_new_psw.text()
 
             if new_password:
-                self.db.set_setting(
-                    "admin_password",
-                    new_password
-                )
+                if not self.db.set_admin_password(new_password):
+                    raise RuntimeError(
+                        "The administrator password could not be saved."
+                    )
 
             self.apply_selected_theme(theme_name)
             self.update_theme_description()

@@ -1,10 +1,16 @@
 
 import csv
+import re
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from PyQt6.QtCore import Qt
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+from PyQt6.QtCore import QEvent, QPoint, Qt
 from PyQt6.QtGui import QColor, QCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -16,6 +22,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QPushButton,
+    QButtonGroup,
     QHeaderView,
     QSizePolicy,
     QFrame,
@@ -29,7 +36,12 @@ from PyQt6.QtWidgets import (
     QTabWidget,
 )
 
-from dialogs import UserDialog, ViewBooksDialog
+from dialogs import (
+    ComplaintDialog,
+    ComplaintManagementDialog,
+    UserDialog,
+    ViewBooksDialog,
+)
 from utils import clear_layout
 
 
@@ -63,9 +75,10 @@ class ClickableMetricCard(QFrame):
 
         self.setMinimumHeight(84)
         self.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Fixed,
         )
+        self.setMinimumWidth(0)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 11, 14, 11)
@@ -73,6 +86,7 @@ class ClickableMetricCard(QFrame):
 
         self.lbl_title = QLabel(title)
         self.lbl_title.setObjectName("MetricTitle")
+        self.lbl_title.setWordWrap(True)
         self.lbl_title.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents
         )
@@ -197,6 +211,7 @@ class UserManagementView(QWidget):
         "Year of Study",
         "Department",
         "Created At",
+        "Email",
     ]
 
     def __init__(self, db):
@@ -208,6 +223,10 @@ class UserManagementView(QWidget):
         self.filtered_users: List[Tuple] = []
 
         self.current_filter = "ALL"
+        self._metrics_columns = None
+        self._compact_layout = None
+        self._table_compact_mode = None
+        self._control_center_expanded = True
 
         self.theme_manager = None
         self.colors = self.COLORS["Dark"]
@@ -402,6 +421,37 @@ class UserManagementView(QWidget):
                 border-radius: 10px;
             }}
 
+            QFrame#UserHoverPreview {{
+                background-color: {c["surface"]};
+                border: 1px solid {c["border"]};
+                border-left: 4px solid {c["primary"]};
+                border-radius: 10px;
+            }}
+
+            QLabel#UserPreviewTitle {{
+                color: {c["text"]};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+
+            QLabel#UserPreviewStatus {{
+                color: {c["primary"]};
+                font-size: 10px;
+                font-weight: 700;
+            }}
+
+            QLabel#UserPreviewKey {{
+                color: {c["muted"]};
+                font-size: 10px;
+                font-weight: 600;
+            }}
+
+            QLabel#UserPreviewValue {{
+                color: {c["text"]};
+                font-size: 11px;
+                font-weight: 600;
+            }}
+
             QLineEdit,
             QComboBox {{
                 background-color: {c["input"]};
@@ -593,20 +643,30 @@ class UserManagementView(QWidget):
         )
 
         title.setObjectName("PageTitle")
+        title.setWordWrap(True)
+        title.setMinimumWidth(0)
+        title.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
 
         subtitle = QLabel(
             "Manage student, faculty, and guest lecturer profiles, "
-            "inspect active loans, and perform batch operations."
+            "view books currently issued, and perform batch operations."
         )
 
         subtitle.setObjectName("PageSubtitle")
         subtitle.setWordWrap(True)
+        subtitle.setMinimumWidth(0)
+        subtitle.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
 
         title_group.addWidget(title)
         title_group.addWidget(subtitle)
 
-        header.addLayout(title_group)
-        header.addStretch()
+        header.addLayout(title_group, 1)
 
         self.refresh_btn = QPushButton("↻ Refresh")
         self.refresh_btn.setObjectName("SecondaryButton")
@@ -620,6 +680,20 @@ class UserManagementView(QWidget):
         )
 
         header.addWidget(self.refresh_btn)
+
+        self.control_center_btn = QPushButton("Hide Details")
+        self.control_center_btn.setObjectName("SecondaryButton")
+        self.control_center_btn.setMinimumHeight(35)
+        self.control_center_btn.setToolTip(
+            "Show or hide the User Control Center"
+        )
+        self.control_center_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.control_center_btn.clicked.connect(
+            self.toggle_control_center
+        )
+        header.addWidget(self.control_center_btn)
 
         main_layout.addLayout(header)
 
@@ -646,6 +720,8 @@ class UserManagementView(QWidget):
         )
 
         self.table.setAlternatingRowColors(True)
+        self.table.setMouseTracking(True)
+        self.table.viewport().setMouseTracking(True)
 
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -682,10 +758,16 @@ class UserManagementView(QWidget):
         self.table.itemSelectionChanged.connect(
             self.on_users_selection_changed
         )
+        self.table.cellEntered.connect(
+            self.show_user_hover_preview
+        )
+        self.table.viewport().installEventFilter(self)
 
         self.table.doubleClicked.connect(
             self.on_row_double_clicked
         )
+
+        self._create_user_hover_preview()
 
         content_layout.addWidget(
             self.table,
@@ -699,7 +781,7 @@ class UserManagementView(QWidget):
         )
 
         self.detail_container.setMinimumWidth(275)
-        self.detail_container.setMaximumWidth(340)
+        self.detail_container.setMaximumWidth(360)
 
         self.detail_container.setSizePolicy(
             QSizePolicy.Policy.Preferred,
@@ -782,9 +864,201 @@ class UserManagementView(QWidget):
 
         self.show_default_inspector()
 
+    def _reflow_metric_cards(self, columns):
+        if self._metrics_columns == columns:
+            return
+
+        cards = list(self.metric_cards.values())
+        for card in cards:
+            self.metrics_grid.removeWidget(card)
+
+        for column in range(len(cards)):
+            self.metrics_grid.setColumnStretch(column, 0)
+
+        for index, card in enumerate(cards):
+            self.metrics_grid.addWidget(
+                card,
+                index // columns,
+                index % columns,
+            )
+
+        for column in range(columns):
+            self.metrics_grid.setColumnStretch(column, 1)
+
+        self._metrics_columns = columns
+
+    def toggle_control_center(self):
+        self._control_center_expanded = not self._control_center_expanded
+        self.detail_container.setVisible(self._control_center_expanded)
+        self.control_center_btn.setText(
+            "Hide Details"
+            if self._control_center_expanded
+            else "Show Details"
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+        compact = self.width() < 1080
+        if compact != self._compact_layout:
+            self._compact_layout = compact
+            self._control_center_expanded = not compact
+            self.detail_container.setVisible(
+                self._control_center_expanded
+            )
+            self.control_center_btn.setText(
+                "Hide Details"
+                if self._control_center_expanded
+                else "Show Details"
+            )
+
+        if compact != self._table_compact_mode:
+            mode = (
+                QHeaderView.ResizeMode.Interactive
+                if compact else QHeaderView.ResizeMode.Stretch
+            )
+            self.table.horizontalHeader().setSectionResizeMode(mode)
+            self._table_compact_mode = compact
+
+        columns = (
+            2 if self.width() < 850
+            else 3 if self.width() < 1050
+            else 4
+        )
+        self._reflow_metric_cards(columns)
+
     # ========================================================
     # KPI STATISTICS
     # ========================================================
+
+    def _create_user_hover_preview(self):
+
+        self.hover_preview = QFrame(
+            self,
+            Qt.WindowType.ToolTip,
+        )
+        self.hover_preview.setObjectName("UserHoverPreview")
+        self.hover_preview.setAttribute(
+            Qt.WidgetAttribute.WA_ShowWithoutActivating
+        )
+        self.hover_preview.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.hover_preview.setFixedWidth(330)
+
+        layout = QVBoxLayout(self.hover_preview)
+        layout.setContentsMargins(15, 13, 15, 13)
+        layout.setSpacing(8)
+
+        self.hover_preview_title = QLabel()
+        self.hover_preview_title.setObjectName("UserPreviewTitle")
+        self.hover_preview_title.setWordWrap(True)
+        layout.addWidget(self.hover_preview_title)
+
+        self.hover_preview_status = QLabel()
+        self.hover_preview_status.setObjectName("UserPreviewStatus")
+        layout.addWidget(self.hover_preview_status)
+
+        details = QFormLayout()
+        details.setContentsMargins(0, 2, 0, 0)
+        details.setHorizontalSpacing(12)
+        details.setVerticalSpacing(6)
+
+        self.hover_preview_values = {}
+        for field in (
+            "ID / PIN", "Phone", "Role", "Year",
+            "Department", "Created", "Email",
+        ):
+            key_label = QLabel(field)
+            key_label.setObjectName("UserPreviewKey")
+
+            value_label = QLabel()
+            value_label.setObjectName("UserPreviewValue")
+            value_label.setWordWrap(True)
+
+            details.addRow(key_label, value_label)
+            self.hover_preview_values[field] = value_label
+
+        layout.addLayout(details)
+        self.hover_preview.hide()
+
+    def show_user_hover_preview(self, row, _column):
+
+        id_item = self.table.item(row, 0)
+        if not id_item:
+            self.hover_preview.hide()
+            return
+
+        user_id = str(
+            id_item.data(Qt.ItemDataRole.UserRole)
+            or id_item.text()
+        )
+        selected_ids = self.get_selected_user_ids()
+        if (
+            self.detail_container.isVisible()
+            and selected_ids == [user_id]
+        ):
+            self.hover_preview.hide()
+            return
+
+        values = {
+            "ID / PIN": user_id,
+            "Phone": self._user_table_text(row, 2),
+            "Role": self._user_table_text(row, 3),
+            "Year": self._user_table_text(row, 4),
+            "Department": self._user_table_text(row, 5),
+            "Created": self._user_table_text(row, 6),
+            "Email": self._user_table_text(row, 7),
+        }
+
+        self.hover_preview_title.setText(
+            self._user_table_text(row, 1) or "Unnamed user"
+        )
+        self.hover_preview_status.setText(
+            values["Role"].upper() or "USER PROFILE"
+        )
+
+        for field, value in values.items():
+            self.hover_preview_values[field].setText(
+                value or "—"
+            )
+
+        self.hover_preview.adjustSize()
+        item_rect = self.table.visualItemRect(id_item)
+        position = self.table.viewport().mapToGlobal(
+            QPoint(item_rect.left(), item_rect.bottom())
+        ) + QPoint(12, 8)
+
+        screen = QApplication.screenAt(QCursor.pos())
+        if screen:
+            bounds = screen.availableGeometry()
+            if position.x() + self.hover_preview.width() > bounds.right():
+                position.setX(
+                    bounds.right() - self.hover_preview.width()
+                )
+            if position.y() + self.hover_preview.height() > bounds.bottom():
+                position.setY(
+                    self.table.viewport().mapToGlobal(
+                        QPoint(item_rect.left(), item_rect.top())
+                    ).y() - self.hover_preview.height() - 8
+                )
+
+        self.hover_preview.move(position)
+        self.hover_preview.show()
+        self.hover_preview.raise_()
+
+    def _user_table_text(self, row, column):
+        item = self.table.item(row, column)
+        return item.text() if item else ""
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is self.table.viewport()
+            and event.type() == QEvent.Type.Leave
+        ):
+            self.hover_preview.hide()
+
+        return super().eventFilter(watched, event)
 
     def build_statistics(self, parent_layout):
 
@@ -837,10 +1111,9 @@ class UserManagementView(QWidget):
                 index,
             )
 
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
-        grid.setColumnStretch(3, 1)
+        self.metrics_grid = grid
+        self._metrics_columns = None
+        self._reflow_metric_cards(4)
 
         self.stat_total = self.metric_cards["ALL"]
         self.stat_students = self.metric_cards["STUDENT"]
@@ -924,12 +1197,12 @@ class UserManagementView(QWidget):
             self.apply_filters
         )
 
-        self.import_btn = QPushButton("Import CSV")
+        self.import_btn = QPushButton("Import CSV / XLSX")
         self.import_btn.setObjectName("SecondaryButton")
         self.import_btn.setMinimumHeight(36)
 
         self.import_btn.clicked.connect(
-            self.import_users_from_csv
+            self.import_users_from_file
         )
 
         self.export_btn = QPushButton("Export CSV")
@@ -938,6 +1211,20 @@ class UserManagementView(QWidget):
 
         self.export_btn.clicked.connect(
             self.export_users_to_csv
+        )
+
+        self.complaint_btn = QPushButton("New Complaint")
+        self.complaint_btn.setObjectName("SecondaryButton")
+        self.complaint_btn.setMinimumHeight(36)
+        self.complaint_btn.clicked.connect(
+            self.open_complaint_dialog
+        )
+
+        self.complaint_inbox_btn = QPushButton("Complaint Inbox")
+        self.complaint_inbox_btn.setObjectName("SecondaryButton")
+        self.complaint_inbox_btn.setMinimumHeight(36)
+        self.complaint_inbox_btn.clicked.connect(
+            self.open_complaint_inbox
         )
 
         self.add_btn = QPushButton("+ Add New User")
@@ -951,6 +1238,8 @@ class UserManagementView(QWidget):
         for button in (
             self.import_btn,
             self.export_btn,
+            self.complaint_btn,
+            self.complaint_inbox_btn,
             self.add_btn,
         ):
 
@@ -976,19 +1265,28 @@ class UserManagementView(QWidget):
     def build_filters(self, parent_layout):
 
         layout = QHBoxLayout()
-        layout.setSpacing(5)
+        layout.setSpacing(4)
 
         self.filter_buttons = {}
+        self.filter_button_group = QButtonGroup(self)
+        self.filter_button_group.setExclusive(True)
 
         for key, label in self.FILTERS.items():
 
             button = QPushButton(label)
             button.setObjectName("FilterButton")
             button.setCheckable(True)
+            button.setMinimumHeight(38)
+            button.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Fixed,
+            )
+            button.setAccessibleName(label)
 
             button.setChecked(
                 key == "ALL"
             )
+            self.filter_button_group.addButton(button)
 
             button.setCursor(
                 Qt.CursorShape.PointingHandCursor
@@ -1023,7 +1321,8 @@ class UserManagementView(QWidget):
                 number,
             )
 
-        self.year_combo.setMinimumWidth(110)
+        self.year_combo.setMinimumWidth(80)
+        self.year_combo.setEnabled(False)
 
         self.year_combo.setCursor(
             Qt.CursorShape.PointingHandCursor
@@ -1040,7 +1339,7 @@ class UserManagementView(QWidget):
             "ALL",
         )
 
-        self.branch_combo.setMinimumWidth(150)
+        self.branch_combo.setMinimumWidth(100)
 
         self.branch_combo.setCursor(
             Qt.CursorShape.PointingHandCursor
@@ -1282,10 +1581,10 @@ class UserManagementView(QWidget):
 
         # Academic year filter
         self.year_combo.setEnabled(
-            key in ("ALL", "STUDENT")
+            key == "STUDENT"
         )
 
-        if key not in ("ALL", "STUDENT"):
+        if key != "STUDENT":
 
             self.year_combo.blockSignals(True)
             self.year_combo.setCurrentIndex(0)
@@ -1316,7 +1615,7 @@ class UserManagementView(QWidget):
             if len(row) < 6:
                 continue
 
-            user_id, name, phone, role, department, created = row
+            user_id, name, phone, role, department, created = row[:6]
 
             role_lower = str(
                 role or ""
@@ -1346,7 +1645,7 @@ class UserManagementView(QWidget):
 
             # YEAR FILTER
             if (
-                self.current_filter in ("ALL", "STUDENT")
+                self.current_filter == "STUDENT"
                 and selected_year not in (None, "ALL")
             ):
 
@@ -1391,12 +1690,14 @@ class UserManagementView(QWidget):
 
     def populate_table(self, rows):
 
+        self.hover_preview.hide()
         previously_selected = (
             self.get_selected_user_ids()
         )
 
         self._updating_table = True
         self.table.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
 
         try:
 
@@ -1439,6 +1740,7 @@ class UserManagementView(QWidget):
                     year_label,
                     department,
                     created,
+                    row_data[6] if len(row_data) > 6 else "",
                 ]
 
                 for column, value in enumerate(values):
@@ -1505,6 +1807,7 @@ class UserManagementView(QWidget):
         finally:
 
             self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
             self._updating_table = False
 
         self.lbl_count.setText(
@@ -1580,6 +1883,8 @@ class UserManagementView(QWidget):
 
         if self._updating_table:
             return
+
+        self.hover_preview.hide()
 
         selected_ids = (
             self.get_selected_user_ids()
@@ -1706,12 +2011,12 @@ class UserManagementView(QWidget):
 
         if overdue_count > 0:
 
-            status_text = "OVERDUE LOANS"
+            status_text = "OVERDUE BOOKS"
             status_color = c["danger"]
 
         elif active_loans:
 
-            status_text = "ACTIVE LOANS"
+            status_text = "ISSUED BOOKS"
             status_color = c["warning"]
 
         else:
@@ -1721,7 +2026,7 @@ class UserManagementView(QWidget):
 
         status_lbl = QLabel(
             f"{status_text}\n"
-            f"{len(active_loans)} active loans "
+            f"{len(active_loans)} issued books "
             f"({overdue_count} overdue)"
         )
 
@@ -1768,6 +2073,7 @@ class UserManagementView(QWidget):
             ("Year", year_label),
             ("Department", user[4]),
             ("Created", user[5]),
+            ("Email", user[6] if len(user) > 6 else ""),
         ]
 
         for key, value in fields:
@@ -2015,20 +2321,46 @@ class UserManagementView(QWidget):
             parent=self,
         ).exec()
 
+    def open_complaint_dialog(self):
+        try:
+            dialog = ComplaintDialog(self.db, self)
+            dialog.exec()
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Complaint Form Error",
+                str(error),
+            )
+
+    def open_complaint_inbox(self):
+        dialog = ComplaintManagementDialog(self.db, self)
+        dialog.exec()
+
     # ========================================================
-    # CSV IMPORT
+    # CSV / XLSX IMPORT
     # ========================================================
 
-    def import_users_from_csv(self):
+    def import_users_from_file(self):
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Import Users",
             "",
-            "CSV Files (*.csv);;All Files (*)",
+            "Data Files (*.csv *.xlsx);;CSV Files (*.csv);;"
+            "Excel Files (*.xlsx);;All Files (*)",
         )
 
         if not file_path:
+            return
+
+        file_extension = Path(file_path).suffix.casefold()
+        if file_extension == ".xlsx" and openpyxl is None:
+            QMessageBox.critical(
+                self,
+                "Missing Dependency",
+                "Please install 'openpyxl' to import Excel files:\n"
+                "pip install openpyxl",
+            )
             return
 
         users_to_insert = []
@@ -2053,6 +2385,11 @@ class UserManagementView(QWidget):
                 "phone_number",
                 "mobile",
             ),
+            "email": (
+                "email",
+                "email_address",
+                "e_mail",
+            ),
             "role": (
                 "role",
                 "user_role",
@@ -2060,139 +2397,219 @@ class UserManagementView(QWidget):
             ),
             "department": (
                 "department",
+                "department_name",
                 "dept",
                 "branch",
+                "branch_name",
+                "student_branch",
+                "student_department",
+                "teaching_department",
+                "faculty_department",
+                "program",
+                "course",
+                "major",
             ),
         }
 
         try:
 
-            with open(
-                file_path,
-                mode="r",
-                encoding="utf-8-sig",
-                newline="",
-            ) as file:
+            fieldnames = []
+            rows = []
 
-                reader = csv.DictReader(file)
-
-                if not reader.fieldnames:
-
-                    QMessageBox.warning(
-                        self,
-                        "Invalid CSV",
-                        "The selected CSV file has no header row.",
+            if file_extension == ".xlsx":
+                workbook = openpyxl.load_workbook(
+                    file_path,
+                    data_only=True,
+                    read_only=True,
+                )
+                try:
+                    worksheet = workbook.active
+                    excel_rows = worksheet.iter_rows(
+                        values_only=True
                     )
+                    header_row = next(excel_rows, None)
 
-                    return
+                    if header_row:
+                        fieldnames = [
+                            str(value).strip()
+                            if value is not None
+                            else ""
+                            for value in header_row
+                        ]
 
-                normalized_headers = {
-                    str(header).strip().casefold(): header
-                    for header in reader.fieldnames
-                    if header
-                }
+                        for excel_row in excel_rows:
+                            row = {}
+                            for index, value in enumerate(excel_row):
+                                if (
+                                    index >= len(fieldnames)
+                                    or not fieldnames[index]
+                                ):
+                                    continue
 
-                def find_column(alias_list):
+                                if value is None:
+                                    text = ""
+                                elif (
+                                    isinstance(value, float)
+                                    and value.is_integer()
+                                ):
+                                    text = str(int(value))
+                                else:
+                                    text = str(value).strip()
 
-                    for alias in alias_list:
+                                row[fieldnames[index]] = text
 
-                        if alias in normalized_headers:
-                            return normalized_headers[alias]
+                            rows.append(row)
+                finally:
+                    workbook.close()
 
-                    return None
+            elif file_extension == ".csv":
+                with open(
+                    file_path,
+                    mode="r",
+                    encoding="utf-8-sig",
+                    newline="",
+                ) as file:
+                    reader = csv.DictReader(file)
+                    fieldnames = reader.fieldnames or []
+                    rows = list(reader)
 
-                id_col = find_column(aliases["id"])
-                name_col = find_column(aliases["name"])
-                phone_col = find_column(aliases["phone"])
-                role_col = find_column(aliases["role"])
-                dept_col = find_column(aliases["department"])
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Unsupported File",
+                    "Select a CSV or XLSX file.",
+                )
+                return
 
-                if not id_col or not name_col:
+            if not fieldnames:
+                QMessageBox.warning(
+                    self,
+                    "Invalid File",
+                    "The selected file has no header row.",
+                )
+                return
 
-                    QMessageBox.warning(
-                        self,
-                        "Missing CSV Headers",
-                        "Required columns:\n"
-                        "user_id (or id / pin)\n"
-                        "name (or full_name)",
-                    )
+            def normalize_header(header):
+                return re.sub(
+                    r"[^a-z0-9]+",
+                    "_",
+                    str(header).strip().casefold(),
+                ).strip("_")
 
-                    return
+            normalized_headers = {
+                normalize_header(header): header
+                for header in fieldnames
+                if header
+            }
 
-                for line_number, row in enumerate(
-                    reader,
-                    start=2,
+            def find_column(alias_list):
+
+                for alias in alias_list:
+                    normalized_alias = normalize_header(alias)
+                    if normalized_alias in normalized_headers:
+                        return normalized_headers[normalized_alias]
+
+                return None
+
+            id_col = find_column(aliases["id"])
+            name_col = find_column(aliases["name"])
+            phone_col = find_column(aliases["phone"])
+            email_col = find_column(aliases["email"])
+            role_col = find_column(aliases["role"])
+            dept_col = find_column(aliases["department"])
+
+            if not id_col or not name_col:
+                QMessageBox.warning(
+                    self,
+                    "Missing Headers",
+                    "Required columns:\n"
+                    "user_id (or id / pin)\n"
+                    "name (or full_name)",
+                )
+                return
+
+            for line_number, row in enumerate(rows, start=2):
+
+                if not row or not any(
+                    str(value or "").strip()
+                    for value in row.values()
                 ):
+                    continue
 
-                    if not row or not any(
-                        str(value or "").strip()
-                        for value in row.values()
-                    ):
-                        continue
+                user_id = str(
+                    row.get(id_col) or ""
+                ).strip().upper()
 
-                    user_id = str(
-                        row.get(id_col) or ""
-                    ).strip().upper()
+                name = str(
+                    row.get(name_col) or ""
+                ).strip()
 
-                    name = str(
-                        row.get(name_col) or ""
-                    ).strip()
+                phone = (
+                    str(row.get(phone_col) or "").strip()
+                    if phone_col
+                    else ""
+                )
+                email = (
+                    str(row.get(email_col) or "").strip().casefold()
+                    if email_col
+                    else ""
+                )
 
-                    phone = (
-                        str(row.get(phone_col) or "").strip()
-                        if phone_col
-                        else ""
+                role = (
+                    str(row.get(role_col) or "Student").strip()
+                    if role_col
+                    else "Student"
+                )
+
+                department = (
+                    str(row.get(dept_col) or "General").strip()
+                    if dept_col
+                    else "General"
+                )
+
+                if not user_id or not name:
+                    errors.append(
+                        f"Line {line_number}: "
+                        "User ID and name are required."
                     )
+                    continue
 
-                    role = (
-                        str(row.get(role_col) or "Student").strip()
-                        if role_col
-                        else "Student"
+                if user_id in seen_ids:
+                    errors.append(
+                        f"Line {line_number}: "
+                        f"Duplicate ID '{user_id}' in file."
                     )
+                    continue
 
-                    department = (
-                        str(row.get(dept_col) or "General").strip()
-                        if dept_col
-                        else "General"
+                seen_ids.add(user_id)
+
+                if len(user_id) > 100:
+                    errors.append(
+                        f"Line {line_number}: "
+                        "User ID is too long."
                     )
+                    continue
 
-                    if not user_id or not name:
+                if email and (
+                    "@" not in email
+                    or email.startswith("@")
+                    or email.endswith("@")
+                    or "." not in email.rsplit("@", 1)[-1]
+                ):
+                    errors.append(
+                        f"Line {line_number}: Invalid email address."
+                    )
+                    continue
 
-                        errors.append(
-                            f"Line {line_number}: "
-                            "User ID and name are required."
-                        )
-
-                        continue
-
-                    if user_id in seen_ids:
-
-                        errors.append(
-                            f"Line {line_number}: "
-                            f"Duplicate ID '{user_id}' in CSV."
-                        )
-
-                        continue
-
-                    seen_ids.add(user_id)
-
-                    if len(user_id) > 100:
-
-                        errors.append(
-                            f"Line {line_number}: "
-                            "User ID is too long."
-                        )
-
-                        continue
-
-                    users_to_insert.append((
-                        user_id,
-                        name,
-                        phone or None,
-                        role or "Student",
-                        department or "General",
-                        current_date,
-                    ))
+                users_to_insert.append((
+                    user_id,
+                    name,
+                    phone or None,
+                    role or "Student",
+                    department or "General",
+                    current_date,
+                    email or None,
+                ))
 
             if not users_to_insert:
 
@@ -2300,7 +2717,7 @@ class UserManagementView(QWidget):
 
             QMessageBox.critical(
                 self,
-                "CSV Import Error",
+                "User Import Error",
                 str(exc),
             )
 
@@ -2352,6 +2769,7 @@ class UserManagementView(QWidget):
                     "year",
                     "department",
                     "created_at",
+                    "email",
                 ])
 
                 for row in self.filtered_users:
@@ -2364,6 +2782,7 @@ class UserManagementView(QWidget):
                         department,
                         created,
                     ) = row[:6]
+                    email = row[6] if len(row) > 6 else ""
 
                     _, year_label = (
                         self.get_dynamic_year_data(
@@ -2381,6 +2800,7 @@ class UserManagementView(QWidget):
                         year_label,
                         department,
                         created,
+                        email or "",
                     ])
 
             QMessageBox.information(

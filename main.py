@@ -1,14 +1,18 @@
 
 import sys
 import os
+import logging
+import threading
+import datetime
 
 from PyQt6.QtWidgets import QApplication, QDialog
 from PyQt6.QtGui import QIcon, QFont
-from PyQt6.QtCore import QElapsedTimer
+from PyQt6.QtCore import QElapsedTimer, QTimer
 
 from mainwindow import MainWindow
 from database import LocalDatabase
 from dialogs import LoginDialog, CustomSplashScreen
+from email_service import LibraryEmailService
 from theme_manager import ThemeManager
 
 
@@ -19,9 +23,8 @@ from theme_manager import ThemeManager
 APP_NAME = "Library Management System"
 APP_VERSION = "2.0"
 
-# Set False for normal production authentication.
-# Set True only during development/testing.
-BYPASS_LOGIN = False
+# Keep production authentication enabled; bypass is for local testing only.
+BYPASS_LOGIN = True
 
 DEFAULT_THEME = "Dark"
 SPLASH_DURATION = 1500
@@ -204,6 +207,115 @@ def main():
 
     window.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
     window.showMaximized()
+
+    reminder_lock = threading.Lock()
+
+    def run_due_email_reminders():
+        if not reminder_lock.acquire(blocking=False):
+            return
+
+        def send_reminders():
+            reminder_db = None
+            try:
+                reminder_db = LocalDatabase(db.database_path)
+                enabled = reminder_db.get_setting(
+                    "due_email_reminders_enabled",
+                    "0",
+                )
+                if str(enabled).casefold() not in ("1", "true", "yes"):
+                    return
+
+                sent, failures = LibraryEmailService(
+                    reminder_db
+                ).send_due_reminders()
+                if sent:
+                    logging.info("Sent %s due-date reminder emails.", sent)
+                for failure in failures:
+                    logging.warning(
+                        "Could not send due-date reminder: %s",
+                        failure,
+                    )
+            except Exception:
+                logging.exception("Due-date email reminder run failed.")
+            finally:
+                if reminder_db:
+                    reminder_db.close()
+                reminder_lock.release()
+
+        threading.Thread(
+            target=send_reminders,
+            name="library-email-reminders",
+            daemon=True,
+        ).start()
+
+    reminder_timer = QTimer(app)
+    reminder_timer.setInterval(60 * 60 * 1000)
+    reminder_timer.timeout.connect(run_due_email_reminders)
+    reminder_timer.start()
+    QTimer.singleShot(1000, run_due_email_reminders)
+
+    drive_backup_lock = threading.Lock()
+
+    def run_automatic_drive_backup():
+        if not drive_backup_lock.acquire(blocking=False):
+            return
+
+        def upload_backup():
+            backup_db = None
+            try:
+                from google_drive_backup import (
+                    is_drive_connected,
+                    upload_encrypted_database_backup,
+                )
+
+                backup_db = LocalDatabase(db.database_path)
+                enabled = backup_db.get_setting(
+                    "google_drive_auto_backup_enabled",
+                    "0",
+                )
+                if str(enabled).casefold() not in ("1", "true", "yes"):
+                    return
+                if not is_drive_connected():
+                    return
+
+                today = datetime.date.today().isoformat()
+                if backup_db.get_setting(
+                    "google_drive_last_backup",
+                    "",
+                ) == today:
+                    return
+
+                result = upload_encrypted_database_backup(backup_db)
+                if not backup_db.set_setting(
+                    "google_drive_last_backup",
+                    today,
+                ):
+                    raise RuntimeError(
+                        "The backup uploaded, but its completion date "
+                        "could not be saved."
+                    )
+                logging.info(
+                    "Uploaded encrypted Google Drive backup %s.",
+                    result.get("name", "library backup"),
+                )
+            except Exception:
+                logging.exception("Automatic Google Drive backup failed.")
+            finally:
+                if backup_db:
+                    backup_db.close()
+                drive_backup_lock.release()
+
+        threading.Thread(
+            target=upload_backup,
+            name="library-google-drive-backup",
+            daemon=True,
+        ).start()
+
+    drive_backup_timer = QTimer(app)
+    drive_backup_timer.setInterval(60 * 60 * 1000)
+    drive_backup_timer.timeout.connect(run_automatic_drive_backup)
+    drive_backup_timer.start()
+    QTimer.singleShot(2000, run_automatic_drive_backup)
 
     if splash:
         splash.finish(window)

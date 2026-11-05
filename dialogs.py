@@ -1,5 +1,6 @@
 import io
 import os
+import secrets
 import cv2
 import barcode
 
@@ -7,11 +8,11 @@ from barcode.writer import ImageWriter
 from PIL import Image
 
 from PyQt6.QtWidgets import (
-    QDialog, QPushButton, QLineEdit, QMessageBox, QVBoxLayout,
+    QApplication, QDialog, QPushButton, QLineEdit, QMessageBox, QVBoxLayout,
     QComboBox, QLabel, QSpinBox, QFileDialog, QHBoxLayout,
     QCheckBox, QFrame, QTableWidget, QWidget, QSizePolicy,
     QHeaderView, QFormLayout, QTableWidgetItem, QAbstractItemView,
-    QDialogButtonBox, QGridLayout, QGroupBox
+    QDialogButtonBox, QGridLayout, QGroupBox, QPlainTextEdit,
 )
 
 from PyQt6.QtCore import (
@@ -317,6 +318,242 @@ class BookDialog(QDialog):
 # USER DIALOG
 # ============================================================
 
+class ComplaintDialog(QDialog):
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+
+        configure_dialog(self, "Record Library Complaint", 560, 480)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+        layout.addWidget(create_heading("New library complaint"))
+
+        form = QFormLayout()
+        self.user_combo = QComboBox()
+        self.user_combo.addItem("General / anonymous", "")
+
+        success, users = self.db.get_users()
+        if not success:
+            raise RuntimeError("Unable to load users for the complaint form.")
+        for user in users:
+            self.user_combo.addItem(
+                f"{user[1]} ({user[0]})",
+                str(user[0]),
+            )
+
+        self.subject_input = QLineEdit()
+        self.subject_input.setMaxLength(160)
+        self.subject_input.setPlaceholderText("Short summary")
+
+        self.body_input = QPlainTextEdit()
+        self.body_input.setPlaceholderText(
+            "Describe the issue, suggestion, or complaint..."
+        )
+        self.body_input.setMinimumHeight(170)
+
+        form.addRow("User:", self.user_combo)
+        form.addRow("Subject:", self.subject_input)
+        form.addRow("Details:", self.body_input)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(create_button("Cancel", self.reject))
+        buttons.addWidget(
+            create_button("Submit Complaint", self.submit_complaint)
+        )
+        layout.addLayout(buttons)
+
+    def submit_complaint(self):
+        user_id = self.user_combo.currentData()
+        subject = self.subject_input.text().strip()
+        body = self.body_input.toPlainText().strip()
+
+        if not subject or not body:
+            show_warning(
+                self,
+                "Incomplete Complaint",
+                "Enter both a subject and complaint details.",
+            )
+            return
+
+        success, complaint = self.db.create_complaint(
+            user_id,
+            subject,
+            body,
+        )
+        if not success:
+            show_error(self, "Complaint Not Saved", complaint)
+            return
+
+        try:
+            from email_service import LibraryEmailService
+
+            LibraryEmailService(self.db).send_complaint_receipt(
+                complaint
+            )
+        except Exception as error:
+            show_warning(
+                self,
+                "Complaint Saved; Email Not Sent",
+                f"Complaint #{complaint[0]} was saved locally, but the "
+                f"email notification failed:\n\n{error}",
+            )
+            self.accept()
+            return
+
+        show_success(
+            self,
+            "Complaint Submitted",
+            f"Complaint #{complaint[0]} was saved and emailed to the library.",
+        )
+        self.accept()
+
+
+class ComplaintManagementDialog(QDialog):
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.complaints = []
+        configure_dialog(self, "Library Complaints", 900, 600)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setSpacing(12)
+        layout.addWidget(create_heading("Complaint inbox"))
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels([
+            "ID", "User", "Subject", "Status", "Received",
+        ])
+        configure_table(self.table)
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.table.itemSelectionChanged.connect(
+            self.show_selected_complaint
+        )
+        layout.addWidget(self.table, 1)
+
+        self.body_view = QPlainTextEdit()
+        self.body_view.setReadOnly(True)
+        self.body_view.setMaximumHeight(110)
+        layout.addWidget(self.body_view)
+
+        actions = QHBoxLayout()
+        self.status_combo = QComboBox()
+        self.status_combo.addItem("Open", "OPEN")
+        self.status_combo.addItem("In Progress", "IN_PROGRESS")
+        self.status_combo.addItem("Resolved", "RESOLVED")
+        self.update_status_button = create_button(
+            "Update Status",
+            self.update_status,
+        )
+        close_button = create_button("Close", self.accept)
+        actions.addWidget(self.status_combo)
+        actions.addWidget(self.update_status_button)
+        actions.addStretch()
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        self.load_complaints()
+
+    def load_complaints(self):
+        try:
+            self.complaints = self.db.get_complaints()
+        except Exception as error:
+            show_error(self, "Complaint Loading Error", error)
+            return
+
+        self.table.setRowCount(len(self.complaints))
+        for row_index, complaint in enumerate(self.complaints):
+            user_label = (
+                f"{complaint[2]} ({complaint[1]})"
+                if complaint[1]
+                else "General / anonymous"
+            )
+            values = (
+                complaint[0],
+                user_label,
+                complaint[4],
+                complaint[6].replace("_", " ").title(),
+                complaint[7],
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value or ""))
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    int(complaint[0]),
+                )
+                self.table.setItem(row_index, column, item)
+
+        if self.complaints:
+            self.table.selectRow(0)
+        else:
+            self.body_view.setPlainText("No complaints have been recorded.")
+            self.update_status_button.setEnabled(False)
+
+    def show_selected_complaint(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return
+
+        complaint_id = self.table.item(
+            rows[0].row(),
+            0,
+        ).data(Qt.ItemDataRole.UserRole)
+        complaint = next(
+            (
+                item for item in self.complaints
+                if int(item[0]) == complaint_id
+            ),
+            None,
+        )
+        if not complaint:
+            return
+
+        self.body_view.setPlainText(
+            f"From: {complaint[2]} ({complaint[1] or 'anonymous'})\n"
+            f"Email: {complaint[3] or 'Not provided'}\n\n"
+            f"{complaint[5]}"
+        )
+        index = self.status_combo.findData(complaint[6])
+        if index >= 0:
+            self.status_combo.setCurrentIndex(index)
+        self.update_status_button.setEnabled(True)
+
+    def update_status(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            show_warning(
+                self,
+                "Select a Complaint",
+                "Select a complaint to update its status.",
+            )
+            return
+
+        complaint_id = self.table.item(
+            rows[0].row(),
+            0,
+        ).data(Qt.ItemDataRole.UserRole)
+        success, message = self.db.update_complaint_status(
+            complaint_id,
+            self.status_combo.currentData(),
+        )
+        if not success:
+            show_error(self, "Status Update Failed", message)
+            return
+
+        self.load_complaints()
+
+
 class UserDialog(QDialog):
     data_updated = pyqtSignal()
 
@@ -330,7 +567,7 @@ class UserDialog(QDialog):
             self,
             "Register User" if user_id is None else "Edit User",
             460,
-            470
+            520
         )
 
         layout = QVBoxLayout(self)
@@ -380,11 +617,18 @@ class UserDialog(QDialog):
             )
         )
 
+        self.input_email = QLineEdit()
+        self.input_email.setPlaceholderText(
+            "Email for due-date reminders"
+        )
+        self.input_email.setMaxLength(254)
+
         form.addRow("Role:", self.combo_role)
         form.addRow(self.lbl_department, self.combo_department)
         form.addRow("User ID / PIN:", self.input_id)
         form.addRow("Full Name:", self.input_name)
         form.addRow("Phone:", self.input_phoneno)
+        form.addRow("Email:", self.input_email)
 
         layout.addLayout(form)
         layout.addStretch()
@@ -427,6 +671,9 @@ class UserDialog(QDialog):
 
             self.input_name.setText(str(row[1] or ""))
             self.input_phoneno.setText(str(row[2] or ""))
+            self.input_email.setText(
+                str(row[6] or "") if len(row) > 6 else ""
+            )
 
             role = str(row[3] or "")
             department = str(row[4] or "")
@@ -504,6 +751,7 @@ class UserDialog(QDialog):
         user_id = self.input_id.text().strip()
         name = self.input_name.text().strip()
         phone = self.input_phoneno.text().strip()
+        email = self.input_email.text().strip()
         role = self.combo_role.currentText()
 
         if role == "Select Role":
@@ -531,6 +779,19 @@ class UserDialog(QDialog):
                 self,
                 "Invalid Phone",
                 "Enter a valid phone number."
+            )
+            return
+
+        if email and (
+            "@" not in email
+            or email.startswith("@")
+            or email.endswith("@")
+            or "." not in email.rsplit("@", 1)[-1]
+        ):
+            show_warning(
+                self,
+                "Invalid Email",
+                "Enter a valid email address for reminders and replies."
             )
             return
 
@@ -567,7 +828,8 @@ class UserDialog(QDialog):
                     name,
                     phone,
                     role,
-                    department
+                    department,
+                    email,
                 )
             else:
                 success, message = self.db.edit_user(
@@ -575,7 +837,8 @@ class UserDialog(QDialog):
                     name,
                     phone,
                     role,
-                    department
+                    department,
+                    email,
                 )
 
             if success:
@@ -628,7 +891,7 @@ class ViewBooksDialog(QDialog):
             "Title",
             "Author",
             "Status",
-            "Checkout",
+            "Issue Date",
             "Due Date",
             "Fine"
         ])
@@ -767,7 +1030,7 @@ class ViewBooksDialog(QDialog):
         )
 
         banner = QLabel(
-            "🟠 Active Checkout"
+            "🟠 Issued Book"
             if is_issued else
             "🟢 Returned Record"
         )
@@ -787,7 +1050,7 @@ class ViewBooksDialog(QDialog):
             ("Title:", title),
             ("Author:", author),
             ("Publisher:", publisher),
-            ("Checkout:", checkout),
+            ("Issue Date:", checkout),
             ("Due Date:", due),
             ("Returned:", returned or "Not yet returned"),
             ("Fine:", money(fine))
@@ -1383,7 +1646,7 @@ class LoginDialog(QDialog):
             self,
             "Library System Security",
             390,
-            250
+            320
         )
 
         layout = QVBoxLayout(self)
@@ -1419,6 +1682,14 @@ class LoginDialog(QDialog):
         self.btn_login.setAutoDefault(False)
         layout.addWidget(self.btn_login)
 
+        self.btn_forgot_password = create_button(
+            "Forgot password?",
+            self.open_password_recovery,
+        )
+        self.btn_forgot_password.setDefault(False)
+        self.btn_forgot_password.setAutoDefault(False)
+        layout.addWidget(self.btn_forgot_password)
+
         self.input_admin_password.setFocus()
 
     def verify_password(self):
@@ -1428,16 +1699,9 @@ class LoginDialog(QDialog):
         self._verification_in_progress = True
 
         try:
-            password = self.db.get_setting(
-                "admin_password",
-                "admin123"
-            )
-
             entered = self.input_admin_password.text()
 
-            if entered == str(password):
-                self.accept()
-            else:
+            if not self.db.verify_admin_password(entered):
                 show_error(
                     self,
                     "Access Denied",
@@ -1446,11 +1710,263 @@ class LoginDialog(QDialog):
 
                 self.input_admin_password.clear()
                 self.input_admin_password.setFocus()
+                return
+
+            if not self.db.has_admin_recovery_code():
+                setup_dialog = RecoveryCodeSetupDialog(self)
+                if setup_dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+
+                if not self.db.set_admin_recovery_code(
+                    setup_dialog.recovery_code
+                ):
+                    show_error(
+                        self,
+                        "Recovery Setup Failed",
+                        "The recovery code could not be saved. "
+                        "Please try again before continuing.",
+                    )
+                    return
+
+            self.accept()
 
         except Exception as error:
             show_error(self, "Authentication Error", error)
         finally:
             self._verification_in_progress = False
+
+    def open_password_recovery(self):
+        try:
+            has_recovery_code = self.db.has_admin_recovery_code()
+        except Exception as error:
+            show_error(self, "Recovery Error", error)
+            return
+
+        if not has_recovery_code:
+            show_warning(
+                self,
+                "Recovery Not Set Up",
+                "A recovery code has not been configured. "
+                "Password recovery is only available after a "
+                "librarian saves a recovery code in the application.",
+            )
+            return
+
+        dialog = AdminPasswordRecoveryDialog(self.db, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            show_success(
+                self,
+                "Password Reset",
+                "The administrator password has been reset. "
+                "Save the new recovery code shown during recovery, "
+                "then sign in with the new password.",
+            )
+            self.input_admin_password.clear()
+            self.input_admin_password.setFocus()
+
+
+class RecoveryCodeSetupDialog(QDialog):
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        raw_code = secrets.token_hex(16).upper()
+        self.recovery_code = "-".join(
+            raw_code[index:index + 4]
+            for index in range(0, len(raw_code), 4)
+        )
+
+        configure_dialog(
+            self,
+            "Save Administrator Recovery Code",
+            500,
+            280,
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+
+        layout.addWidget(
+            create_heading("Save this recovery code")
+        )
+        description = QLabel(
+            "Keep this code somewhere secure and separate from the "
+            "computer. It is shown only once and is required to reset "
+            "the administrator password."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        self.code_input = QLineEdit(self.recovery_code)
+        self.code_input.setReadOnly(True)
+        self.code_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.code_input.setStyleSheet(
+            "font-size: 15px; font-weight: 700; letter-spacing: 1px;"
+        )
+        self.code_input.setMinimumHeight(42)
+        layout.addWidget(self.code_input)
+
+        copy_button = create_button(
+            "Copy Recovery Code",
+            lambda: QApplication.clipboard().setText(self.recovery_code),
+        )
+        layout.addWidget(copy_button)
+
+        self.saved_checkbox = QCheckBox(
+            "I have saved this code somewhere secure."
+        )
+        layout.addWidget(self.saved_checkbox)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+
+        cancel_button = create_button("Cancel", self.reject)
+        buttons.addWidget(cancel_button)
+
+        self.confirm_button = create_button(
+            "Continue",
+            self.accept,
+            enabled=False,
+        )
+        buttons.addWidget(self.confirm_button)
+        layout.addLayout(buttons)
+
+        self.saved_checkbox.toggled.connect(
+            self.confirm_button.setEnabled
+        )
+
+
+class AdminPasswordRecoveryDialog(QDialog):
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+
+        self.db = db
+
+        configure_dialog(
+            self,
+            "Reset Administrator Password",
+            450,
+            310,
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(11)
+
+        layout.addWidget(
+            create_heading("Verify your recovery code")
+        )
+
+        self.recovery_code_input = QLineEdit()
+        self.recovery_code_input.setPlaceholderText(
+            "Enter the saved recovery code"
+        )
+        layout.addWidget(self.recovery_code_input)
+
+        self.new_password_input = QLineEdit()
+        self.new_password_input.setEchoMode(
+            QLineEdit.EchoMode.Password
+        )
+        self.new_password_input.setPlaceholderText(
+            "New password (at least 8 characters)"
+        )
+        layout.addWidget(self.new_password_input)
+
+        self.confirm_password_input = QLineEdit()
+        self.confirm_password_input.setEchoMode(
+            QLineEdit.EchoMode.Password
+        )
+        self.confirm_password_input.setPlaceholderText(
+            "Confirm new password"
+        )
+        self.confirm_password_input.returnPressed.connect(
+            self.reset_password
+        )
+        layout.addWidget(self.confirm_password_input)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel_button = create_button("Cancel", self.reject)
+        buttons.addWidget(cancel_button)
+        reset_button = create_button(
+            "Reset Password",
+            self.reset_password,
+        )
+        buttons.addWidget(reset_button)
+        layout.addLayout(buttons)
+
+    def reset_password(self):
+        recovery_code = self.recovery_code_input.text().strip()
+        new_password = self.new_password_input.text()
+        confirmation = self.confirm_password_input.text()
+
+        if not recovery_code:
+            show_warning(
+                self,
+                "Recovery Code Required",
+                "Enter the saved administrator recovery code.",
+            )
+            return
+
+        if len(new_password) < 8:
+            show_warning(
+                self,
+                "Weak Password",
+                "The new password must contain at least 8 characters.",
+            )
+            return
+
+        if new_password != confirmation:
+            show_warning(
+                self,
+                "Password Mismatch",
+                "The new password and confirmation do not match.",
+            )
+            return
+
+        try:
+            recovery_code_valid = self.db.verify_admin_recovery_code(
+                recovery_code
+            )
+        except Exception as error:
+            show_error(self, "Recovery Error", error)
+            return
+
+        if not recovery_code_valid:
+            show_error(
+                self,
+                "Recovery Failed",
+                "The recovery code is incorrect.",
+            )
+            self.recovery_code_input.clear()
+            self.recovery_code_input.setFocus()
+            return
+
+        setup_dialog = RecoveryCodeSetupDialog(self)
+        if setup_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            reset = self.db.reset_admin_password_with_recovery(
+                recovery_code,
+                new_password,
+                setup_dialog.recovery_code,
+            )
+            if not reset:
+                show_error(
+                    self,
+                    "Recovery Failed",
+                    "The recovery code is incorrect or has already "
+                    "been replaced.",
+                )
+                return
+        except Exception as error:
+            show_error(self, "Password Reset Failed", error)
+            return
+
+        self.accept()
 
 
 # ============================================================
@@ -1558,7 +2074,7 @@ class BookHistoryDialog(QDialog):
         self.table.setHorizontalHeaderLabels([
             "Borrower ID",
             "Status",
-            "Checkout",
+            "Issue Date",
             "Due Date",
             "Return Date",
             "Fine"
@@ -1695,7 +2211,7 @@ class BookHistoryDialog(QDialog):
         )
 
         banner = QLabel(
-            "🟠 Active Checkout"
+            "🟠 Issued Book"
             if is_issued else
             "🟢 Completed Loan"
         )
@@ -1716,7 +2232,7 @@ class BookHistoryDialog(QDialog):
             ("Book ID:", self.book_id),
             ("Borrower ID:", user_id),
             ("Status:", status),
-            ("Checkout:", checkout),
+            ("Issue Date:", checkout),
             ("Due Date:", due),
             ("Returned:", returned or "Not yet returned"),
             ("Fine:", money(fine))

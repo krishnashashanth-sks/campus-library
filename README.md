@@ -88,7 +88,7 @@ campus-library/
 Install required packages:
 
 ```bash
-pip install PyQt6 pillow opencv-python python-barcode
+pip install PyQt6 pillow opencv-python python-barcode openpyxl
 ```
 
 ### Running the Application
@@ -103,7 +103,55 @@ cd campus-library
 python main.py
 ```
 
-3. Enter the default admin password: **`admin123`**
+3. Enter the default admin password: **`admin123`** on a new database.
+4. On first sign-in, save the administrator recovery code somewhere safe.
+   The code is shown once and is required to reset a forgotten password.
+
+Use **Forgot password?** on the login screen and enter the saved recovery
+code to choose a new password. A successful reset replaces the recovery code;
+save the newly displayed code before continuing. You can also replace the
+recovery code from **Settings → Administrator Security** while signed in.
+
+The password and recovery code are stored as salted hashes in the local
+database. Existing databases migrate the legacy password after a successful
+sign-in. For security, an older database with a forgotten password and no
+previously saved recovery code cannot be reset locally; there is no safe way
+for an offline EXE to verify ownership otherwise.
+
+## Email Notifications, Complaints, and Online Backups
+
+Optional email and Google Drive integrations require the service dependencies:
+
+```bash
+pip install -r requirements-services.txt
+```
+
+In **Settings → Email Notifications**, enter the Gmail sender and library
+contact address. Use a Gmail **App Password** (with 2-Step Verification
+enabled), not the account password; enter it in the app and save it. The
+password is stored in the signed-in Windows account's Credential Manager,
+not in the database. Enable due-date reminders to send one email on a loan's
+due date and one when it becomes overdue. Student email addresses can be
+entered in User Management or included in user CSV/XLSX imports.
+
+The librarian can submit and track user complaints in User Management.
+Complaints are saved locally and emailed to the configured library contact;
+this is an in-app librarian workflow, not a public student portal.
+
+In **Settings → Encrypted Google Drive Backup**, connect with a Google OAuth
+**Desktop app** client JSON file from a Google Cloud project where the Drive
+API is enabled. The app uploads AES-GCM encrypted database copies. The OAuth
+token and backup key are stored in the signed-in Windows account's Credential
+Manager. Export the backup recovery key and keep it securely outside the
+computer; without it, backups cannot be recovered if that Windows profile is
+lost. Restore writes to a separate database file and does not overwrite the
+currently open database.
+
+Automatic daily uploads are optional and run while the application is open,
+after a successful Drive connection and when enabled in backup settings.
+Without saved Drive authorization, no automatic upload is attempted. Email
+and Drive integrations require an internet connection and are not exercised
+by offline operation.
 
 ## Building a Windows EXE and Installer (PyInstaller + Inno Setup)
 
@@ -271,7 +319,7 @@ Remove-Item -Recurse -Force build,dist,__pycache__
 
 | Setting | Default Value |
 |---------|---------------|
-| Admin Password | `admin123` |
+| Initial Admin Password | `admin123` (new databases only) |
 | Daily Fine Rate | 10.00 (currency units) |
 | Default Loan Period | 14 days |
 

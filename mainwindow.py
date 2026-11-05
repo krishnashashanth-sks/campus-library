@@ -35,7 +35,7 @@ from pages.dashboard_view import DashboardView
 class MainWindow(QMainWindow):
 
     SIDEBAR_WIDTH = 230
-    SIDEBAR_COLLAPSED_WIDTH = 0
+    SIDEBAR_COLLAPSED_WIDTH = 76
 
     def __init__(self, db):
 
@@ -43,6 +43,8 @@ class MainWindow(QMainWindow):
 
         self.db = db
         self.sidebar_expanded = True
+        self._sidebar_auto_collapsed = False
+        self._responsive_sidebar_mode = None
         self.anim_group = None
         self.nav_buttons = []
         self.page_views = []
@@ -59,8 +61,20 @@ class MainWindow(QMainWindow):
             "Library Management System"
         )
 
-        self.setMinimumSize(1024, 640)
-        self.resize(1440, 900)
+        screen = app.primaryScreen() if app else None
+        available = screen.availableGeometry() if screen else None
+        if available and available.isValid():
+            self.setMinimumSize(
+                min(1024, available.width()),
+                min(640, available.height()),
+            )
+            self.resize(
+                min(1440, available.width()),
+                min(900, available.height()),
+            )
+        else:
+            self.setMinimumSize(1024, 640)
+            self.resize(1440, 900)
 
         self.load_saved_theme()
 
@@ -337,6 +351,15 @@ class MainWindow(QMainWindow):
                     outline: none;
                 }}
 
+                QPushButton#NavigationButton[compact="true"] {{
+                    text-align: center;
+                    padding-left: 0;
+                    padding-right: 0;
+                    margin-left: 8px;
+                    margin-right: 8px;
+                    font-size: 19px;
+                }}
+
                 /* Exit button */
 
                 QPushButton#ExitButton {{
@@ -356,6 +379,15 @@ class MainWindow(QMainWindow):
                     background-color: #DC2626;
                     color: #FFFFFF;
                     border-color: #DC2626;
+                }}
+
+                QPushButton#ExitButton[compact="true"] {{
+                    text-align: center;
+                    padding-left: 0;
+                    padding-right: 0;
+                    margin-left: 8px;
+                    margin-right: 8px;
+                    font-size: 18px;
                 }}
 
                 /* Pages container */
@@ -595,15 +627,15 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding
         )
 
-        sidebar_layout = QVBoxLayout(
+        self.sidebar_layout = QVBoxLayout(
             self.sidebar
         )
 
-        sidebar_layout.setContentsMargins(
+        self.sidebar_layout.setContentsMargins(
             0, 18, 0, 14
         )
 
-        sidebar_layout.setSpacing(4)
+        self.sidebar_layout.setSpacing(4)
 
         # Navigation items
 
@@ -617,10 +649,15 @@ class MainWindow(QMainWindow):
         ]
 
         self.nav_buttons = []
+        self.nav_icons = {}
 
         for title, index in navigation_items:
 
             button = QPushButton(title)
+            icon, _label = title.split("  ", 1)
+            self.nav_icons[index] = (icon, title)
+            button.setToolTip(title)
+            button.setAccessibleName(title)
 
             button.setObjectName(
                 "NavigationButton"
@@ -643,7 +680,7 @@ class MainWindow(QMainWindow):
                 self.switch_page(idx)
             )
 
-            sidebar_layout.addWidget(
+            self.sidebar_layout.addWidget(
                 button
             )
 
@@ -663,32 +700,33 @@ class MainWindow(QMainWindow):
             for button, _ in self.nav_buttons
         ]
 
-        sidebar_layout.addStretch()
+        self.sidebar_layout.addStretch()
 
         # Exit button
 
-        exit_btn = QPushButton(
+        self.exit_btn = QPushButton(
             "⏻  Exit System"
         )
 
-        exit_btn.setObjectName(
+        self.exit_btn.setObjectName(
             "ExitButton"
         )
 
-        exit_btn.setCursor(
+        self.exit_btn.setToolTip("Exit System")
+        self.exit_btn.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
 
-        exit_btn.setFocusPolicy(
+        self.exit_btn.setFocusPolicy(
             Qt.FocusPolicy.NoFocus
         )
 
-        exit_btn.clicked.connect(
+        self.exit_btn.clicked.connect(
             self.confirm_exit
         )
 
-        sidebar_layout.addWidget(
-            exit_btn
+        self.sidebar_layout.addWidget(
+            self.exit_btn
         )
 
         parent_layout.addWidget(
@@ -880,13 +918,12 @@ class MainWindow(QMainWindow):
                 button_index == index
             )
 
-        self.refresh_page(index)
-
     # ========================================================
     # SIDEBAR ANIMATION
     # ========================================================
 
     def toggle_sidebar(self):
+        self._sidebar_auto_collapsed = False
 
         if self.anim_group and (
             self.anim_group.state()
@@ -894,11 +931,13 @@ class MainWindow(QMainWindow):
         ):
             self.anim_group.stop()
 
+        target_expanded = not self.sidebar_expanded
         target_width = (
-            self.SIDEBAR_COLLAPSED_WIDTH
-            if self.sidebar_expanded
-            else self.SIDEBAR_WIDTH
+            self.SIDEBAR_WIDTH
+            if target_expanded
+            else self.SIDEBAR_COLLAPSED_WIDTH
         )
+        self._apply_sidebar_compact_mode(not target_expanded)
 
         current_width = self.sidebar.maximumWidth()
 
@@ -935,11 +974,71 @@ class MainWindow(QMainWindow):
                 animation
             )
 
-        self.sidebar_expanded = (
-            not self.sidebar_expanded
-        )
+        self.sidebar_expanded = target_expanded
 
         self.anim_group.start()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+        if not hasattr(self, "sidebar"):
+            return
+
+        compact = self.width() < 1280
+        if compact == self._responsive_sidebar_mode:
+            return
+
+        self._responsive_sidebar_mode = compact
+
+        if compact and self.sidebar_expanded:
+            self._set_sidebar_expanded(False, automatic=True)
+        elif not compact and self._sidebar_auto_collapsed:
+            self._set_sidebar_expanded(True, automatic=False)
+
+    def _set_sidebar_expanded(self, expanded, automatic):
+        if self.anim_group and (
+            self.anim_group.state()
+            == QParallelAnimationGroup.State.Running
+        ):
+            self.anim_group.stop()
+
+        width = (
+            self.SIDEBAR_WIDTH
+            if expanded
+            else self.SIDEBAR_COLLAPSED_WIDTH
+        )
+        self.sidebar.setMinimumWidth(width)
+        self.sidebar.setMaximumWidth(width)
+        self.sidebar_expanded = expanded
+        self._sidebar_auto_collapsed = automatic and not expanded
+        self._apply_sidebar_compact_mode(not expanded)
+
+    def _apply_sidebar_compact_mode(self, compact):
+        if not hasattr(self, "nav_buttons"):
+            return
+
+        margins = 8 if compact else 0
+        self.sidebar_layout.setContentsMargins(
+            margins,
+            18,
+            margins,
+            14,
+        )
+
+        for button, index in self.nav_buttons:
+            icon, title = self.nav_icons[index]
+            button.setText(icon if compact else title)
+            button.setToolTip(title if compact else "")
+            button.setProperty("compact", compact)
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+        self.exit_btn.setText(
+            "⏻" if compact else "⏻  Exit System"
+        )
+        self.exit_btn.setProperty("compact", compact)
+        self.exit_btn.style().unpolish(self.exit_btn)
+        self.exit_btn.style().polish(self.exit_btn)
 
     # ========================================================
     # EXIT CONFIRMATION

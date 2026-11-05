@@ -15,6 +15,9 @@ Usage:
     theme_manager.set_theme("Dark")
 """
 
+import os
+import sys
+
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QColor, QPalette, QFont
 from PyQt6.QtWidgets import QApplication
@@ -222,6 +225,30 @@ class ThemeManager(QObject):
     def _create_stylesheet(c):
         """Central application stylesheet."""
 
+        resource_root = getattr(
+            sys,
+            "_MEIPASS",
+            os.path.dirname(os.path.abspath(__file__)),
+        )
+        checkbox_check = os.path.join(
+            resource_root,
+            "assets",
+            "checkbox-check.svg",
+        ).replace("\\", "/")
+        arrow_scheme = (
+            "light" if c["text"].lower() == "#e8eef8" else "dark"
+        )
+        spin_up_arrow = os.path.join(
+            resource_root,
+            "assets",
+            f"spin-up-{arrow_scheme}.svg",
+        ).replace("\\", "/")
+        spin_down_arrow = os.path.join(
+            resource_root,
+            "assets",
+            f"spin-down-{arrow_scheme}.svg",
+        ).replace("\\", "/")
+
         return f"""
         /* ---------- GLOBAL ---------- */
 
@@ -305,6 +332,55 @@ class ThemeManager(QObject):
             border: 1px solid {c["primary"]};
         }}
 
+        QSpinBox,
+        QDoubleSpinBox {{
+            padding-right: 26px;
+        }}
+
+        QSpinBox::up-button,
+        QDoubleSpinBox::up-button,
+        QSpinBox::down-button,
+        QDoubleSpinBox::down-button {{
+            subcontrol-origin: border;
+            subcontrol-position: top right;
+            width: 18px;
+            background-color: {c["surface_alt"]};
+            border-left: 1px solid {c["border"]};
+        }}
+
+        QSpinBox::up-button,
+        QDoubleSpinBox::up-button {{
+            border-top-right-radius: 5px;
+        }}
+
+        QSpinBox::down-button,
+        QDoubleSpinBox::down-button {{
+            subcontrol-position: bottom right;
+            border-top: 1px solid {c["border"]};
+            border-bottom-right-radius: 5px;
+        }}
+
+        QSpinBox::up-button:hover,
+        QDoubleSpinBox::up-button:hover,
+        QSpinBox::down-button:hover,
+        QDoubleSpinBox::down-button:hover {{
+            background-color: {c["selection"]};
+        }}
+
+        QSpinBox::up-arrow,
+        QDoubleSpinBox::up-arrow {{
+            image: url("{spin_up_arrow}");
+            width: 8px;
+            height: 6px;
+        }}
+
+        QSpinBox::down-arrow,
+        QDoubleSpinBox::down-arrow {{
+            image: url("{spin_down_arrow}");
+            width: 8px;
+            height: 6px;
+        }}
+
         QComboBox QAbstractItemView {{
             background-color: {c["surface"]};
             color: {c["text"]};
@@ -364,6 +440,43 @@ class ThemeManager(QObject):
         QRadioButton {{
             spacing: 8px;
             color: {c["text"]};
+        }}
+
+        QCheckBox::indicator,
+        QRadioButton::indicator {{
+            width: 16px;
+            height: 16px;
+            background-color: {c["input"]};
+            border: 1px solid {c["muted"]};
+        }}
+
+        QCheckBox::indicator {{
+            border-radius: 4px;
+        }}
+
+        QCheckBox::indicator:checked,
+        QRadioButton::indicator:checked {{
+            background-color: {c["primary"]};
+            border: 1px solid {c["primary"]};
+        }}
+
+        QCheckBox::indicator:checked {{
+            image: url("{checkbox_check}");
+        }}
+
+        QCheckBox::indicator:hover,
+        QRadioButton::indicator:hover {{
+            border-color: {c["primary"]};
+        }}
+
+        QCheckBox::indicator:disabled,
+        QRadioButton::indicator:disabled {{
+            background-color: {c["surface"]};
+            border-color: {c["border"]};
+        }}
+
+        QRadioButton::indicator {{
+            border-radius: 9px;
         }}
 
         QCheckBox:disabled,
@@ -546,5 +659,3 @@ class ThemeManager(QObject):
             border: none;
         }}
         """
-
-

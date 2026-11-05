@@ -23,6 +23,5 @@ Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Icons]
-; FIXED: Changed target filename to match the main executable in your dist folder ('main.exe')
-Name: "{group}\Library"; Filename: "{app}\main.exe"; IconFilename: "{app}\assets\library_icon.ico"
-Name: "{userdesktop}\Library"; Filename: "{app}\main.exe"; IconFilename: "{app}\assets\library_icon.ico"; Tasks: desktopicon
+Name: "{group}\Library"; Filename: "{app}\Library.exe"; IconFilename: "{app}\assets\library_icon.ico"
+Name: "{userdesktop}\Library"; Filename: "{app}\Library.exe"; IconFilename: "{app}\assets\library_icon.ico"; Tasks: desktopicon

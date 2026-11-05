@@ -612,7 +612,7 @@ class ReportsView(QWidget):
             "ISSUED",
             "BOOKS ISSUED",
             "0",
-            "Loans started in selected period",
+            "Books issued during selected period",
             self.ACCENTS["ISSUED"],
         )
 
@@ -626,9 +626,9 @@ class ReportsView(QWidget):
 
         self.card_active = InteractiveStatCard(
             "ACTIVE",
-            "ACTIVE LOANS",
+            "ISSUED BOOKS",
             "0",
-            "Current outstanding loans",
+            "Books currently issued",
             self.ACCENTS["ACTIVE"],
         )
 
@@ -636,7 +636,7 @@ class ReportsView(QWidget):
             "FINES",
             "FINES COLLECTED",
             "₹0.00",
-            "Fines recorded for returned loans",
+            "Fines recorded for returned books",
             self.ACCENTS["FINES"],
         )
 
@@ -943,7 +943,7 @@ class ReportsView(QWidget):
         if metric == "ISSUED":
             self.graph_title.setText("Daily Books Issued")
             self.graph_subtitle.setText(
-                "Number of loans started on each date"
+                "Books issued on each date"
             )
 
             self.render_bar_chart(
@@ -969,7 +969,7 @@ class ReportsView(QWidget):
                 "Current Circulation Breakdown"
             )
             self.graph_subtitle.setText(
-                "Outstanding loans and overdue distribution"
+                "Issued and overdue books"
             )
 
             self.render_status_pie_chart()
@@ -977,7 +977,7 @@ class ReportsView(QWidget):
         elif metric == "FINES":
             self.graph_title.setText("Daily Fine Collection")
             self.graph_subtitle.setText(
-                "Fine amounts recorded against returned loans"
+                "Fine amounts recorded for returned books"
             )
 
             self.render_bar_chart(
@@ -1173,12 +1173,12 @@ class ReportsView(QWidget):
 
         values = [
             (
-                "On-Time Loans",
+                "On-Time Books",
                 on_time,
                 self.ACCENTS["ISSUED"],
             ),
             (
-                "Overdue Loans",
+                "Overdue Books",
                 overdue,
                 self.colors["danger"],
             ),
@@ -1187,7 +1187,7 @@ class ReportsView(QWidget):
         total = sum(value for _, value, _ in values)
 
         if total == 0:
-            empty = series.append("No Active Loans", 1)
+            empty = series.append("No Issued Books", 1)
             empty.setBrush(
                 QColor(self.colors["border"])
             )
@@ -1306,7 +1306,7 @@ class ReportsView(QWidget):
                     "Log ID",
                     "Book ID",
                     "User ID",
-                    "Checkout Date",
+                    "Issue Date",
                     "Due Date",
                     "Return Date",
                     "Fine Amount (INR)",
@@ -1330,12 +1330,12 @@ class ReportsView(QWidget):
                 ])
 
                 writer.writerow([
-                    "Currently Active Loans",
+                    "Issued Books",
                     self.stats_summary["active"],
                 ])
 
                 writer.writerow([
-                    "Overdue Loans",
+                    "Overdue Books",
                     self.stats_summary["overdue"],
                 ])
 

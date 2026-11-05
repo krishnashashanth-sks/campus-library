@@ -3,6 +3,10 @@ import csv
 import sqlite3
 import datetime
 import logging
+import hashlib
+import hmac
+import re
+import secrets
 from contextlib import contextmanager
 from typing import Optional, Iterable, Sequence, Any
 
@@ -106,6 +110,7 @@ class LocalDatabase:
                     full_name TEXT NOT NULL,
                     role TEXT NOT NULL,
                     department TEXT,
+                    email TEXT,
                     created_at TIMESTAMP
                 )
             """)
@@ -143,6 +148,29 @@ class LocalDatabase:
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS email_notifications (
+                    loan_id INTEGER NOT NULL,
+                    reminder_type TEXT NOT NULL,
+                    sent_at TIMESTAMP NOT NULL,
+                    PRIMARY KEY (loan_id, reminder_type),
+                    FOREIGN KEY(loan_id) REFERENCES circulation_logs(id)
+                        ON DELETE CASCADE
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS complaints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                        ON DELETE SET NULL
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS departments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT UNIQUE COLLATE NOCASE,
@@ -164,6 +192,7 @@ class LocalDatabase:
             self._ensure_column("books", "isbn", "TEXT")
             self._ensure_column("circulation_logs", "status", "TEXT DEFAULT 'ISSUED'")
             self._ensure_column("circulation_logs", "fine_amount", "DECIMAL(10, 2) DEFAULT 0.00")
+            self._ensure_column("users", "email", "TEXT")
 
             cur.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
@@ -249,19 +278,212 @@ class LocalDatabase:
             logging.error("Could not save setting %s: %s", key, exc)
             return False
 
+    @staticmethod
+    def _hash_admin_secret(secret):
+        iterations = 310000
+        salt = secrets.token_bytes(16)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            secret.encode("utf-8"),
+            salt,
+            iterations,
+        )
+        return "pbkdf2_sha256${}${}${}".format(
+            iterations,
+            salt.hex(),
+            digest.hex(),
+        )
+
+    @staticmethod
+    def _verify_admin_secret(secret, encoded_hash):
+        try:
+            algorithm, iterations, salt_hex, digest_hex = (
+                encoded_hash.split("$", 3)
+            )
+            if algorithm != "pbkdf2_sha256":
+                return False
+
+            iterations = int(iterations)
+            if not 100000 <= iterations <= 1000000:
+                return False
+
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(digest_hex)
+            actual = hashlib.pbkdf2_hmac(
+                "sha256",
+                secret.encode("utf-8"),
+                salt,
+                iterations,
+            )
+            return hmac.compare_digest(actual, expected)
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _normalize_recovery_code(code):
+        normalized = re.sub(r"[\s-]", "", str(code or "")).upper()
+        return normalized if re.fullmatch(r"[0-9A-F]{32}", normalized) else ""
+
+    def verify_admin_password(self, password):
+        password = str(password or "")
+        password_hash = self.get_setting("admin_password_hash")
+
+        if password_hash:
+            return self._verify_admin_secret(password, password_hash)
+
+        legacy_password = self.get_setting("admin_password", "admin123")
+        if not hmac.compare_digest(password, str(legacy_password)):
+            return False
+
+        if not self.set_admin_password(password):
+            raise RuntimeError("Unable to securely migrate the administrator password.")
+        return True
+
+    def set_admin_password(self, password):
+        password = str(password or "")
+        if len(password) < 8:
+            raise ValueError("The administrator password must contain at least 8 characters.")
+
+        password_hash = self._hash_admin_secret(password)
+        with self._transaction(immediate=True):
+            self.conn.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES ('admin_password_hash', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (password_hash,),
+            )
+            self.conn.execute(
+                "DELETE FROM settings WHERE key = 'admin_password'"
+            )
+        return True
+
+    def has_admin_recovery_code(self):
+        return bool(self.get_setting("admin_recovery_code_hash"))
+
+    def set_admin_recovery_code(self, code):
+        normalized = self._normalize_recovery_code(code)
+        if not normalized:
+            raise ValueError("The recovery code is invalid.")
+
+        code_hash = self._hash_admin_secret(normalized)
+        with self._transaction(immediate=True):
+            self.conn.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES ('admin_recovery_code_hash', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (code_hash,),
+            )
+        return True
+
+    def _verify_admin_recovery_code_hash(self, code, encoded_hash):
+        normalized = self._normalize_recovery_code(code)
+        return bool(
+            normalized
+            and encoded_hash
+            and self._verify_admin_secret(normalized, encoded_hash)
+        )
+
+    def verify_admin_recovery_code(self, code):
+        return self._verify_admin_recovery_code_hash(
+            code,
+            self.get_setting("admin_recovery_code_hash"),
+        )
+
+    def reset_admin_password_with_recovery(
+        self,
+        recovery_code,
+        new_password,
+        new_recovery_code,
+    ):
+        new_password = str(new_password or "")
+        normalized_recovery = self._normalize_recovery_code(
+            new_recovery_code
+        )
+        if len(new_password) < 8:
+            raise ValueError("The administrator password must contain at least 8 characters.")
+        if not normalized_recovery:
+            raise ValueError("The new recovery code is invalid.")
+
+        new_password_hash = self._hash_admin_secret(new_password)
+        new_recovery_hash = self._hash_admin_secret(normalized_recovery)
+
+        with self._transaction(immediate=True):
+            stored_hash = self.conn.execute(
+                """
+                SELECT value FROM settings
+                WHERE key = 'admin_recovery_code_hash'
+                """
+            ).fetchone()
+            if not stored_hash or not self._verify_admin_recovery_code_hash(
+                recovery_code,
+                stored_hash[0],
+            ):
+                return False
+
+            self.conn.executemany(
+                """
+                INSERT INTO settings(key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                [
+                    ("admin_password_hash", new_password_hash),
+                    ("admin_recovery_code_hash", new_recovery_hash),
+                ],
+            )
+            self.conn.execute(
+                "DELETE FROM settings WHERE key = 'admin_password'"
+            )
+        return True
+
     # DEPARTMENTS
     def get_departments(self, category=None):
         try:
             if category:
+                category = self._clean(category).upper()
+                if category == "STUDENT":
+                    role_filter = "LOWER(role) LIKE '%student%'"
+                elif category == "FACULTY":
+                    role_filter = (
+                        "LOWER(role) LIKE '%faculty%' "
+                        "OR LOWER(role) LIKE '%staff%' "
+                        "OR LOWER(role) LIKE '%guest%'"
+                    )
+                else:
+                    return []
+
                 rows = self.conn.execute(
-                    "SELECT name FROM departments WHERE category = ? ORDER BY name COLLATE NOCASE",
-                    (self._clean(category).upper(),),
+                    f"""
+                    SELECT name FROM departments WHERE category = ?
+                    UNION
+                    SELECT department FROM users
+                    WHERE department IS NOT NULL
+                        AND TRIM(department) != ''
+                        AND ({role_filter})
+                    ORDER BY 1 COLLATE NOCASE
+                    """,
+                    (category,),
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    "SELECT name FROM departments ORDER BY name COLLATE NOCASE"
+                    """
+                    SELECT name FROM departments
+                    UNION
+                    SELECT department FROM users
+                    WHERE department IS NOT NULL AND TRIM(department) != ''
+                    ORDER BY 1 COLLATE NOCASE
+                    """
                 ).fetchall()
-            return [r[0] for r in rows]
+            values = {
+                self._clean(row[0])
+                for row in rows
+                if row[0] and self._clean(row[0])
+            }
+            return sorted(values, key=str.casefold)
         except sqlite3.Error:
             logging.exception("Could not fetch departments")
             return []
@@ -398,19 +620,31 @@ class LocalDatabase:
             return False, self._parse_db_error(exc, "loan policy update")
 
     # USERS
-    def insert_user(self, user_id, full_name, phone_number, role, department):
+    def insert_user(
+        self,
+        user_id,
+        full_name,
+        phone_number,
+        role,
+        department,
+        email="",
+    ):
         uid, name = self._clean(user_id).upper(), self._clean(full_name)
         phone = self._clean(phone_number) or None
         role, dept = self._clean(role), self._clean(department)
+        email = self._clean(email).casefold() or None
         if not uid or not name or not role:
             return False, "User ID, full name, and role are required."
         created = datetime.date.today().isoformat()
         try:
             with self._transaction():
                 self.conn.execute("""
-                    INSERT INTO users(id, full_name, phone_number, role, department, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (uid, name, phone, role, dept, created))
+                    INSERT INTO users(
+                        id, full_name, phone_number, role, department,
+                        email, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (uid, name, phone, role, dept, email, created))
             return True, "User created successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "user registration")
@@ -418,7 +652,8 @@ class LocalDatabase:
     def get_users(self):
         try:
             rows = self.conn.execute("""
-                SELECT id, full_name, COALESCE(phone_number, ''), role, department, created_at
+                SELECT id, full_name, COALESCE(phone_number, ''), role,
+                    department, created_at, COALESCE(email, '')
                 FROM users ORDER BY full_name COLLATE NOCASE
             """).fetchall()
             return True, rows
@@ -429,7 +664,8 @@ class LocalDatabase:
     def get_user_details(self, user_id):
         try:
             row = self.conn.execute("""
-                SELECT id, full_name, COALESCE(phone_number, ''), role, department, created_at
+                SELECT id, full_name, COALESCE(phone_number, ''), role,
+                    department, created_at, COALESCE(email, '')
                 FROM users WHERE id = ?
             """, (self._clean(user_id),)).fetchone()
             return True, row
@@ -437,17 +673,34 @@ class LocalDatabase:
             logging.exception("Could not fetch user details")
             return False, None
 
-    def edit_user(self, user_id, name, phone_number, role, dept):
+    def edit_user(
+        self,
+        user_id,
+        name,
+        phone_number,
+        role,
+        dept,
+        email="",
+    ):
         name, role = self._clean(name), self._clean(role)
         phone = self._clean(phone_number) or None
+        email = self._clean(email).casefold() or None
         if not name or not role:
             return False, "Full name and role are required."
         try:
             with self._transaction():
                 cur = self.conn.execute("""
-                    UPDATE users SET full_name = ?, phone_number = ?, role = ?, department = ?
+                    UPDATE users SET full_name = ?, phone_number = ?,
+                        role = ?, department = ?, email = ?
                     WHERE id = ?
-                """, (name, phone, role, self._clean(dept), self._clean(user_id)))
+                """, (
+                    name,
+                    phone,
+                    role,
+                    self._clean(dept),
+                    email,
+                    self._clean(user_id),
+                ))
                 if cur.rowcount == 0:
                     return False, "User not found."
             return True, "User details updated successfully."
@@ -543,7 +796,7 @@ class LocalDatabase:
                     SELECT 1 FROM circulation_logs WHERE book_id = ? AND status = 'ISSUED' LIMIT 1
                 """, (bid,)).fetchone()
                 if active:
-                    return False, f"Cannot delete Book ID ({bid}): Copies of this book are currently checked out."
+                    return False, f"Cannot delete Book ID ({bid}): Copies of this book are currently issued."
                 cur = self.conn.execute("DELETE FROM books WHERE id = ?", (bid,))
                 if cur.rowcount == 0:
                     return False, "Book not found."
@@ -574,22 +827,22 @@ class LocalDatabase:
                 if not book:
                     return False, f"Book ID '{bid}' is not registered in the system."
                 if int(book[0]) <= 0:
-                    return False, f"Book ID '{bid}' has no available copies for checkout."
+                    return False, f"Book ID '{bid}' has no available copies to issue."
 
                 duplicate = self.conn.execute("""
                     SELECT 1 FROM circulation_logs
                     WHERE book_id = ? AND user_id = ? AND status = 'ISSUED' LIMIT 1
                 """, (bid, uid)).fetchone()
                 if duplicate:
-                    return False, f"User '{uid}' already has an active copy of Book ID '{bid}' checked out."
+                    return False, f"User '{uid}' already has Book ID '{bid}' issued."
 
                 active_count = self.conn.execute("""
                     SELECT COUNT(*) FROM circulation_logs WHERE user_id = ? AND status = 'ISSUED'
                 """, (uid,)).fetchone()[0]
                 if int(active_count) >= int(policy["max_books"]):
                     return False, (
-                        f"Checkout denied: User has reached the maximum allowed limit of "
-                        f"{policy['max_books']} active loans for role '{role}'."
+                        f"Issue denied: User has reached the maximum allowed limit of "
+                        f"{policy['max_books']} issued books for role '{role}'."
                     )
 
                 now = datetime.datetime.now().replace(second=0, microsecond=0)
@@ -681,7 +934,7 @@ class LocalDatabase:
                     "SELECT COUNT(*) FROM circulation_logs WHERE status = 'ISSUED'"
                 ).fetchone()[0]
                 if active:
-                    return False, "Cannot clear circulation history while active loans exist."
+                    return False, "Cannot clear circulation history while issued books exist."
                 self.conn.execute("DELETE FROM circulation_logs")
                 self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'circulation_logs'")
                 self.conn.execute("UPDATE books SET available_copies = total_copies")
@@ -756,6 +1009,129 @@ class LocalDatabase:
         except sqlite3.Error:
             logging.exception("Could not get book circulation status")
             return None
+
+    def get_due_email_reminders(self, today=None):
+        today = today or datetime.date.today().isoformat()
+        try:
+            return self.conn.execute("""
+                SELECT c.id, u.email, u.full_name, b.title,
+                    c.due_date,
+                    CASE
+                        WHEN substr(c.due_date, 1, 10) = ?
+                        THEN 'due_today'
+                        ELSE 'overdue'
+                    END
+                FROM circulation_logs c
+                JOIN users u ON u.id = c.user_id
+                JOIN books b ON b.id = c.book_id
+                WHERE c.status = 'ISSUED'
+                    AND COALESCE(u.email, '') != ''
+                    AND substr(c.due_date, 1, 10) <= ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM email_notifications n
+                        WHERE n.loan_id = c.id
+                            AND n.reminder_type = CASE
+                                WHEN substr(c.due_date, 1, 10) = ?
+                                THEN 'due_today'
+                                ELSE 'overdue'
+                            END
+                    )
+                ORDER BY c.due_date, c.id
+            """, (today, today, today)).fetchall()
+        except sqlite3.Error:
+            logging.exception("Could not fetch due email reminders")
+            raise
+
+    def mark_due_email_reminder_sent(
+        self,
+        loan_id,
+        reminder_type,
+        sent_at=None,
+    ):
+        if reminder_type not in ("due_today", "overdue"):
+            raise ValueError("Invalid due-date reminder type.")
+
+        sent_at = sent_at or datetime.datetime.now().isoformat(timespec="seconds")
+        with self._transaction(immediate=True):
+            self.conn.execute("""
+                INSERT OR IGNORE INTO email_notifications(
+                    loan_id, reminder_type, sent_at
+                )
+                VALUES (?, ?, ?)
+            """, (int(loan_id), reminder_type, sent_at))
+        return True
+
+    def create_complaint(self, user_id, subject, body):
+        uid = self._clean(user_id) or None
+        subject = self._clean(subject)
+        body = self._clean(body)
+        if not subject or not body:
+            return False, "Complaint subject and details are required."
+
+        created_at = datetime.datetime.now().isoformat(timespec="seconds")
+        try:
+            with self._transaction():
+                cursor = self.conn.execute("""
+                    INSERT INTO complaints(
+                        user_id, subject, body, status, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, 'OPEN', ?, ?)
+                """, (uid, subject, body, created_at, created_at))
+                complaint_id = cursor.lastrowid
+                row = self.conn.execute("""
+                    SELECT c.id, c.user_id, COALESCE(u.full_name, ''),
+                        COALESCE(u.email, ''), c.subject, c.body,
+                        c.created_at
+                    FROM complaints c
+                    LEFT JOIN users u ON u.id = c.user_id
+                    WHERE c.id = ?
+                """, (complaint_id,)).fetchone()
+            return True, row
+        except Exception as exc:
+            logging.exception("Could not create library complaint")
+            return False, str(exc)
+
+    def get_complaints(self, status=None):
+        try:
+            query = """
+                SELECT c.id, c.user_id, COALESCE(u.full_name, ''),
+                    COALESCE(u.email, ''), c.subject, c.body, c.status,
+                    c.created_at, c.updated_at
+                FROM complaints c
+                LEFT JOIN users u ON u.id = c.user_id
+            """
+            parameters = ()
+            if status and status != "ALL":
+                query += " WHERE c.status = ?"
+                parameters = (str(status).upper(),)
+            query += " ORDER BY c.created_at DESC, c.id DESC"
+            return self.conn.execute(query, parameters).fetchall()
+        except sqlite3.Error:
+            logging.exception("Could not fetch library complaints")
+            raise
+
+    def update_complaint_status(self, complaint_id, status):
+        normalized_status = self._clean(status).upper()
+        if normalized_status not in ("OPEN", "IN_PROGRESS", "RESOLVED"):
+            return False, "Invalid complaint status."
+
+        try:
+            with self._transaction():
+                cursor = self.conn.execute("""
+                    UPDATE complaints
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                """, (
+                    normalized_status,
+                    datetime.datetime.now().isoformat(timespec="seconds"),
+                    int(complaint_id),
+                ))
+                if cursor.rowcount == 0:
+                    return False, "Complaint not found."
+            return True, "Complaint status updated."
+        except Exception as exc:
+            logging.exception("Could not update complaint status")
+            return False, str(exc)
 
     def get_active_loans_report(self):
         return self._report_query("""
@@ -861,29 +1237,68 @@ class LocalDatabase:
             return False, str(exc)
 
     def import_users_batch(self, users_data: list):
-        """Atomically upsert user rows using the legacy 6-column format."""
+        """Atomically upsert legacy or email-enabled user rows."""
         if not users_data:
             return True, 0
         try:
             normalized = []
+            departments_to_register = {}
             for row in users_data:
-                if len(row) != 6:
-                    raise ValueError("Each user import row must contain 6 values.")
-                uid, name, phone, role, dept, created = row
+                if len(row) not in (6, 7):
+                    raise ValueError(
+                        "Each user import row must contain 6 or 7 values."
+                    )
+                uid, name, phone, role, dept, created = row[:6]
+                email = row[6] if len(row) == 7 else None
                 uid, name, role = self._clean(uid).upper(), self._clean(name), self._clean(role)
                 if not uid or not name or not role:
                     raise ValueError("Imported users require an ID, full name, and role.")
+                department = self._clean(dept)
+                role_key = role.casefold()
+                department_category = (
+                    "STUDENT"
+                    if "student" in role_key
+                    else "FACULTY"
+                    if any(
+                        kind in role_key
+                        for kind in ("faculty", "staff", "guest")
+                    )
+                    else None
+                )
+                if (
+                    department_category
+                    and department
+                    and department.casefold() not in {
+                        "general",
+                        "general administration",
+                        "n/a",
+                    }
+                ):
+                    departments_to_register.setdefault(
+                        department.casefold(),
+                        (department, department_category),
+                    )
                 normalized.append((uid, name, self._clean(phone) or None, role,
-                                   self._clean(dept), created or datetime.date.today().isoformat()))
+                                   department, self._clean(email).casefold() or None,
+                                   created or datetime.date.today().isoformat()))
             with self._transaction(immediate=True):
                 self.conn.executemany("""
-                    INSERT INTO users(id, full_name, phone_number, role, department, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO departments(name, category, duration_years)
+                    VALUES (?, ?, 3)
+                    ON CONFLICT(name) DO NOTHING
+                """, list(departments_to_register.values()))
+                self.conn.executemany("""
+                    INSERT INTO users(
+                        id, full_name, phone_number, role, department,
+                        email, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         full_name = excluded.full_name,
                         phone_number = excluded.phone_number,
                         role = excluded.role,
-                        department = excluded.department
+                        department = excluded.department,
+                        email = COALESCE(excluded.email, users.email)
                 """, normalized)
             return True, len(normalized)
         except Exception as exc:
@@ -936,7 +1351,7 @@ class LocalDatabase:
 
             archive = [s for s in graduating if s[0] not in active_map]
             if not archive:
-                return False, 0, "All final-year students have active loans and were skipped."
+                return False, 0, "All final-year students have issued books and were skipped."
 
             filename = f"Graduated_Batch_{current_year - 3}_Archive.csv"
             path = os.path.join(output_directory, filename)
@@ -957,12 +1372,12 @@ class LocalDatabase:
                     WHERE user_id IN ({marks}) AND status = 'ISSUED'
                 """, archive_ids).fetchone()[0]
                 if active_now:
-                    return False, 0, "Archive cancelled: one or more selected students now have active loans."
+                    return False, 0, "Archive cancelled: one or more selected students now have issued books."
                 self.conn.execute(f"DELETE FROM users WHERE id IN ({marks})", archive_ids)
 
             message = f"Successfully archived {len(archive)} students from the graduating batch."
             if skipped:
-                message += f"\n\nSkipped {len(skipped)} student(s) with active book loans."
+                message += f"\n\nSkipped {len(skipped)} student(s) with issued books."
             return True, len(archive), message
         except Exception as exc:
             logging.exception("Final-year archive failed")
@@ -974,8 +1389,11 @@ class LocalDatabase:
         try:
             destination_path = os.fspath(destination_path)
             os.makedirs(os.path.dirname(os.path.abspath(destination_path)), exist_ok=True)
-            with sqlite3.connect(destination_path) as backup_conn:
+            backup_conn = sqlite3.connect(destination_path)
+            try:
                 self.conn.backup(backup_conn)
+            finally:
+                backup_conn.close()
             return True, destination_path
         except Exception as exc:
             logging.exception("Database backup failed")
