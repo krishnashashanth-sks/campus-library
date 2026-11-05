@@ -24,7 +24,7 @@ APP_NAME = "Library Management System"
 APP_VERSION = "2.0"
 
 # Keep production authentication enabled; bypass is for local testing only.
-BYPASS_LOGIN = True
+BYPASS_LOGIN = False
 
 DEFAULT_THEME = "Dark"
 SPLASH_DURATION = 1500
