@@ -14,6 +14,7 @@ from database import LocalDatabase
 from dialogs import LoginDialog, CustomSplashScreen
 from email_service import LibraryEmailService
 from theme_manager import ThemeManager
+from app_version import get_app_version
 
 
 # ============================================================
@@ -21,10 +22,9 @@ from theme_manager import ThemeManager
 # ============================================================
 
 APP_NAME = "Library Management System"
-APP_VERSION = "2.0"
 
 # Keep production authentication enabled; bypass is for local testing only.
-BYPASS_LOGIN = False
+BYPASS_LOGIN = True
 
 DEFAULT_THEME = "Dark"
 SPLASH_DURATION = 1500
@@ -67,7 +67,7 @@ def load_application_icon(app: QApplication):
 def show_splash(app: QApplication):
     """Display splash screen without freezing the UI."""
 
-    image_path = get_resource_path("assets/library_icon.jpeg")
+    image_path = get_resource_path("assets/library_icon.png")
 
     splash = CustomSplashScreen(image_path)
 
@@ -102,7 +102,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName(APP_NAME)
-    app.setApplicationVersion(APP_VERSION)
+    app.setApplicationVersion(get_app_version())
     app.setOrganizationName("Library Management System")
 
     app.setFont(QFont("Segoe UI", 10))
@@ -205,7 +205,7 @@ def main():
     # 8. Launch application
     # --------------------------------------------------------
 
-    window.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+    window.setWindowTitle(f"{APP_NAME} v{get_app_version()}")
     window.showMaximized()
 
     reminder_lock = threading.Lock()
@@ -225,11 +225,14 @@ def main():
                 if str(enabled).casefold() not in ("1", "true", "yes"):
                     return
 
-                sent, failures = LibraryEmailService(
+                queued, failures = LibraryEmailService(
                     reminder_db
                 ).send_due_reminders()
-                if sent:
-                    logging.info("Sent %s due-date reminder emails.", sent)
+                if queued:
+                    logging.info(
+                        "Queued %s due-date reminder emails.",
+                        queued,
+                    )
                 for failure in failures:
                     logging.warning(
                         "Could not send due-date reminder: %s",

@@ -3,22 +3,28 @@ import csv
 import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QBrush, QCursor
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QColor, QBrush, QCursor, QFont, QKeyEvent, QPainter, QPen,
+)
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame,
-    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QProgressBar, QPushButton, QSizePolicy,
-    QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QApplication, QButtonGroup, QComboBox, QDialog, QFileDialog,
+    QFormLayout, QFrame, QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout,
+    QHeaderView,
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
+    QSizePolicy, QScrollArea, QTableWidget, QTableWidgetItem,
+    QToolTip, QVBoxLayout, QWidget,
 )
 
 from dialogs import (
     BarcodeGeneratorDialog,
     BookDialog,
+    IssueBookDialog,
     QuickScanDialog,
+    ReturnBookDialog,
     UserDialog,
 )
+from utils import rgba_color
 
 
 PRIMARY = "#2563eb"
@@ -26,6 +32,12 @@ SUCCESS = "#10b981"
 WARNING = "#f59e0b"
 DANGER = "#ef4444"
 INFO = "#6366f1"
+STATUS_BADGE_COLORS = {
+    "ISSUED": ("#1D4ED8", "#93C5FD"),
+    "DUE TODAY": ("#B45309", "#FDE68A"),
+    "OVERDUE": ("#991B1B", "#FCA5A5"),
+    "RETURNED": ("#065F46", "#A7F3D0"),
+}
 
 
 # ============================================================
@@ -35,15 +47,53 @@ INFO = "#6366f1"
 def get_theme_colors():
     app = QApplication.instance()
     palette = app.palette() if app else QApplication.palette()
+    manager = getattr(app, "theme_manager", None) if app else None
+    active_theme = (
+        manager.get_active_theme().lower()
+        if manager
+        else "dark"
+    )
+    theme = (
+        manager.THEME.get(active_theme, {})
+        if manager
+        else {}
+    )
 
     return {
-        "window": palette.color(palette.ColorRole.Window).name(),
-        "surface": palette.color(palette.ColorRole.Base).name(),
-        "surface_alt": palette.color(palette.ColorRole.AlternateBase).name(),
-        "text": palette.color(palette.ColorRole.Text).name(),
-        "muted": palette.color(palette.ColorRole.PlaceholderText).name(),
-        "border": palette.color(palette.ColorRole.Mid).name(),
-        "primary": palette.color(palette.ColorRole.Highlight).name(),
+        "window": theme.get(
+            "window", palette.color(palette.ColorRole.Window).name()
+        ),
+        "surface": theme.get(
+            "surface", palette.color(palette.ColorRole.Base).name()
+        ),
+        "surface_alt": theme.get(
+            "surface_alt", palette.color(palette.ColorRole.AlternateBase).name()
+        ),
+        "text": theme.get(
+            "text", palette.color(palette.ColorRole.Text).name()
+        ),
+        "muted": theme.get(
+            "muted", palette.color(palette.ColorRole.PlaceholderText).name()
+        ),
+        "border": theme.get(
+            "border", palette.color(palette.ColorRole.Mid).name()
+        ),
+        "primary": theme.get(
+            "primary", palette.color(palette.ColorRole.Highlight).name()
+        ),
+        "primary_hover": theme.get("primary_hover", PRIMARY),
+        "success": theme.get("success", SUCCESS),
+        "warning": theme.get("warning", WARNING),
+        "danger": theme.get("danger", DANGER),
+        "table_row": theme.get("table_row", "#FFFFFF"),
+        "table_alt": theme.get("table_alt", "#F1F5F9"),
+        "overdue_tint": theme.get("overdue_tint", "#FEE2E2"),
+        "amber_tint": theme.get("amber_tint", "#FEF3C7"),
+        "chart_issued": theme.get("chart_issued", "#38BDF8"),
+        "chart_returned": theme.get("chart_returned", "#34D399"),
+        "inventory_issued": theme.get("inventory_issued", "#3B82F6"),
+        "inventory_due": theme.get("inventory_due", "#F59E0B"),
+        "inventory_overdue": theme.get("inventory_overdue", "#EF4444"),
         "selection_text": palette.color(
             palette.ColorRole.HighlightedText
         ).name(),
@@ -86,6 +136,24 @@ def activity_icon(action_type):
         return "↗"
 
     return "●"
+
+
+class ExpressBookInput(QLineEdit):
+    issueRequested = pyqtSignal()
+    returnRequested = pyqtSignal()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.returnRequested.emit()
+            else:
+                self.issueRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 def connect_theme(widget):
@@ -132,18 +200,23 @@ class MetricCard(QFrame):
 
         self.inventory = inventory
         self.accent_color = accent_color
+        self.metric_key = ""
+        self.overdue_active = False
+        self.unpaid_fines_active = False
+        self.overdue_glow = None
+        self.overdue_glow_animation = None
 
         self.setObjectName("MetricCard")
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.setMinimumHeight(125)
+        self.setFixedHeight(115)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 15, 18, 15)
-        layout.setSpacing(7)
+        layout.setContentsMargins(13, 9, 13, 8)
+        layout.setSpacing(3)
 
         top = QHBoxLayout()
 
@@ -168,51 +241,89 @@ class MetricCard(QFrame):
             self.progress_bar = QProgressBar()
             self.progress_bar.setObjectName("InventoryProgress")
             self.progress_bar.setTextVisible(False)
-            self.progress_bar.setFixedHeight(7)
+            self.progress_bar.setFixedHeight(6)
             layout.addWidget(self.progress_bar)
-        else:
-            spacer = QWidget()
-            spacer.setFixedHeight(7)
-            layout.addWidget(spacer)
 
+        self.secondary_container = QWidget()
+        secondary_layout = QHBoxLayout(self.secondary_container)
+        secondary_layout.setContentsMargins(0, 0, 0, 0)
+        secondary_layout.setSpacing(5)
+        self.issued_badge = QLabel()
+        self.issued_badge.setObjectName("IssuedBadge")
+        self.due_badge = QLabel()
+        self.due_badge.setObjectName("DueBadge")
+        secondary_layout.addWidget(self.issued_badge)
+        secondary_layout.addWidget(self.due_badge)
+        secondary_layout.addStretch()
+        self.secondary_container.hide()
+        layout.addWidget(self.secondary_container)
+
+        footer = QHBoxLayout()
         self.subtitle_label = QLabel(subtitle)
         self.subtitle_label.setObjectName("MetricSubtitle")
-        layout.addWidget(self.subtitle_label)
+        self.subtitle_label.setWordWrap(True)
+        footer.addWidget(self.subtitle_label, 1)
 
-        layout.addStretch()
+        self.action_button = QPushButton()
+        self.action_button.setObjectName("MetricAction")
+        self.action_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.action_button.setFixedHeight(20)
+        self.action_button.hide()
+        footer.addWidget(self.action_button)
+        layout.addLayout(footer)
+
         self.apply_style()
 
     def apply_style(self, *_):
         c = get_theme_colors()
+        accent = {
+            "inventory": c["success"],
+            "active_loans": c["primary"],
+            "overdue_books": c["danger"],
+            "unpaid_fines": c["warning"],
+        }.get(self.metric_key, self.accent_color)
+        card_border = rgba_color(accent, 0.48)
+        card_background = rgba_color(accent, 0.10)
+        if self.metric_key == "overdue_books":
+            accent = c["danger"]
+            if self.overdue_active:
+                card_border = c["danger"]
+                card_background = rgba_color(c["danger"], 0.20)
+        elif self.metric_key == "unpaid_fines" and self.unpaid_fines_active:
+            accent = c["warning"]
+            card_border = c["warning"]
+            card_background = rgba_color(c["warning"], 0.20)
 
         self.setStyleSheet(f"""
             QFrame#MetricCard {{
-                background: {c['surface']};
-                border: 1px solid {c['border']};
-                border-left: 4px solid {self.accent_color};
-                border-radius: 12px;
+                background: {card_background};
+                border: 1px solid {card_border};
+                border-left: 4px solid {accent};
+                border-radius: 10px;
             }}
             QFrame#MetricCard:hover {{
                 background: {c['surface_alt']};
-                border: 1px solid {self.accent_color};
+                border: 1px solid {accent};
             }}
             QLabel#MetricTitle {{
                 color: {c['muted']};
-                font-size: 12px;
-                font-weight: 600;
+                font-size: 10px;
+                font-weight: 700;
                 border: none;
                 background: transparent;
             }}
             QLabel#MetricIcon {{
-                color: {self.accent_color};
-                font-size: 19px;
+                color: {accent};
+                font-size: 16px;
                 border: none;
                 background: transparent;
             }}
             QLabel#MetricValue {{
                 color: {c['text']};
-                font-size: 25px;
-                font-weight: 750;
+                font-size: 23px;
+                font-weight: 800;
                 border: none;
                 background: transparent;
             }}
@@ -222,16 +333,57 @@ class MetricCard(QFrame):
                 border: none;
                 background: transparent;
             }}
+            QLabel#MetricSecondary {{
+                color: {c['text']};
+                font-size: 10px;
+                font-weight: 600;
+                background: {c['surface_alt']};
+                border: none;
+                border-radius: 5px;
+                padding: 2px 6px;
+            }}
+            QLabel#IssuedBadge {{
+                color: {c['primary']};
+                font-size: 10px;
+                font-weight: 700;
+                background: {c['surface_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 7px;
+                padding: 2px 6px;
+            }}
+            QLabel#DueBadge {{
+                color: {c['warning']};
+                font-size: 10px;
+                font-weight: 700;
+                background: {c['surface_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 7px;
+                padding: 2px 6px;
+            }}
+            QPushButton#MetricAction {{
+                background: transparent;
+                color: {c['primary']};
+                border: none;
+                padding: 1px 2px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+            QPushButton#MetricAction:hover {{
+                color: {c['primary_hover']};
+                text-decoration: underline;
+            }}
             QProgressBar#InventoryProgress {{
                 background: {c['surface_alt']};
                 border: none;
                 border-radius: 3px;
             }}
             QProgressBar#InventoryProgress::chunk {{
-                background: {self.accent_color};
+                background: {c['success']};
                 border-radius: 3px;
             }}
         """)
+        if self.overdue_glow:
+            self.overdue_glow.setColor(QColor(c["danger"]))
 
     def set_metric(self, value, subtitle=None):
         self.value_label.setText(str(value))
@@ -239,7 +391,70 @@ class MetricCard(QFrame):
         if subtitle is not None:
             self.subtitle_label.setText(str(subtitle))
 
-    def set_inventory(self, available_copies, total_copies):
+    def set_overdue(self, count):
+        self.overdue_active = int(count or 0) > 0
+        self.value_label.setText(str(count))
+        self.apply_style()
+        if self.overdue_active:
+            self._start_overdue_glow()
+        else:
+            self._stop_overdue_glow()
+
+    def set_fines(self, amount):
+        value = float(amount or 0)
+        self.unpaid_fines_active = value > 0
+        self.value_label.setText(f"₹{value:,.2f}")
+        self.apply_style()
+
+    def _start_overdue_glow(self):
+        if self.overdue_glow is None:
+            self.overdue_glow = QGraphicsDropShadowEffect(self)
+            self.overdue_glow.setOffset(0, 0)
+            self.overdue_glow.setColor(
+                QColor(get_theme_colors()["danger"])
+            )
+            self.setGraphicsEffect(self.overdue_glow)
+
+        if self.overdue_glow_animation is None:
+            animation = QPropertyAnimation(
+                self.overdue_glow, b"blurRadius", self
+            )
+            animation.setStartValue(3.0)
+            animation.setEndValue(12.0)
+            animation.setDuration(1100)
+            animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+            animation.setLoopCount(-1)
+            animation.setKeyValueAt(0.5, 6.0)
+            self.overdue_glow_animation = animation
+
+        if (
+            self.overdue_glow_animation.state()
+            != QPropertyAnimation.State.Running
+        ):
+            self.overdue_glow_animation.start()
+
+    def _stop_overdue_glow(self):
+        if self.overdue_glow_animation:
+            self.overdue_glow_animation.stop()
+        if self.overdue_glow:
+            self.overdue_glow.setBlurRadius(0)
+
+    def set_secondary(self, issued, due=None):
+        if due is None:
+            self.issued_badge.setText(str(issued))
+            self.due_badge.hide()
+        else:
+            self.issued_badge.setText(f"Issued Today: {issued}")
+            self.due_badge.setText(f"Due Today: {due}")
+            self.due_badge.show()
+        self.secondary_container.show()
+
+    def set_inventory(
+        self,
+        available_copies,
+        total_copies,
+        unique_titles=None,
+    ):
         if not self.progress_bar:
             return
 
@@ -249,26 +464,217 @@ class MetricCard(QFrame):
         percentage = int(available / total * 100) if total else 0
 
         if available == 0:
-            self.accent_color = DANGER
+            self.accent_color = get_theme_colors()["danger"]
             status = "Empty inventory"
         elif percentage <= 25:
-            self.accent_color = WARNING
+            self.accent_color = get_theme_colors()["warning"]
             status = f"Low stock · {percentage}% available"
         else:
-            self.accent_color = SUCCESS
+            self.accent_color = get_theme_colors()["success"]
             status = f"Healthy stock · {percentage}% available"
 
         self.value_label.setText(f"{available:,} / {total:,}")
-        self.subtitle_label.setText(status)
+        self.subtitle_label.setText(
+            f"{int(unique_titles):,} Unique Titles ({percentage}% in stock)"
+            if unique_titles is not None
+            else status
+        )
+        self.setToolTip(status)
         self.progress_bar.setRange(0, max(total, 1))
         self.progress_bar.setValue(available)
 
         self.apply_style()
 
+    def set_action(self, text, callback):
+        self.action_button.setText(text)
+        self.action_button.clicked.connect(callback)
+        self.action_button.show()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+
+# ============================================================
+# CIRCULATION ANALYTICS PANEL
+# ============================================================
+
+class CirculationAnalyticsWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(210)
+        self.setMouseTracking(True)
+        self.days = []
+        self.inventory = []
+
+    def set_data(self, days, inventory):
+        self.days = list(days)
+        self.inventory = list(inventory)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        colors = get_theme_colors()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setFont(QFont("Segoe UI", 9))
+
+        width = self.width()
+        height = self.height()
+        split_x = int(width * 0.61)
+        muted = QColor(colors["muted"])
+        text = QColor(colors["text"])
+        border = QColor(colors["border"])
+
+        painter.setPen(text)
+        painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        painter.drawText(14, 23, "7-Day Circulation")
+        painter.drawText(split_x + 14, 23, "Inventory Status")
+
+        painter.setPen(QPen(border, 1))
+        painter.drawLine(split_x, 12, split_x, height - 12)
+
+        chart_left = 28
+        chart_right = split_x - 14
+        chart_top = 54
+        chart_bottom = height - 34
+        chart_height = max(chart_bottom - chart_top, 1)
+        values = [
+            max(int(day.get("issued", 0)), int(day.get("returned", 0)))
+            for day in self.days
+        ]
+        max_value = max(values, default=0) or 1
+
+        painter.setPen(QPen(border, 1))
+        painter.drawLine(chart_left, chart_bottom, chart_right, chart_bottom)
+        group_width = (chart_right - chart_left) / max(len(self.days), 1)
+        bar_width = max(min(int(group_width * 0.24), 13), 4)
+        issued_color = QColor(colors["chart_issued"])
+        returned_color = QColor(colors["chart_returned"])
+
+        for index, day in enumerate(self.days):
+            center = chart_left + group_width * (index + 0.5)
+            for offset, key, color in (
+                (-bar_width * 0.65, "issued", issued_color),
+                (bar_width * 0.65, "returned", returned_color),
+            ):
+                value = int(day.get(key, 0))
+                bar_height = chart_height * value / max_value
+                x = int(center + offset - bar_width / 2)
+                y = int(chart_bottom - bar_height)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                painter.drawRoundedRect(
+                    x, y, bar_width, max(int(bar_height), 2), 3, 3
+                )
+                if value:
+                    painter.setPen(muted)
+                    painter.drawText(
+                        x - 2, max(y - 3, chart_top - 4), str(value)
+                    )
+
+            painter.setPen(muted)
+            painter.drawText(
+                int(center - 14), height - 12, str(day.get("label", ""))
+            )
+
+        legend_y = 40
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(issued_color)
+        painter.drawRoundedRect(108, legend_y - 8, 8, 8, 2, 2)
+        painter.setPen(muted)
+        painter.drawText(120, legend_y, "Issued")
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(returned_color)
+        painter.drawRoundedRect(165, legend_y - 8, 8, 8, 2, 2)
+        painter.setPen(muted)
+        painter.drawText(177, legend_y, "Returned")
+
+        status_colors = {
+            "Available on Shelf": QColor(colors["success"]),
+            "Currently Issued": QColor(colors["inventory_issued"]),
+            "Due Today / Reserved": QColor(colors["inventory_due"]),
+            "Overdue / Missing": QColor(colors["inventory_overdue"]),
+        }
+        status_x = split_x + 14
+        status_width = max(width - status_x - 14, 1)
+        bar_x = status_x
+        bar_y = 55
+        bar_width_total = status_width
+        total = sum(max(int(item.get("count", 0)), 0) for item in self.inventory)
+        if total <= 0:
+            painter.setPen(muted)
+            painter.drawText(status_x, bar_y + 15, "No inventory records")
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            for item in self.inventory:
+                count = max(int(item.get("count", 0)), 0)
+                segment_width = int(bar_width_total * count / total)
+                painter.setBrush(status_colors[item["label"]])
+                painter.drawRect(bar_x, bar_y, segment_width, 10)
+                bar_x += segment_width
+
+            row_top = bar_y + 22
+            for item in self.inventory:
+                count = max(int(item.get("count", 0)), 0)
+                percent = count / total * 100
+                color = status_colors[item["label"]]
+                label_y = row_top + 9
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                painter.drawRoundedRect(status_x, label_y - 7, 7, 7, 2, 2)
+                painter.setPen(text)
+                painter.drawText(
+                    status_x + 13, label_y,
+                    f"{item['label']}  {count:,}",
+                )
+                percentage_text = f"{percent:.0f}%"
+                percentage_width = painter.fontMetrics().horizontalAdvance(
+                    percentage_text
+                )
+                painter.drawText(
+                    width - 14 - percentage_width,
+                    label_y,
+                    percentage_text,
+                )
+
+                track_y = row_top + 13
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(border)
+                painter.drawRoundedRect(
+                    status_x, track_y, status_width, 5, 2, 2
+                )
+                progress_width = int(status_width * count / total)
+                if progress_width:
+                    painter.setBrush(color)
+                    painter.drawRoundedRect(
+                        status_x, track_y, progress_width, 5, 2, 2
+                    )
+                row_top += 32
+
+        painter.end()
+
+    def mouseMoveEvent(self, event):
+        if self.days:
+            split_x = int(self.width() * 0.61)
+            chart_left = 28
+            chart_right = split_x - 14
+            if chart_left <= event.position().x() <= chart_right:
+                group_width = (chart_right - chart_left) / len(self.days)
+                index = int((event.position().x() - chart_left) / group_width)
+                if 0 <= index < len(self.days):
+                    day = self.days[index]
+                    QToolTip.showText(
+                        QCursor.pos(),
+                        (
+                            f"{day['label']}: "
+                            f"{day['issued']} issued · "
+                            f"{day['returned']} returned"
+                        ),
+                        self,
+                    )
+        super().mouseMoveEvent(event)
 
 
 # ============================================================
@@ -312,7 +718,7 @@ def dialog_stylesheet(c):
         }}
 
         QTableWidget::item {{
-            padding: 9px 10px;
+            padding: 7px 9px;
             border: none;
             border-bottom: 1px solid {c['border']};
             border-radius: 0px;
@@ -331,7 +737,7 @@ def dialog_stylesheet(c):
             font-weight: 700;
             border: none;
             border-bottom: 1px solid {c['border']};
-            padding: 12px 9px;
+            padding: 10px 10px;
         }}
 
         QPushButton {{
@@ -407,6 +813,7 @@ class MetricDetailDialog(QDialog):
         headers: List[str],
         rows: List[Tuple[object, ...]],
         parent: Optional[QWidget] = None,
+        searchable: bool = True,
     ):
         super().__init__(parent)
 
@@ -418,22 +825,24 @@ class MetricDetailDialog(QDialog):
         self.setMinimumSize(760, 450)
 
         self.layout_main = QVBoxLayout(self)
-        self.layout_main.setContentsMargins(24, 22, 24, 22)
+        self.layout_main.setContentsMargins(20, 18, 20, 18)
         self.layout_main.setSpacing(16)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("DialogTitle")
         self.layout_main.addWidget(self.title_label)
 
-        self.search_input = QLineEdit()
-        self.search_input.setObjectName("RecordSearch")
-        self.search_input.setPlaceholderText(
-            "Search by ID, title, author or any field..."
-        )
-        self.search_input.setClearButtonEnabled(True)
-        self.search_input.setMinimumHeight(36)
-        self.search_input.textChanged.connect(self.apply_search)
-        self.layout_main.addWidget(self.search_input)
+        self.search_input = None
+        if searchable:
+            self.search_input = QLineEdit()
+            self.search_input.setObjectName("RecordSearch")
+            self.search_input.setPlaceholderText(
+                "Search by ID, title, author or any field..."
+            )
+            self.search_input.setClearButtonEnabled(True)
+            self.search_input.setMinimumHeight(36)
+            self.search_input.textChanged.connect(self.apply_search)
+            self.layout_main.addWidget(self.search_input)
 
         self.table = QTableWidget()
         self.table.setColumnCount(len(headers))
@@ -453,7 +862,7 @@ class MetricDetailDialog(QDialog):
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(43)
+        self.table.verticalHeader().setDefaultSectionSize(44)
 
         # Important: fixed sections allow us to calculate
         # proportional widths ourselves.
@@ -541,7 +950,10 @@ class MetricDetailDialog(QDialog):
 
                 self.table.setItem(row_index, column_index, item)
 
-        query = self.search_input.text().strip()
+        query = (
+            self.search_input.text().strip()
+            if self.search_input else ""
+        )
         if query:
             self.count_label.setText(
                 f"{len(self.visible_rows)} of {len(self.rows)} record(s)"
@@ -647,7 +1059,7 @@ class MetricDetailDialog(QDialog):
             }}
 
             QTableWidget::item {{
-                padding: 9px 10px;
+                padding: 7px 9px;
                 border: none;
                 border-bottom: 1px solid {c['border']};
                 border-radius: 0px;
@@ -671,7 +1083,7 @@ class MetricDetailDialog(QDialog):
                 font-weight: 700;
                 border: none;
                 border-bottom: 1px solid {c['border']};
-                padding: 12px 8px;
+                padding: 10px 10px;
             }}
 
             QScrollBar:vertical {{
@@ -866,6 +1278,8 @@ class ActivityDetailDialog(QDialog):
         username,
         timestamp,
         parent=None,
+        details=None,
+        dialog_title="Activity Details",
     ):
         super().__init__(parent)
 
@@ -874,7 +1288,13 @@ class ActivityDetailDialog(QDialog):
         self.username = safe_text(username)
         self.timestamp = safe_text(timestamp)
 
-        self.setWindowTitle("Activity Details")
+        self.detail_items = details or [
+            ("BOOK / ITEM", self.book_title),
+            ("USER", self.username),
+            ("ACTIVITY TYPE", self.action_type),
+            ("TIMESTAMP", self.timestamp),
+        ]
+        self.setWindowTitle(dialog_title)
         self.resize(590, 480)
         self.setMinimumSize(480, 400)
 
@@ -882,27 +1302,48 @@ class ActivityDetailDialog(QDialog):
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(13)
 
-        title = QLabel(
-            f"{activity_icon(self.action_type)}  {self.action_type}"
+        heading = (
+            dialog_title
+            if details is not None
+            else f"{activity_icon(self.action_type)}  {self.action_type}"
         )
+        title = QLabel(heading)
         title.setStyleSheet(
             "font-size: 20px; font-weight: 750;"
         )
         layout.addWidget(title)
 
-        self.add_detail(layout, "BOOK / ITEM", self.book_title)
-        self.add_detail(layout, "USER", self.username)
-        self.add_detail(layout, "ACTIVITY TYPE", self.action_type)
-        self.add_detail(layout, "TIMESTAMP", self.timestamp)
+        if details is not None:
+            detail_form = QFormLayout()
+            detail_form.setContentsMargins(2, 4, 2, 4)
+            detail_form.setVerticalSpacing(7)
+            for label, value in self.detail_items:
+                key_label = QLabel(label)
+                key_label.setStyleSheet(
+                    "font-size: 10px; font-weight: 700;"
+                )
+                value_label = QLabel(safe_text(value) or "Not available")
+                value_label.setWordWrap(True)
+                value_label.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse
+                )
+                value_label.setStyleSheet(
+                    "font-size: 12px; font-weight: 600;"
+                )
+                detail_form.addRow(key_label, value_label)
+            layout.addLayout(detail_form, 1)
+        else:
+            for label, value in self.detail_items:
+                self.add_detail(layout, label, safe_text(value))
 
-        note = QLabel(
-            "The recent activity database method currently supplies "
-            "these four fields. Additional transaction details are "
-            "not available from that result."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("font-size: 10px;")
-        layout.addWidget(note)
+            note = QLabel(
+                "The recent activity database method currently supplies "
+                "these four fields. Additional transaction details are "
+                "not available from that result."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("font-size: 10px;")
+            layout.addWidget(note)
 
         footer = QHBoxLayout()
 
@@ -944,11 +1385,9 @@ class ActivityDetailDialog(QDialog):
         parent_layout.addWidget(frame)
 
     def copy_details(self):
-        text = (
-            f"Activity: {self.action_type}\n"
-            f"Book: {self.book_title}\n"
-            f"User: {self.username}\n"
-            f"Timestamp: {self.timestamp}"
+        text = "\n".join(
+            f"{label}: {safe_text(value)}"
+            for label, value in self.detail_items
         )
 
         QApplication.clipboard().setText(text)
@@ -994,7 +1433,7 @@ class ActivityHistoryDialog(QDialog):
         self.setMinimumSize(750, 470)
 
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(22, 22, 22, 22)
+        self.main_layout.setContentsMargins(20, 18, 20, 18)
         self.main_layout.setSpacing(13)
 
         self.build_ui()
@@ -1071,7 +1510,7 @@ class ActivityHistoryDialog(QDialog):
         self.table.setShowGrid(False)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(43)
+        self.table.verticalHeader().setDefaultSectionSize(44)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(
@@ -1317,80 +1756,263 @@ class DashboardView(QWidget):
 
         self.db = db
         self.metric_widgets: Dict[str, MetricCard] = {}
+        self._activity_records = []
+        self._activity_filter = "All Recent"
+        self.activity_filter_buttons = {}
+        self._users_by_id = {}
+        self._books_by_id = {}
+        self._current_books_by_user = {}
 
         self.setObjectName("DashboardView")
 
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(24, 22, 24, 22)
-        self.main_layout.setSpacing(16)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        self.dashboard_scroll = QScrollArea()
+        self.dashboard_scroll.setObjectName("DashboardScroll")
+        self.dashboard_scroll.setWidgetResizable(True)
+        self.dashboard_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.dashboard_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        self.dashboard_content = QWidget()
+        self.dashboard_content.setObjectName("DashboardContent")
+        self.dashboard_scroll.setWidget(self.dashboard_content)
+        outer_layout.addWidget(self.dashboard_scroll)
+
+        self.main_layout = QVBoxLayout(self.dashboard_content)
+        self.main_layout.setContentsMargins(20, 16, 20, 16)
+        self.main_layout.setSpacing(12)
+
+        page_header = QVBoxLayout()
+        page_header.setSpacing(3)
+
+        page_title = QLabel("Dashboard")
+        page_title.setObjectName("PageTitle")
+        page_header.addWidget(page_title)
+
+        page_subtitle = QLabel(
+            "At a glance: inventory, circulation, and recent activity."
+        )
+        page_subtitle.setObjectName("PageSubtitle")
+        page_subtitle.setWordWrap(True)
+        page_header.addWidget(page_subtitle)
+        self.main_layout.addLayout(page_header)
 
         self.tiles_grid = QGridLayout()
-        self.tiles_grid.setHorizontalSpacing(14)
-        self.tiles_grid.setVerticalSpacing(14)
+        self.tiles_grid.setHorizontalSpacing(12)
+        self.tiles_grid.setVerticalSpacing(12)
 
         for column in range(4):
             self.tiles_grid.setColumnStretch(column, 1)
+        self.tiles_grid.setRowMinimumHeight(0, 115)
+        self.tiles_grid.setRowStretch(0, 0)
 
         self.main_layout.addLayout(self.tiles_grid)
         self._create_metric_cards()
 
+        middle_layout = QHBoxLayout()
+        middle_layout.setSpacing(12)
+        middle_layout.addWidget(self._create_analytics_panel(), 13)
+        middle_layout.addWidget(
+            self._create_express_circulation_panel(), 7
+        )
+        self.main_layout.addLayout(middle_layout)
+
         lower_layout = QHBoxLayout()
-        lower_layout.setSpacing(16)
-
-        feed_container = QFrame()
-        feed_container.setObjectName("DashboardPanel")
-
-        feed_layout = QVBoxLayout(feed_container)
-        feed_layout.setContentsMargins(19, 17, 19, 17)
-        feed_layout.setSpacing(11)
-
-        feed_header = QHBoxLayout()
-
-        feed_title = QLabel("🕒  Recent Activity")
-        feed_title.setObjectName("PanelTitle")
-        feed_header.addWidget(feed_title)
-        feed_header.addStretch()
-
-        self.view_all_button = QPushButton("View All  →")
-        self.view_all_button.setObjectName("ViewAllButton")
-        self.view_all_button.setCursor(
-            Qt.CursorShape.PointingHandCursor
-        )
-        self.view_all_button.clicked.connect(
-            self.open_activity_history
-        )
-        feed_header.addWidget(self.view_all_button)
-
-        feed_layout.addLayout(feed_header)
-
-        self.activity_summary_label = QLabel(
-            "Latest circulation transactions"
-        )
-        self.activity_summary_label.setObjectName("ActivitySummary")
-        feed_layout.addWidget(self.activity_summary_label)
-
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-
-        self.feed_content_widget = QWidget()
-        self.feed_inner_layout = QVBoxLayout(
-            self.feed_content_widget
-        )
-        self.feed_inner_layout.setContentsMargins(0, 0, 0, 0)
-        self.feed_inner_layout.setSpacing(10)
-
-        self.scroll_area.setWidget(self.feed_content_widget)
-        feed_layout.addWidget(self.scroll_area, 1)
-
-        lower_layout.addWidget(feed_container, 3)
+        lower_layout.setSpacing(12)
+        lower_layout.addWidget(self._create_activity_table_panel(), 4)
         lower_layout.addWidget(self.create_quick_actions(), 1)
 
         self.main_layout.addLayout(lower_layout, 1)
+        self.main_layout.setStretch(0, 0)
+        self.main_layout.setStretch(1, 0)
+        self.main_layout.setStretch(2, 0)
+        self.main_layout.setStretch(3, 1)
 
         self.theme_manager = connect_theme(self)
         self.apply_theme()
         self.refresh_dashboard()
+
+    def _create_analytics_panel(self):
+        panel = QFrame()
+        panel.setObjectName("DashboardPanel")
+        panel.setFixedHeight(230)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 9, 12, 8)
+        layout.setSpacing(3)
+
+        self.analytics_widget = CirculationAnalyticsWidget()
+        layout.addWidget(self.analytics_widget, 1)
+        return panel
+
+    def _create_express_circulation_panel(self):
+        panel = QFrame()
+        panel.setObjectName("DashboardPanel")
+        panel.setFixedHeight(230)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(13, 11, 13, 10)
+        layout.setSpacing(6)
+
+        title = QLabel("Express Circulation")
+        title.setObjectName("PanelTitle")
+        layout.addWidget(title)
+
+        self.express_user_input = QLineEdit()
+        self.express_user_input.setObjectName("ExpressInput")
+        self.express_user_input.setPlaceholderText(
+            "Student / Member ID or Roll No"
+        )
+        self.express_user_input.setClearButtonEnabled(True)
+        self.express_user_input.textChanged.connect(
+            self._update_express_previews
+        )
+        layout.addWidget(self.express_user_input)
+
+        self.express_user_preview = QLabel(
+            "Enter a registered member ID to preview eligibility."
+        )
+        self.express_user_preview.setObjectName("ExpressPreview")
+        self.express_user_preview.setWordWrap(True)
+        layout.addWidget(self.express_user_preview)
+
+        self.express_book_input = ExpressBookInput()
+        self.express_book_input.setObjectName("ExpressInput")
+        self.express_book_input.setPlaceholderText("Book ID / Barcode")
+        self.express_book_input.setClearButtonEnabled(True)
+        self.express_book_input.textChanged.connect(
+            self._update_express_previews
+        )
+        self.express_book_input.issueRequested.connect(
+            self.instant_issue_book
+        )
+        self.express_book_input.returnRequested.connect(
+            self.instant_return_book
+        )
+        layout.addWidget(self.express_book_input)
+
+        self.express_book_preview = QLabel(
+            "Enter a book ID to check title and availability."
+        )
+        self.express_book_preview.setObjectName("ExpressPreview")
+        self.express_book_preview.setWordWrap(True)
+        layout.addWidget(self.express_book_preview)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(7)
+        self.instant_issue_button = QPushButton("⚡ Instant Issue (Enter)")
+        self.instant_issue_button.setObjectName("InstantIssue")
+        self.instant_issue_button.clicked.connect(self.instant_issue_book)
+        actions.addWidget(self.instant_issue_button)
+
+        self.instant_return_button = QPushButton(
+            "↩ Instant Return (Shift+Enter)"
+        )
+        self.instant_return_button.setObjectName("InstantReturn")
+        self.instant_return_button.clicked.connect(self.instant_return_book)
+        actions.addWidget(self.instant_return_button)
+        layout.addLayout(actions)
+
+        self.express_status_label = QLabel("")
+        self.express_status_label.setObjectName("ExpressStatus")
+        self.express_status_label.setWordWrap(True)
+        layout.addWidget(self.express_status_label)
+        return panel
+
+    def _create_activity_table_panel(self):
+        panel = QFrame()
+        panel.setObjectName("DashboardPanel")
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(5)
+
+        header = QHBoxLayout()
+        title = QLabel("Recent Circulation & Alerts")
+        title.setObjectName("PanelTitle")
+        header.addWidget(title)
+        header.addStretch()
+
+        self.view_all_button = QPushButton("View All")
+        self.view_all_button.setObjectName("ViewAllButton")
+        self.view_all_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.view_all_button.clicked.connect(self.open_activity_history)
+        header.addWidget(self.view_all_button)
+        layout.addLayout(header)
+
+        filters = QHBoxLayout()
+        filters.setSpacing(4)
+        filter_group = QButtonGroup(self)
+        filter_group.setExclusive(True)
+        for label in (
+            "All Recent", "Issued Today", "Due Today", "Overdue Alerts"
+        ):
+            button = QPushButton(label)
+            button.setObjectName("ActivityFilter")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setChecked(label == self._activity_filter)
+            button.clicked.connect(
+                lambda _checked=False, value=label:
+                self.set_activity_filter(value)
+            )
+            filter_group.addButton(button)
+            self.activity_filter_buttons[label] = button
+            filters.addWidget(button)
+        filters.addStretch()
+
+        self.activity_summary_label = QLabel("Latest transactions")
+        self.activity_summary_label.setObjectName("ActivitySummary")
+        filters.addWidget(self.activity_summary_label)
+        layout.addLayout(filters)
+
+        self.activity_table = QTableWidget()
+        self.activity_table.setObjectName("ActivityTable")
+        self.activity_table.setColumnCount(7)
+        self.activity_table.setHorizontalHeaderLabels([
+            "Time / Date", "Book ID", "Book Title", "Member / User",
+            "Status", "Due Date", "Quick Action",
+        ])
+        self.activity_table.setAlternatingRowColors(True)
+        self.activity_table.setShowGrid(False)
+        self.activity_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.activity_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.activity_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.activity_table.verticalHeader().setVisible(False)
+        self.activity_table.verticalHeader().setDefaultSectionSize(44)
+        self.activity_table.setMouseTracking(True)
+
+        table_header = self.activity_table.horizontalHeader()
+        table_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        table_header.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
+        for column, width in (
+            (0, 130), (1, 80), (3, 160), (4, 90), (5, 130), (6, 200)
+        ):
+            self.activity_table.setColumnWidth(column, width)
+
+        self.activity_table.setFixedHeight(208)
+        layout.addWidget(self.activity_table)
+        self.activity_empty_hint = QLabel(
+            "Showing all recent records — Press Ctrl+I to issue a book "
+            "or scan a barcode at the Express Desk."
+        )
+        self.activity_empty_hint.setObjectName("ActivityEmptyHint")
+        self.activity_empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.activity_empty_hint.setWordWrap(True)
+        layout.addWidget(self.activity_empty_hint)
+        return panel
 
     # --------------------------------------------------------
     # THEME
@@ -1405,16 +2027,75 @@ class DashboardView(QWidget):
                 color: {c['text']};
             }}
 
+            QScrollArea#DashboardScroll,
+            QWidget#DashboardContent {{
+                background: {c['window']};
+                border: none;
+            }}
+
+            QLineEdit#ExpressInput {{
+                background: {c['surface_alt']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                border-radius: 7px;
+                padding: 6px 9px;
+                font-size: 11px;
+            }}
+
+            QLineEdit#ExpressInput:focus {{
+                border-color: {c['primary']};
+            }}
+
+            QLabel#ExpressPreview, QLabel#ExpressStatus {{
+                color: {c['muted']};
+                font-size: 10px;
+                background: transparent;
+            }}
+
+            QLabel#ExpressStatus[success="true"] {{
+                color: {c['success']};
+            }}
+
+            QLabel#ExpressStatus[success="false"] {{
+                color: {c['danger']};
+            }}
+
+            QPushButton#InstantIssue,
+            QPushButton#InstantReturn {{
+                color: white;
+                border: none;
+                border-radius: 7px;
+                padding: 7px 8px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+
+            QPushButton#InstantIssue {{
+                background: {c['primary']};
+            }}
+
+            QPushButton#InstantIssue:hover {{
+                background: {c.get('primary_hover', c['primary'])};
+            }}
+
+            QPushButton#InstantReturn {{
+                background: {c.get('success', SUCCESS)};
+            }}
+
+            QPushButton#InstantReturn:hover {{
+                background: #059669;
+            }}
+
             QFrame#DashboardPanel {{
                 background: {c['surface']};
                 border: 1px solid {c['border']};
-                border-radius: 12px;
+                border-radius: 10px;
             }}
 
             QLabel#PanelTitle {{
                 color: {c['text']};
-                font-size: 15px;
-                font-weight: 750;
+                font-size: 14px;
+                font-weight: 700;
                 background: transparent;
                 border: none;
             }}
@@ -1426,20 +2107,126 @@ class DashboardView(QWidget):
                 border: none;
             }}
 
-            QPushButton#QuickActionButton {{
-                background: {c['surface_alt']};
-                color: {c['text']};
-                font-size: 11px;
+            QPushButton#ActivityFilter {{
+                background: transparent;
+                color: {c['muted']};
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: 10px;
                 font-weight: 600;
-                text-align: left;
-                border: 1px solid {c['border']};
-                border-radius: 8px;
-                padding: 11px 12px;
             }}
 
-            QPushButton#QuickActionButton:hover {{
+            QPushButton#ActivityFilter:hover {{
+                background: {c['surface_alt']};
+                color: {c['text']};
+            }}
+
+            QPushButton#ActivityFilter:checked {{
+                background: {c['primary']};
+                color: white;
                 border-color: {c['primary']};
-                background: {c['button']};
+            }}
+
+            QTableWidget#ActivityTable {{
+                background: {c['table_row']};
+                alternate-background-color: {c['table_alt']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                border-radius: 10px;
+                selection-background-color: {c['primary']};
+                selection-color: {c['selection_text']};
+                outline: none;
+                font-size: 11px;
+            }}
+
+            QTableWidget#ActivityTable::item {{
+                padding: 7px 9px;
+                border-bottom: 1px solid {c['border']};
+            }}
+
+            QTableWidget#ActivityTable::item:hover {{
+                background: {c['surface_alt']};
+            }}
+
+            QLabel#StatusBadge {{
+                border-radius: 8px;
+                padding: 3px 7px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+
+            QHeaderView::section {{
+                background: {c['surface_alt']};
+                color: {c['muted']};
+                border: none;
+                border-bottom: 1px solid {c['border']};
+                padding: 10px 10px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+
+            QPushButton#QuickActionRow {{
+                background: {c['surface_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 8px;
+                text-align: left;
+            }}
+
+            QPushButton#QuickActionRow:hover {{
+                border-color: {c['primary']};
+                background: {c['surface']};
+            }}
+
+            QLabel#QuickActionIcon {{
+                color: {c['primary']};
+                background: transparent;
+                font-size: 13px;
+            }}
+
+            QLabel#QuickActionText {{
+                color: {c['text']};
+                background: transparent;
+                font-size: 10px;
+                font-weight: 600;
+            }}
+
+            QLabel#QuickActionKeycap {{
+                color: {c['muted']};
+                background: {c['surface']};
+                border: 1px solid {c['border']};
+                border-radius: 5px;
+                padding: 3px 5px;
+                font-size: 8px;
+                font-weight: 700;
+            }}
+
+            QLabel#ActivityEmptyHint {{
+                color: {c['muted']};
+                font-size: 10px;
+                padding: 3px;
+                background: transparent;
+            }}
+
+            QPushButton#RowAction {{
+                background: {c['surface_alt']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                border-radius: 5px;
+                padding: 4px 6px;
+                font-size: 9px;
+                font-weight: 600;
+            }}
+
+            QPushButton#RowAction:hover {{
+                border-color: {c['primary']};
+                background: {c['surface']};
+            }}
+
+            QPushButton#RowAction:disabled {{
+                color: {c['muted']};
+                background: {c['surface_alt']};
+                border-color: {c['border']};
             }}
 
             QPushButton#ViewAllButton {{
@@ -1460,13 +2247,7 @@ class DashboardView(QWidget):
 
         for card in self.metric_widgets.values():
             card.apply_style()
-
-        for index in range(self.feed_inner_layout.count()):
-            item = self.feed_inner_layout.itemAt(index)
-            widget = item.widget() if item else None
-
-            if isinstance(widget, ActivityCard):
-                widget.apply_style()
+        self.analytics_widget.update()
 
     # --------------------------------------------------------
     # METRIC CARDS
@@ -1475,44 +2256,24 @@ class DashboardView(QWidget):
     def _create_metric_cards(self):
         metrics = [
             (
-                "total_users", "Total Users", "0",
-                "Registered library users", "👥",
-                PRIMARY, 0, 0, self.show_users_drilldown, False,
+                "inventory", "Total Inventory", "0 / 0",
+                "Available copies", "📚",
+                SUCCESS, 0, 0, self.show_total_copies_drilldown, True,
             ),
             (
-                "unique_titles", "Unique Titles", "0",
-                "Books in catalog", "📚",
-                INFO, 0, 1, self.show_titles_drilldown, False,
-            ),
-            (
-                "inventory", "Inventory", "0 / 0",
-                "Available / Total Copies", "📦",
-                SUCCESS, 0, 2, self.show_total_copies_drilldown, True,
-            ),
-            (
-                "unpaid_fines", "Unpaid Fines", "₹0.00",
-                "Pending collection", "💳",
-                WARNING, 0, 3, self.show_fines_drilldown, False,
-            ),
-            (
-                "active_loans", "Issued Books", "0",
-                "Currently issued", "🔄",
-                INFO, 1, 0, self.show_active_loans_drilldown, False,
-            ),
-            (
-                "issued_today", "Issued Today", "0",
-                "Books issued today", "📈",
-                SUCCESS, 1, 1, self.show_issued_today_drilldown, False,
+                "active_loans", "Active Circulation", "0",
+                "Currently issued", "↗",
+                INFO, 0, 1, self.show_active_loans_drilldown, False,
             ),
             (
                 "overdue_books", "Overdue Books", "0",
-                "Action required", "⚠️",
-                DANGER, 1, 2, self.show_overdue_drilldown, False,
+                "Action required", "⚠",
+                DANGER, 0, 2, self.show_overdue_drilldown, False,
             ),
             (
-                "today_due", "Due Today", "0",
-                "Books due today", "📅",
-                PRIMARY, 1, 3, self.show_due_today_drilldown, False,
+                "unpaid_fines", "Unpaid Fines", "₹0.00",
+                "Pending collection", "₹",
+                WARNING, 0, 3, self.show_fines_drilldown, False,
             ),
         ]
 
@@ -1524,6 +2285,21 @@ class DashboardView(QWidget):
                 key, title, value, subtitle, icon,
                 accent, row, column, callback, inventory,
             )
+
+        self.metric_widgets["inventory"].set_action(
+            "Catalog →", lambda: self.navigate_requested.emit("catalog")
+        )
+        self.metric_widgets["active_loans"].set_action(
+            "Circulation →",
+            lambda: self.navigate_requested.emit("circulation"),
+        )
+        self.metric_widgets["overdue_books"].set_action(
+            "Overdue List →",
+            lambda: self.navigate_requested.emit("circulation"),
+        )
+        self.metric_widgets["unpaid_fines"].set_action(
+            "View Fines →", self.show_fines_drilldown
+        )
 
     def create_metric_card(
         self,
@@ -1548,6 +2324,7 @@ class DashboardView(QWidget):
             self,
         )
 
+        card.metric_key = key
         card.clicked.connect(callback)
         self.metric_widgets[key] = card
         self.tiles_grid.addWidget(card, row, column)
@@ -1561,33 +2338,53 @@ class DashboardView(QWidget):
     def create_quick_actions(self):
         card = QFrame()
         card.setObjectName("DashboardPanel")
-        card.setMinimumWidth(215)
+        card.setMinimumWidth(220)
 
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(17, 17, 17, 17)
-        layout.setSpacing(11)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
 
-        title = QLabel("⚡  Quick Actions")
+        title = QLabel("Quick Desk Actions")
         title.setObjectName("PanelTitle")
         layout.addWidget(title)
 
         actions = [
-            ("👤   Add New User", self.open_userform),
-            ("📚   Add New Book", self.open_bookform),
-            ("▦   Generate Barcode", self.open_bargenerate_form),
-            ("▣   Quick Scan", self.open_quick_scan),
-            ("📋   Activity History", self.open_activity_history),
-            ("⟳   Refresh Dashboard", self.refresh_dashboard),
+            ("📚", "Add New Book", "Ctrl+B", self.open_bookform),
+            ("👤", "Add New User", "Ctrl+U", self.open_userform),
+            ("▦", "Generate Barcode", "Ctrl+G", self.open_bargenerate_form),
+            ("⌁", "Quick Scan", "Ctrl+Shift+K", self.open_quick_scan),
+            ("◷", "Activity History", "Ctrl+H", self.open_activity_history),
+            ("↻", "Refresh Dashboard", "F5", self.refresh_dashboard),
         ]
 
-        for label, callback in actions:
-            button = QPushButton(label)
-            button.setObjectName("QuickActionButton")
-            button.setCursor(
-                Qt.CursorShape.PointingHandCursor
-            )
-            button.setMinimumHeight(42)
+        for icon, label, shortcut, callback in actions:
+            button = QPushButton()
+            button.setObjectName("QuickActionRow")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setAccessibleName(label)
             button.clicked.connect(callback)
+            row_layout = QHBoxLayout(button)
+            row_layout.setContentsMargins(9, 5, 8, 5)
+            row_layout.setSpacing(7)
+            icon_label = QLabel(icon)
+            icon_label.setObjectName("QuickActionIcon")
+            icon_label.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents
+            )
+            row_layout.addWidget(icon_label)
+            text_label = QLabel(label)
+            text_label.setObjectName("QuickActionText")
+            text_label.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents
+            )
+            row_layout.addWidget(text_label, 1)
+            keycap = QLabel(shortcut)
+            keycap.setObjectName("QuickActionKeycap")
+            keycap.setVisible(bool(shortcut))
+            keycap.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents
+            )
+            row_layout.addWidget(keycap)
             layout.addWidget(button)
 
         layout.addStretch()
@@ -1609,7 +2406,7 @@ class DashboardView(QWidget):
             book_title,
             username,
             timestamp,
-            self.feed_content_widget,
+            self,
         )
         card.clicked.connect(self.open_activity_details)
         return card
@@ -1633,57 +2430,291 @@ class DashboardView(QWidget):
         self.load_activity_log()
 
     def load_activity_log(self):
-        while self.feed_inner_layout.count():
-            item = self.feed_inner_layout.takeAt(0)
-            widget = item.widget()
-
-            if widget:
-                widget.deleteLater()
-
         try:
-            success, logs = self.db.get_recent_activity_logs(
-                limit=8
-            )
-        except Exception as error:
-            success, logs = False, []
-            print(f"Activity log error: {error}")
+            success, logs = self.db.get_logs()
+            if not success:
+                raise RuntimeError("Could not retrieve circulation records.")
 
-        if success and logs:
-            for log in logs:
-                try:
-                    card = self.create_activity_card(
-                        safe_text(log[0]),
-                        safe_text(log[1]),
-                        safe_text(log[2]),
-                        safe_text(log[3]),
+            books_success, books = self.db.get_books()
+            users_success, users = self.db.get_users()
+            if not books_success or not users_success:
+                raise RuntimeError(
+                    "Could not load book and user details for activity."
+                )
+
+            book_titles = {
+                str(book[0]): safe_text(book[1])
+                for book in books
+                if len(book) > 1
+            }
+            user_names = {
+                str(user[0]): safe_text(user[1])
+                for user in users
+                if len(user) > 1
+            }
+            self._books_by_id = {
+                str(book[0]).strip().casefold(): book
+                for book in books if len(book) > 1
+            }
+            self._users_by_id = {
+                str(user[0]).strip().casefold(): user
+                for user in users if len(user) > 1
+            }
+            self._current_books_by_user = {}
+            for record in logs or []:
+                if (
+                    len(record) >= 8
+                    and safe_text(record[7]).upper() == "ISSUED"
+                ):
+                    user_key = safe_text(record[2]).strip().casefold()
+                    self._current_books_by_user[user_key] = (
+                        self._current_books_by_user.get(user_key, 0) + 1
                     )
-                    self.feed_inner_layout.addWidget(card)
 
-                except (IndexError, TypeError) as error:
-                    print(f"Invalid activity record: {error}")
+            self._activity_records = []
+            today = datetime.date.today().isoformat()
+            for record in list(logs or [])[:300]:
+                if len(record) < 8:
+                    continue
+                log_id, book_id, user_id, issue_date, due_date, returned, fine, raw_status = record
+                status = safe_text(raw_status).upper()
+                due_text = safe_text(due_date)
+                if (
+                    status == "ISSUED"
+                    and due_text
+                    and due_text[:10] < today
+                ):
+                    status = "OVERDUE"
+                elif (
+                    status == "ISSUED"
+                    and due_text
+                    and due_text[:10] == today
+                ):
+                    status = "DUE TODAY"
 
+                self._activity_records.append({
+                    "record": record,
+                    "log_id": log_id,
+                    "book_id": safe_text(book_id),
+                    "book_title": book_titles.get(
+                        str(book_id), "Unknown book"
+                    ),
+                    "user_id": safe_text(user_id),
+                    "user_name": user_names.get(
+                        str(user_id), "Unknown user"
+                    ),
+                    "display_date": safe_text(returned or issue_date),
+                    "issue_date": safe_text(issue_date),
+                    "due_date": due_text,
+                    "status": status,
+                    "fine": fine,
+                })
+
+            self._update_analytics(logs, books)
+            self._update_express_previews()
+            self._render_activity_table()
+        except Exception as error:
+            self._activity_records = []
+            self.activity_table.setRowCount(0)
             self.activity_summary_label.setText(
-                f"Showing the latest {len(logs)} activity record(s)."
+                f"Could not load activity: {error}"
             )
 
+    def set_activity_filter(self, filter_name):
+        self._activity_filter = filter_name
+        self._render_activity_table()
+
+    def _render_activity_table(self):
+        today = datetime.date.today().isoformat()
+        if self._activity_filter == "Issued Today":
+            records = [
+                item for item in self._activity_records
+                if item["issue_date"][:10] == today
+            ]
+        elif self._activity_filter == "Due Today":
+            records = [
+                item for item in self._activity_records
+                if item["status"] in ("ISSUED", "DUE TODAY", "OVERDUE")
+                and item["due_date"][:10] == today
+            ]
+        elif self._activity_filter == "Overdue Alerts":
+            records = [
+                item for item in self._activity_records
+                if item["status"] == "OVERDUE"
+            ]
         else:
-            empty = QLabel(
-                "No recent circulation activity yet."
+            records = self._activity_records
+
+        self.activity_table.setRowCount(len(records))
+        self.activity_empty_hint.setVisible(len(records) < 4)
+        for row_index, item in enumerate(records):
+            values = (
+                item["display_date"],
+                item["book_id"],
+                item["book_title"],
+                f"{item['user_name']} ({item['user_id']})",
+                item["due_date"] or "—",
             )
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setWordWrap(True)
-            empty.setMinimumHeight(110)
-            empty.setStyleSheet(
-                "padding: 20px; border: 1px dashed "
-                f"{get_theme_colors()['border']}; border-radius: 8px;"
+            for column, value in enumerate(values):
+                actual_column = column if column < 4 else column + 1
+                table_item = QTableWidgetItem(safe_text(value) or "—")
+                table_item.setToolTip(safe_text(value) or "—")
+                if actual_column == 0:
+                    table_item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        item["record"],
+                    )
+                self.activity_table.setItem(
+                    row_index, actual_column, table_item
+                )
+
+            badge_background, status_color = STATUS_BADGE_COLORS.get(
+                item["status"],
+                STATUS_BADGE_COLORS["ISSUED"],
+            )
+            badge = QLabel(item["status"].title())
+            badge.setObjectName("StatusBadge")
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setStyleSheet(
+                f"color: {status_color}; background: {badge_background};"
+            )
+            self.activity_table.setCellWidget(row_index, 4, badge)
+
+            actions = QWidget()
+            actions_layout = QHBoxLayout(actions)
+            actions_layout.setContentsMargins(2, 2, 2, 2)
+            actions_layout.setSpacing(4)
+
+            return_button = QPushButton("Return")
+            return_button.setObjectName("RowAction")
+            return_button.setEnabled(
+                item["status"] in ("ISSUED", "DUE TODAY", "OVERDUE")
+            )
+            return_button.clicked.connect(
+                lambda _checked=False, selected=item:
+                self.return_activity_record(selected)
+            )
+            actions_layout.addWidget(return_button)
+
+            renew_button = QPushButton("Renew")
+            renew_button.setObjectName("RowAction")
+            renew_button.setEnabled(False)
+            renew_button.setToolTip(
+                "Renewals are not supported by the current circulation service."
+            )
+            actions_layout.addWidget(renew_button)
+
+            inspect_button = QPushButton("Inspect")
+            inspect_button.setObjectName("RowAction")
+            inspect_button.clicked.connect(
+                lambda _checked=False, selected=item:
+                self.inspect_activity_record(selected)
+            )
+            actions_layout.addWidget(inspect_button)
+            self.activity_table.setCellWidget(
+                row_index, 6, actions
             )
 
-            self.feed_inner_layout.addWidget(empty)
-            self.activity_summary_label.setText(
-                "No recent transactions are available."
+        self.activity_summary_label.setText(
+            f"{len(records)} transaction(s)"
+        )
+
+    def _update_analytics(self, logs, books):
+        today = datetime.date.today()
+        days = []
+        issue_counts = {}
+        return_counts = {}
+        for offset in range(6, -1, -1):
+            date = today - datetime.timedelta(days=offset)
+            key = date.isoformat()
+            issue_counts[key] = 0
+            return_counts[key] = 0
+
+        active = []
+        for record in logs or []:
+            if len(record) < 8:
+                continue
+            _, _, _, checkout_date, due_date, returned_date, _, status = record
+            checkout_day = safe_text(checkout_date)[:10]
+            returned_day = safe_text(returned_date)[:10]
+            if checkout_day in issue_counts:
+                issue_counts[checkout_day] += 1
+            if returned_day in return_counts:
+                return_counts[returned_day] += 1
+            if safe_text(status).upper() == "ISSUED":
+                active.append((safe_text(due_date)[:10], due_date))
+
+        for key in issue_counts:
+            date = datetime.date.fromisoformat(key)
+            days.append({
+                "label": date.strftime("%a"),
+                "issued": issue_counts[key],
+                "returned": return_counts[key],
+            })
+
+        total_copies = sum(
+            max(int(book[4] or 0), 0) for book in books if len(book) > 5
+        )
+        available_copies = sum(
+            max(int(book[5] or 0), 0) for book in books if len(book) > 5
+        )
+        due_count = sum(1 for due_day, _ in active if due_day == today.isoformat())
+        overdue_count = sum(1 for due_day, _ in active if due_day and due_day < today.isoformat())
+        issued_regular = max(
+            len(active) - due_count - overdue_count, 0
+        )
+        self.analytics_widget.set_data(
+            days,
+            [
+                {"label": "Available on Shelf", "count": available_copies},
+                {"label": "Currently Issued", "count": issued_regular},
+                {"label": "Due Today / Reserved", "count": due_count},
+                {"label": "Overdue / Missing", "count": overdue_count},
+            ],
+        )
+
+    def _update_express_previews(self, *_):
+        user_id = self.express_user_input.text().strip()
+        book_id = self.express_book_input.text().strip()
+        user_key = user_id.casefold()
+        book_key = book_id.casefold()
+        user = self._users_by_id.get(user_key)
+        book = self._books_by_id.get(book_key)
+
+        if user:
+            held = self._current_books_by_user.get(user_key, 0)
+            self.express_user_preview.setText(
+                f"{safe_text(user[1])} · {held} book(s) currently held"
+            )
+        elif user_id:
+            self.express_user_preview.setText(
+                "Member ID not found in the library records."
+            )
+        else:
+            self.express_user_preview.setText(
+                "Enter a registered member ID to preview eligibility."
             )
 
-        self.feed_inner_layout.addStretch(1)
+        if book:
+            available = int(book[5] or 0)
+            self.express_book_preview.setText(
+                f"{safe_text(book[1])} · "
+                f"{'Available' if available > 0 else 'No copies available'}"
+            )
+        elif book_id:
+            self.express_book_preview.setText(
+                "Book ID not found in the catalog."
+            )
+        else:
+            self.express_book_preview.setText(
+                "Enter a book ID to check title and availability."
+            )
+
+        can_transact = bool(user and book)
+        self.instant_issue_button.setEnabled(
+            can_transact and int(book[5] or 0) > 0
+        )
+        self.instant_return_button.setEnabled(can_transact)
 
     # --------------------------------------------------------
     # DASHBOARD METRICS
@@ -1699,7 +2730,7 @@ class DashboardView(QWidget):
                 )
 
             (
-                total_users,
+                _total_users,
                 unique_titles,
                 total_copies,
                 available_copies,
@@ -1710,54 +2741,352 @@ class DashboardView(QWidget):
                 unpaid_fines,
             ) = details
 
-            self.metric_widgets["total_users"].set_metric(
-                str(total_users)
-            )
-
-            self.metric_widgets["unique_titles"].set_metric(
-                str(unique_titles)
-            )
-
             self.metric_widgets["inventory"].set_inventory(
                 available_copies,
                 total_copies,
+                unique_titles,
             )
 
             self.metric_widgets["active_loans"].set_metric(
-                str(active_loans)
+                str(active_loans),
+                "Currently issued",
+            )
+            self.metric_widgets["active_loans"].set_secondary(
+                today_issued,
+                due_today,
             )
 
-            self.metric_widgets["issued_today"].set_metric(
-                str(today_issued)
-            )
+            overdue_card = self.metric_widgets["overdue_books"]
+            overdue_card.set_overdue(overdue_books)
 
-            self.metric_widgets["overdue_books"].set_metric(
-                str(overdue_books)
-            )
-
-            self.metric_widgets["today_due"].set_metric(
-                str(due_today)
-            )
-
-            self.metric_widgets["unpaid_fines"].set_metric(
-                f"₹{float(unpaid_fines or 0):,.2f}"
+            self.metric_widgets["unpaid_fines"].set_fines(
+                unpaid_fines
             )
 
         except Exception as error:
-            print(f"Dashboard metrics error: {error}")
+            self.activity_summary_label.setText(
+                f"Could not load dashboard metrics: {error}"
+            )
 
     # --------------------------------------------------------
     # DETAIL DIALOG HELPER
     # --------------------------------------------------------
 
-    def _open_report_dialog(self, title, headers, rows):
+    def _open_report_dialog(
+        self, title, headers, rows, searchable=True
+    ):
         dialog = MetricDetailDialog(
             title,
             headers,
             rows or [],
             self,
+            searchable=searchable,
         )
         dialog.exec()
+
+    def open_issue_dialog(self):
+        dialog = IssueBookDialog(self.db, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            book_id, user_id, days = dialog.get_data()
+            success, message = self.db.issue_book(
+                book_id,
+                user_id,
+                days,
+            )
+            if success:
+                QMessageBox.information(
+                    self, "Book Issued", str(message)
+                )
+                self.refresh_dashboard()
+            else:
+                QMessageBox.warning(
+                    self, "Issue Failed", str(message)
+                )
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Issue Error", str(error)
+            )
+
+    def open_return_dialog(self):
+        dialog = ReturnBookDialog(self.db, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            book_id, user_id = dialog.get_data()
+            success, fine, message = self.db.return_book(
+                book_id,
+                user_id,
+            )
+            if success:
+                QMessageBox.information(
+                    self,
+                    "Book Returned",
+                    f"{message}\nFine: ₹{float(fine or 0):.2f}",
+                )
+                self.refresh_dashboard()
+            else:
+                QMessageBox.warning(
+                    self, "Return Failed", str(message)
+                )
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Return Error", str(error)
+            )
+
+    def quick_scan_barcode(self, input_field=None):
+        input_field = input_field or self.express_book_input
+        book_id = input_field.text().strip()
+        if not book_id:
+            return
+
+        dialog = QuickScanDialog(self.db, self)
+        dialog.set_camera_scanned_book_id(
+            book_id,
+            "barcode / Book ID entry",
+        )
+        dialog.data_updated.connect(self.refresh_dashboard)
+        dialog.exec()
+        input_field.clear()
+        self.refresh_dashboard()
+
+    def instant_issue_book(self):
+        user_id = self.express_user_input.text().strip()
+        book_id = self.express_book_input.text().strip()
+        user = self._users_by_id.get(user_id.casefold())
+        book = self._books_by_id.get(book_id.casefold())
+        if not user_id or not book_id or not user or not book:
+            self.express_status_label.setText(
+                "Enter a registered member ID and a registered book ID."
+            )
+            return
+
+        try:
+            success, message = self.db.issue_book(
+                safe_text(book[0]),
+                safe_text(user[0]),
+            )
+            self.express_status_label.setText(str(message))
+            self.express_status_label.setProperty(
+                "success", bool(success)
+            )
+            self.express_status_label.style().unpolish(
+                self.express_status_label
+            )
+            self.express_status_label.style().polish(
+                self.express_status_label
+            )
+            self.refresh_dashboard()
+            if success:
+                self.express_book_input.clear()
+        except Exception as error:
+            self.express_status_label.setText(
+                f"Issue failed: {error}"
+            )
+
+    def instant_return_book(self):
+        user_id = self.express_user_input.text().strip()
+        book_id = self.express_book_input.text().strip()
+        user = self._users_by_id.get(user_id.casefold())
+        book = self._books_by_id.get(book_id.casefold())
+        if not user_id or not book_id or not user or not book:
+            self.express_status_label.setText(
+                "Enter a registered member ID and a registered book ID."
+            )
+            return
+
+        try:
+            success, fine, message = self.db.return_book(
+                safe_text(book[0]),
+                safe_text(user[0]),
+            )
+            result = str(message)
+            if success:
+                result += f" · Fine: ₹{float(fine or 0):.2f}"
+            self.express_status_label.setText(result)
+            self.express_status_label.setProperty(
+                "success", bool(success)
+            )
+            self.express_status_label.style().unpolish(
+                self.express_status_label
+            )
+            self.express_status_label.style().polish(
+                self.express_status_label
+            )
+            self.refresh_dashboard()
+            if success:
+                self.express_book_input.clear()
+        except Exception as error:
+            self.express_status_label.setText(
+                f"Return failed: {error}"
+            )
+
+    def search_global_records(self, query=None):
+        query = safe_text(query).strip().casefold()
+        if not query:
+            return []
+
+        books_success, books = self.db.get_books()
+        users_success, users = self.db.get_users()
+        logs_success, logs = self.db.get_logs()
+        if not (books_success and users_success and logs_success):
+            raise RuntimeError("The search data could not be loaded.")
+
+        book_map = {
+            str(row[0]): row for row in books if len(row) >= 2
+        }
+        user_map = {
+            str(row[0]): row for row in users if len(row) >= 2
+        }
+        results = []
+        category_counts = {
+            "Book": 0,
+            "Member": 0,
+            "Transaction": 0,
+        }
+        per_category_limit = 4
+
+        def append_result(kind, record_id, title, description, page):
+            if category_counts[kind] >= per_category_limit:
+                return
+            results.append({
+                "type": kind,
+                "id": safe_text(record_id),
+                "title": safe_text(title) or f"{kind} record",
+                "description": safe_text(description),
+                "page": page,
+            })
+            category_counts[kind] += 1
+
+        for book in books:
+            values = [safe_text(value) for value in book]
+            if len(values) >= 2 and query in " ".join(values).casefold():
+                author = values[2] if len(values) > 2 else ""
+                append_result(
+                    "Book",
+                    values[0],
+                    values[1],
+                    f"Book · ID {values[0]}"
+                    + (f" · {author}" if author else ""),
+                    1,
+                )
+
+        for user in users:
+            values = [safe_text(value) for value in user]
+            if len(values) >= 2 and query in " ".join(values).casefold():
+                role = values[3] if len(values) > 3 else "Member"
+                append_result(
+                    "Member",
+                    values[0],
+                    values[1],
+                    f"Member · ID {values[0]} · {role}",
+                    2,
+                )
+
+        for log in logs:
+            if len(log) < 8:
+                continue
+            log_id, book_id, user_id, issue_date, due_date, returned, _fine, status = log
+            book = book_map.get(str(book_id), ())
+            user = user_map.get(str(user_id), ())
+            values = [
+                safe_text(value) for value in log
+            ] + [
+                safe_text(value) for value in book
+            ] + [
+                safe_text(value) for value in user
+            ]
+            if query in " ".join(values).casefold():
+                book_title = (
+                    safe_text(book[1])
+                    if len(book) > 1 else safe_text(book_id)
+                )
+                member_name = (
+                    safe_text(user[1])
+                    if len(user) > 1 else safe_text(user_id)
+                )
+                append_result(
+                    "Transaction",
+                    log_id,
+                    book_title,
+                    f"Transaction · #{log_id} · {member_name} · "
+                    f"{safe_text(status).title()}",
+                    3,
+                )
+
+        return results
+
+    def toggle_theme(self):
+        if not self.theme_manager:
+            QMessageBox.warning(
+                self,
+                "Theme Unavailable",
+                "The application theme manager is not available.",
+            )
+            return
+
+        active = self.theme_manager.get_active_theme()
+        target = "Light" if active == "Dark" else "Dark"
+        try:
+            if not self.db.set_setting("theme_mode", target):
+                raise RuntimeError("Unable to save the selected theme.")
+            self.theme_manager.set_theme(target)
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Theme Change Failed", str(error)
+            )
+
+    def inspect_activity_record(self, item):
+        record = item["record"]
+        details = [
+            ("Transaction ID", item["log_id"]),
+            ("Book ID", item["book_id"]),
+            ("Book Title", item["book_title"]),
+            (
+                "Member",
+                f"{item['user_name']} ({item['user_id']})",
+            ),
+            ("Issue Date", item["issue_date"]),
+            ("Due Date", item["due_date"]),
+            ("Return Date", safe_text(record[5]) or "—"),
+            ("Status", item["status"].title()),
+            ("Fine", f"₹{float(item['fine'] or 0):.2f}"),
+        ]
+        dialog = ActivityDetailDialog(
+            "Transaction",
+            item["book_title"],
+            f"{item['user_name']} ({item['user_id']})",
+            item["display_date"],
+            self,
+            details=details,
+            dialog_title=f"Transaction #{item['log_id']}",
+        )
+        dialog.exec()
+
+    def return_activity_record(self, item):
+        try:
+            success, fine, message = self.db.return_book(
+                item["book_id"],
+                item["user_id"],
+            )
+            if success:
+                QMessageBox.information(
+                    self,
+                    "Book Returned",
+                    f"{message}\nFine: ₹{float(fine or 0):.2f}",
+                )
+                self.refresh_dashboard()
+            else:
+                QMessageBox.warning(
+                    self, "Return Failed", str(message)
+                )
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Return Error", str(error)
+            )
 
     # --------------------------------------------------------
     # USERS

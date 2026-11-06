@@ -29,6 +29,7 @@ from PyQt6.QtCharts import (
     QBarCategoryAxis,
     QValueAxis,
 )
+from utils import rgba_color
 
 
 # ============================================================
@@ -64,15 +65,15 @@ class InteractiveStatCard(QFrame):
 
         self.setObjectName("StatCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(145)
+        self.setMinimumHeight(116)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(19, 17, 19, 17)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
 
         top = QHBoxLayout()
         top.setSpacing(6)
@@ -114,26 +115,31 @@ class InteractiveStatCard(QFrame):
         border = (
             self.accent
             if self.selected
-            else self.colors["border"]
+            else rgba_color(self.accent, 0.48)
         )
+        background = rgba_color(
+            self.accent,
+            0.20 if self.selected else 0.09,
+        )
+        hover_background = rgba_color(self.accent, 0.20)
 
         self.setStyleSheet(f"""
             QFrame#StatCard {{
-                background: {self.colors["surface"]};
+                background: {background};
                 border: 1px solid {border};
                 border-left: 5px solid {self.accent};
-                border-radius: 12px;
+                border-radius: 10px;
             }}
 
             QFrame#StatCard:hover {{
-                background: {self.colors["surface_alt"]};
+                background: {hover_background};
                 border: 1px solid {self.accent};
                 border-left: 5px solid {self.accent};
             }}
 
             QLabel#CardTitle {{
                 color: {self.colors["muted"]};
-                font-size: 12px;
+                font-size: 10px;
                 font-weight: 700;
                 border: none;
                 background: transparent;
@@ -141,7 +147,7 @@ class InteractiveStatCard(QFrame):
 
             QLabel#CardValue {{
                 color: {self.colors["text"]};
-                font-size: 29px;
+                font-size: 23px;
                 font-weight: 800;
                 border: none;
                 background: transparent;
@@ -149,7 +155,7 @@ class InteractiveStatCard(QFrame):
 
             QLabel#CardSubtitle {{
                 color: {self.colors["muted"]};
-                font-size: 11px;
+                font-size: 10px;
                 border: none;
                 background: transparent;
             }}
@@ -341,7 +347,7 @@ class ReportsView(QWidget):
             QLabel#PageTitle {{
                 color: {c["text"]};
                 font-size: 23px;
-                font-weight: 800;
+                font-weight: 700;
                 background: transparent;
                 border: none;
             }}
@@ -355,7 +361,7 @@ class ReportsView(QWidget):
 
             QLabel#SectionTitle {{
                 color: {c["text"]};
-                font-size: 17px;
+                font-size: 14px;
                 font-weight: 700;
                 background: transparent;
                 border: none;
@@ -483,8 +489,8 @@ class ReportsView(QWidget):
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(22, 18, 22, 18)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(20, 16, 20, 16)
+        main_layout.setSpacing(12)
 
         header = QFrame()
         header.setObjectName("ReportHeader")
@@ -522,7 +528,7 @@ class ReportsView(QWidget):
 
         self.content_layout = QVBoxLayout(self.content)
         self.content_layout.setContentsMargins(2, 2, 8, 12)
-        self.content_layout.setSpacing(18)
+        self.content_layout.setSpacing(12)
 
         self._build_stat_cards()
         self._build_graph_panel()

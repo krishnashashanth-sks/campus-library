@@ -38,39 +38,63 @@ class ThemeManager(QObject):
 
     THEMES = ("Dark", "Light", "System")
 
-    COLORS = {
-        "Dark": {
-            "window": "#0B1220",
-            "surface": "#111C2E",
-            "surface_alt": "#17243A",
-            "input": "#0F1B2D",
-            "border": "#293B55",
-            "text": "#E8EEF8",
+    THEME = {
+        "dark": {
+            "window": "#0B1120",
+            "surface": "#151F32",
+            "surface_alt": "#1B2940",
+            "input": "#111B2D",
+            "border": "#28354A",
+            "text": "#F8FAFC",
             "muted": "#94A3B8",
-            "primary": "#3B82F6",
+            "primary": "#2563EB",
             "primary_hover": "#2563EB",
             "selection": "#1D4ED8",
-            "success": "#16A34A",
-            "warning": "#D97706",
-            "danger": "#DC2626",
-            "tooltip": "#17243A",
+            "success": "#10B981",
+            "success_hover": "#059669",
+            "warning": "#F59E0B",
+            "danger": "#EF4444",
+            "tooltip": "#151F32",
+            "table_row": "#131C2E",
+            "table_alt": "#182338",
+            "overdue_tint": "#1E1B18",
+            "amber_tint": "#2B2415",
+            "chart_issued": "#38BDF8",
+            "chart_returned": "#34D399",
+            "inventory_issued": "#3B82F6",
+            "inventory_due": "#F59E0B",
+            "inventory_overdue": "#EF4444",
         },
-        "Light": {
-            "window": "#F3F6FB",
+        "light": {
+            "window": "#F1F5F9",
             "surface": "#FFFFFF",
-            "surface_alt": "#EAF0F8",
+            "surface_alt": "#E8EEF5",
             "input": "#FFFFFF",
-            "border": "#D5DEEA",
-            "text": "#172033",
+            "border": "#CBD5E1",
+            "text": "#0F172A",
             "muted": "#64748B",
             "primary": "#2563EB",
             "primary_hover": "#1D4ED8",
             "selection": "#BFDBFE",
-            "success": "#15803D",
-            "warning": "#B45309",
-            "danger": "#B91C1C",
+            "success": "#10B981",
+            "success_hover": "#059669",
+            "warning": "#F59E0B",
+            "danger": "#EF4444",
             "tooltip": "#FFFFFF",
+            "table_row": "#FFFFFF",
+            "table_alt": "#F1F5F9",
+            "overdue_tint": "#FEE2E2",
+            "amber_tint": "#FEF3C7",
+            "chart_issued": "#38BDF8",
+            "chart_returned": "#34D399",
+            "inventory_issued": "#3B82F6",
+            "inventory_due": "#F59E0B",
+            "inventory_overdue": "#EF4444",
         },
+    }
+    COLORS = {
+        "Dark": THEME["dark"],
+        "Light": THEME["light"],
     }
 
     def __init__(self, app: QApplication, initial_theme="Dark"):
@@ -278,9 +302,9 @@ class ThemeManager(QObject):
             background-color: {c["surface_alt"]};
             color: {c["text"]};
             border: 1px solid {c["border"]};
-            border-radius: 7px;
-            padding: 8px 15px;
-            min-height: 20px;
+            border-radius: 8px;
+            padding: 8px 14px;
+            min-height: 22px;
         }}
 
         QPushButton:hover {{
@@ -316,7 +340,7 @@ class ThemeManager(QObject):
             background-color: {c["input"]};
             color: {c["text"]};
             border: 1px solid {c["border"]};
-            border-radius: 6px;
+            border-radius: 8px;
             padding: 7px 9px;
             selection-background-color: {c["selection"]};
         }}
@@ -400,7 +424,7 @@ class ThemeManager(QObject):
             alternate-background-color: {c["surface_alt"]};
             color: {c["text"]};
             border: 1px solid {c["border"]};
-            border-radius: 7px;
+            border-radius: 10px;
             gridline-color: {c["border"]};
             selection-background-color: {c["selection"]};
             selection-color: #FFFFFF;
@@ -411,7 +435,7 @@ class ThemeManager(QObject):
         QTableView::item,
         QTreeWidget::item,
         QTreeView::item {{
-            padding: 7px;
+            padding: 7px 9px;
             border: none;
         }}
 
@@ -430,8 +454,25 @@ class ThemeManager(QObject):
             color: {c["text"]};
             border: none;
             border-bottom: 1px solid {c["border"]};
-            padding: 10px 8px;
+            padding: 10px 10px;
             font-weight: 600;
+        }}
+
+        QLabel#PageTitle {{
+            color: {c["text"]};
+            font-size: 23px;
+            font-weight: 700;
+        }}
+
+        QLabel#PageSubtitle {{
+            color: {c["muted"]};
+            font-size: 12px;
+        }}
+
+        QLabel#SectionTitle {{
+            color: {c["text"]};
+            font-size: 14px;
+            font-weight: 700;
         }}
 
         /* ---------- CHECKBOXES / RADIO ---------- */
@@ -536,7 +577,7 @@ class ThemeManager(QObject):
 
         QTabWidget::pane {{
             border: 1px solid {c["border"]};
-            border-radius: 6px;
+            border-radius: 8px;
         }}
 
         QTabBar::tab {{

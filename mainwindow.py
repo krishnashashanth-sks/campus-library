@@ -11,14 +11,18 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QPushButton,
     QLabel,
+    QLineEdit,
     QSizePolicy,
     QMessageBox,
     QApplication,
+    QScrollArea,
 )
 
-from PyQt6.QtGui import QIcon, QFont
+from PyQt6.QtGui import QIcon, QFont, QKeySequence, QShortcut
 from PyQt6.QtCore import (
     Qt,
+    QPoint,
+    QTimer,
     QPropertyAnimation,
     QEasingCurve,
     QParallelAnimationGroup,
@@ -30,6 +34,9 @@ from pages.reports_view import ReportsView
 from pages.usermanagement_view import UserManagementView
 from pages.settings_view import SettingsView
 from pages.dashboard_view import DashboardView
+from email_queue import EmailQueueManager
+from help_dialog import HelpDialog
+from app_version import get_app_version
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +49,14 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.db = db
+        self.email_sync_manager = EmailQueueManager(
+            db.database_path,
+            self,
+            db,
+        )
+        application = QApplication.instance()
+        if application:
+            application.email_sync_manager = self.email_sync_manager
         self.sidebar_expanded = True
         self._sidebar_auto_collapsed = False
         self._responsive_sidebar_mode = None
@@ -79,6 +94,13 @@ class MainWindow(QMainWindow):
         self.load_saved_theme()
 
         self.initialize_window_icon()
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(180)
+        self._search_debounce_timer.timeout.connect(
+            self._update_search_suggestions
+        )
+        self._search_results = []
         self.initialize_ui()
 
         if self.theme_manager:
@@ -93,6 +115,10 @@ class MainWindow(QMainWindow):
 
         self.apply_shell_theme()
         self.switch_page(0)
+        self.email_sync_manager.status_changed.connect(
+            self.update_email_status
+        )
+        self.email_sync_manager.start()
 
     # ========================================================
     # THEME INTEGRATION
@@ -276,7 +302,7 @@ class MainWindow(QMainWindow):
                     color: {text};
                     background-color: transparent;
                     border: none;
-                    font-size: 17px;
+                    font-size: 14px;
                     font-weight: 700;
                 }}
 
@@ -301,18 +327,88 @@ class MainWindow(QMainWindow):
                     color: #FFFFFF;
                 }}
 
-                /* Librarian greeting */
+                    QLabel#VersionBadge {{
+                        background-color: {surface_alt};
+                        color: {primary};
+                        font-size: 9px;
+                        font-weight: 700;
+                        padding: 3px 7px;
+                        border-radius: 8px;
+                        border: 1px solid {border};
+                    }}
 
-                QLabel#SystemStatusBadge {{
-                    background-color: {surface_alt};
-                    color: {success};
-                    font-size: 12px;
-                    font-weight: 600;
-                    padding: 7px 14px;
-                    min-height: 20px;
-                    border-radius: 15px;
-                    border: 1px solid {border};
-                }}
+                    QLineEdit#HeaderSearch {{
+                        background-color: {input_color};
+                        color: {text};
+                        border: 1px solid {border};
+                        border-radius: 8px;
+                        padding: 7px 11px;
+                        min-height: 20px;
+                        font-size: 11px;
+                    }}
+
+                    QLineEdit#HeaderSearch:focus {{
+                        border-color: {primary};
+                    }}
+
+                    QPushButton#HeaderIssue,
+                    QPushButton#HeaderReturn,
+                    QPushButton#HeaderTheme,
+                    QPushButton#HeaderHelp {{
+                        color: #FFFFFF;
+                        border: none;
+                        border-radius: 7px;
+                        padding: 7px 10px;
+                        min-height: 20px;
+                        font-size: 10px;
+                        font-weight: 700;
+                    }}
+
+                    QPushButton#HeaderIssue {{
+                        background-color: {primary};
+                    }}
+
+                    QPushButton#HeaderIssue:hover {{
+                        background-color: {primary_hover};
+                    }}
+
+                    QPushButton#HeaderReturn {{
+                        background-color: {success};
+                    }}
+
+                    QPushButton#HeaderReturn:hover {{
+                        background-color: {colors.get('success_hover', success)};
+                    }}
+
+                    QPushButton#HeaderTheme {{
+                        background-color: {surface_alt};
+                        color: {text};
+                        border: 1px solid {border};
+                    }}
+
+                    QPushButton#HeaderTheme:hover {{
+                        border-color: {primary};
+                    }}
+
+                    QPushButton#HeaderHelp {{
+                        background-color: {surface_alt};
+                        color: {text};
+                        border: 1px solid {border};
+                    }}
+
+                    QPushButton#HeaderHelp:hover {{
+                        border-color: {primary};
+                    }}
+
+                    QLabel#SystemStatusBadge {{
+                        background-color: {surface_alt};
+                        color: {success};
+                        font-size: 10px;
+                        font-weight: 700;
+                        padding: 6px 10px;
+                        border-radius: 12px;
+                        border: 1px solid {border};
+                    }}
 
                 /* Sidebar */
 
@@ -399,6 +495,11 @@ class MainWindow(QMainWindow):
 
             """)
 
+            if hasattr(self, "theme_button"):
+                self.theme_button.setText(
+                    "☀ Light" if active_theme == "Dark" else "☾ Dark"
+                )
+
             # Update the shell background palette.
             self.setAutoFillBackground(True)
 
@@ -468,6 +569,40 @@ class MainWindow(QMainWindow):
 
         self.create_topbar(main_layout)
         self.create_content_area(main_layout)
+        search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        search_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        search_shortcut.activated.connect(
+            self.global_search_input.setFocus
+        )
+        self._global_search_shortcut = search_shortcut
+
+        self._application_shortcuts = []
+        shortcut_actions = (
+            ("Ctrl+I", self.dashboard_view.open_issue_dialog),
+            ("Ctrl+R", self.dashboard_view.open_return_dialog),
+            ("Ctrl+B", self.dashboard_view.open_bookform),
+            ("Ctrl+U", self.dashboard_view.open_userform),
+            ("Ctrl+G", self.dashboard_view.open_bargenerate_form),
+            ("Ctrl+Shift+K", self.dashboard_view.open_quick_scan),
+            ("Ctrl+H", self.dashboard_view.open_activity_history),
+            ("F5", self.dashboard_view.refresh_dashboard),
+        )
+        for sequence, callback in shortcut_actions:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(
+                Qt.ShortcutContext.ApplicationShortcut
+            )
+            shortcut.activated.connect(callback)
+            self._application_shortcuts.append(shortcut)
+
+        help_shortcut = QShortcut(QKeySequence("F1"), self)
+        help_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        help_shortcut.activated.connect(self.show_help)
+        self._help_shortcut = help_shortcut
 
     # ========================================================
     # TOPBAR
@@ -481,17 +616,17 @@ class MainWindow(QMainWindow):
             "TopBar"
         )
 
-        topbar.setFixedHeight(72)
+        topbar.setFixedHeight(60)
 
         top_layout = QHBoxLayout(
             topbar
         )
 
         top_layout.setContentsMargins(
-            18, 0, 24, 0
+            14, 0, 16, 0
         )
 
-        top_layout.setSpacing(15)
+        top_layout.setSpacing(9)
 
         # Sidebar toggle
 
@@ -502,7 +637,7 @@ class MainWindow(QMainWindow):
         )
 
         self.toggle_btn.setFixedSize(
-            42, 42
+            36, 36
         )
 
         self.toggle_btn.setCursor(
@@ -538,7 +673,7 @@ class MainWindow(QMainWindow):
         title_label.setFont(
             QFont(
                 "Segoe UI",
-                16,
+                13,
                 QFont.Weight.Bold
             )
         )
@@ -547,13 +682,97 @@ class MainWindow(QMainWindow):
             title_label
         )
 
-        top_layout.addStretch()
+        version_badge = QLabel(f"v{get_app_version()}")
+        version_badge.setObjectName("VersionBadge")
+        top_layout.addWidget(version_badge)
 
-        # Librarian greeting
-
-        self.status_badge = QLabel(
-            "● Hi, Librarian!"
+        self.global_search_input = QLineEdit()
+        self.global_search_input.setObjectName("HeaderSearch")
+        self.global_search_input.setPlaceholderText(
+            "Search books, Roll No (e.g., 24001-CS-097), author, or ISBN..."
         )
+        self.global_search_input.setClearButtonEnabled(True)
+        self.global_search_input.setMinimumWidth(200)
+        self.global_search_input.textChanged.connect(
+            self._schedule_search_suggestions
+        )
+        self.global_search_input.returnPressed.connect(
+            self._search_from_header
+        )
+        top_layout.addWidget(self.global_search_input, 1)
+
+        self.search_suggestions = QFrame(self)
+        self.search_suggestions.setObjectName(
+            "GlobalSearchSuggestions"
+        )
+        self.search_suggestions.hide()
+        self.search_suggestions.setFocusPolicy(
+            Qt.FocusPolicy.NoFocus
+        )
+        self.search_suggestions.setAttribute(
+            Qt.WidgetAttribute.WA_ShowWithoutActivating,
+            True,
+        )
+        self.search_suggestions.setMinimumWidth(340)
+        self.search_suggestions.setMaximumHeight(360)
+        self.search_suggestions_scroll = QScrollArea(
+            self.search_suggestions
+        )
+        self.search_suggestions_scroll.setWidgetResizable(True)
+        self.search_suggestions_scroll.setFrameShape(
+            QFrame.Shape.NoFrame
+        )
+        self.search_suggestions_scroll.setFocusPolicy(
+            Qt.FocusPolicy.NoFocus
+        )
+        self.search_suggestions_scroll.setMaximumHeight(348)
+        self.search_suggestions_content = QWidget()
+        self.search_suggestions_layout = QVBoxLayout(
+            self.search_suggestions_content
+        )
+        self.search_suggestions_layout.setContentsMargins(0, 0, 0, 0)
+        self.search_suggestions_layout.setSpacing(3)
+        self.search_suggestions_scroll.setWidget(
+            self.search_suggestions_content
+        )
+        self.search_suggestions_outer_layout = QVBoxLayout(
+            self.search_suggestions
+        )
+        self.search_suggestions_outer_layout.setContentsMargins(
+            6, 6, 6, 6
+        )
+        self.search_suggestions_outer_layout.addWidget(
+            self.search_suggestions_scroll
+        )
+
+        self.issue_header_button = QPushButton("+ Issue Book")
+        self.issue_header_button.setObjectName("HeaderIssue")
+        self.issue_header_button.clicked.connect(
+            self._issue_from_header
+        )
+        top_layout.addWidget(self.issue_header_button)
+
+        self.return_header_button = QPushButton("Return Book")
+        self.return_header_button.setObjectName("HeaderReturn")
+        self.return_header_button.clicked.connect(
+            self._return_from_header
+        )
+        top_layout.addWidget(self.return_header_button)
+
+        self.theme_button = QPushButton("☀ Light")
+        self.theme_button.setObjectName("HeaderTheme")
+        self.theme_button.clicked.connect(
+            self._toggle_theme_from_header
+        )
+        top_layout.addWidget(self.theme_button)
+
+        self.help_button = QPushButton("Help")
+        self.help_button.setObjectName("HeaderHelp")
+        self.help_button.setToolTip("Open application help (F1)")
+        self.help_button.clicked.connect(self.show_help)
+        top_layout.addWidget(self.help_button)
+
+        self.status_badge = QLabel("● Email sync checking")
 
         self.status_badge.setObjectName(
             "SystemStatusBadge"
@@ -570,6 +789,188 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(
             topbar
         )
+
+    def update_email_status(self, message):
+        self.status_badge.setText(f"● {message}")
+        if message.startswith("Email sync active"):
+            color = "#16A34A"
+        elif message.startswith("Email sync running"):
+            color = "#2563EB"
+        else:
+            color = "#D97706"
+        self.status_badge.setStyleSheet(
+            f"QLabel#SystemStatusBadge {{ color: {color}; }}"
+        )
+
+    def _search_from_header(self):
+        self._search_debounce_timer.stop()
+        self._update_search_suggestions()
+        if self._search_results:
+            self._open_global_search_result(self._search_results[0])
+
+    def _schedule_search_suggestions(self, text):
+        if not text.strip():
+            self._search_debounce_timer.stop()
+            self._search_results = []
+            self.search_suggestions.hide()
+            return
+        self._search_debounce_timer.start()
+
+    def _update_search_suggestions(self):
+        query = self.global_search_input.text().strip()
+        if not query:
+            self.search_suggestions.hide()
+            return
+
+        try:
+            self._search_results = (
+                self.dashboard_view.search_global_records(query)
+            )
+            message = (
+                "No matching books, members, or transactions."
+                if not self._search_results else None
+            )
+        except Exception as error:
+            self._search_results = []
+            message = f"Search unavailable: {error}"
+
+        self._render_search_suggestions(message)
+
+    def _render_search_suggestions(self, message=None):
+        while self.search_suggestions_layout.count():
+            item = self.search_suggestions_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        colors = self.get_theme_colors()
+        self.search_suggestions.setStyleSheet(f"""
+            QFrame#GlobalSearchSuggestions {{
+                background-color: {colors['surface']};
+                border: 1px solid {colors['border']};
+                border-radius: 9px;
+            }}
+            QPushButton#GlobalSearchResult {{
+                background-color: transparent;
+                color: {colors['text']};
+                border: none;
+                border-radius: 6px;
+                text-align: left;
+                padding: 8px 10px;
+                min-height: 42px;
+                font-size: 11px;
+            }}
+            QPushButton#GlobalSearchResult:hover {{
+                background-color: {colors['surface_alt']};
+            }}
+            QLabel#GlobalSearchMessage {{
+                color: {colors['muted']};
+                padding: 10px;
+                font-size: 11px;
+            }}
+        """)
+
+        if message:
+            label = QLabel(message)
+            label.setObjectName("GlobalSearchMessage")
+            label.setWordWrap(True)
+            self.search_suggestions_layout.addWidget(label)
+        else:
+            for result in self._search_results:
+                button = QPushButton(
+                    f"{result['title']}\n{result['description']}"
+                )
+                button.setObjectName("GlobalSearchResult")
+                button.setCursor(
+                    Qt.CursorShape.PointingHandCursor
+                )
+                button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                button.clicked.connect(
+                    lambda _checked=False, selected=result:
+                    self._open_global_search_result(selected)
+                )
+                self.search_suggestions_layout.addWidget(button)
+
+        result_count = self.search_suggestions_layout.count()
+        self.search_suggestions_scroll.setFixedHeight(
+            min(348, max(58, result_count * 58))
+        )
+        popup_width = max(340, self.global_search_input.width())
+        screen = self.screen()
+        if screen:
+            popup_width = min(
+                popup_width,
+                screen.availableGeometry().width(),
+            )
+        self.search_suggestions.setFixedWidth(popup_width)
+        self.search_suggestions.adjustSize()
+        anchor = self.mapFromGlobal(
+            self.global_search_input.mapToGlobal(
+                QPoint(0, self.global_search_input.height())
+            )
+        )
+        anchor.setX(
+            max(
+                0,
+                min(
+                    anchor.x(),
+                    self.width() - self.search_suggestions.width(),
+                ),
+            )
+        )
+        self.search_suggestions.move(anchor)
+        self.search_suggestions.raise_()
+        self.search_suggestions.show()
+
+    def _open_global_search_result(self, result):
+        self.global_search_input.setText(result["id"])
+        self._search_debounce_timer.stop()
+        self._search_results = []
+        self.search_suggestions.hide()
+
+        page_index = result["page"]
+        self.switch_page(page_index)
+
+        if page_index == 1:
+            page = self.catalog_view
+            page.set_catalog_filter("ALL")
+            page.search_input.setText(result["id"])
+            page.select_book_by_id(result["id"])
+        elif page_index == 2:
+            page = self.usermanagement_view
+            page.set_user_filter("ALL")
+            page.branch_combo.setCurrentIndex(0)
+            page.search_input.setText(result["id"])
+            self._select_table_row_by_id(page, result["id"])
+        elif page_index == 3:
+            page = self.circulation_view
+            page.set_status_filter("ALL")
+            page.search_input.setText(result["id"])
+            self._select_table_row_by_id(page, result["id"])
+
+    @staticmethod
+    def _select_table_row_by_id(page, record_id):
+        for row in range(page.table.rowCount()):
+            item = page.table.item(row, 0)
+            if item and item.text() == str(record_id):
+                page.table.selectRow(row)
+                page.table.scrollToItem(item)
+                return
+
+    def _issue_from_header(self):
+        if hasattr(self, "dashboard_view"):
+            self.dashboard_view.open_issue_dialog()
+
+    def _return_from_header(self):
+        if hasattr(self, "dashboard_view"):
+            self.dashboard_view.open_return_dialog()
+
+    def _toggle_theme_from_header(self):
+        if hasattr(self, "dashboard_view"):
+            self.dashboard_view.toggle_theme()
+
+    def show_help(self):
+        HelpDialog(self).exec()
 
     # ========================================================
     # CONTENT AREA
@@ -911,6 +1312,8 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(
             index
         )
+
+        self.refresh_page(index)
 
         for button, button_index in self.nav_buttons:
 

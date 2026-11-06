@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from secure_storage import read_secret, store_secret
@@ -231,22 +231,23 @@ def upload_encrypted_database_backup(db, client_secret_file=None):
         filename = (
             f"library-backup-{datetime.datetime.now():%Y%m%d-%H%M%S}.clbk"
         )
-        media = MediaFileUpload(
-            os.fspath(encrypted_path),
-            mimetype="application/octet-stream",
-            resumable=True,
-        )
-        result = drive.files().create(
-            body={
-                "name": filename,
-                "description": (
-                    "Encrypted campus library SQLite backup. "
-                    "The decryption key is stored in this Windows account's "
-                    "Credential Manager."
-                ),
-            },
-            media_body=media,
-            fields="id,name",
-        ).execute()
+        with encrypted_path.open("rb") as encrypted_file:
+            media = MediaIoBaseUpload(
+                encrypted_file,
+                mimetype="application/octet-stream",
+                resumable=True,
+            )
+            result = drive.files().create(
+                body={
+                    "name": filename,
+                    "description": (
+                        "Encrypted campus library SQLite backup. "
+                        "The decryption key is stored in this Windows account's "
+                        "Credential Manager."
+                    ),
+                },
+                media_body=media,
+                fields="id,name",
+            ).execute()
 
     return result

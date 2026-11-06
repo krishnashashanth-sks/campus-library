@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QTabWidget, QSpacerItem
 )
 
-from utils import clear_layout
+from utils import clear_layout, rgba_color
 from dialogs import IssueBookDialog, ReturnBookDialog
 
 
@@ -32,7 +32,7 @@ class ClickableMetricCard(QFrame):
 
         self.setObjectName("MetricCard")
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.setMinimumHeight(94)
+        self.setMinimumHeight(100)
         self.setSizePolicy(
             QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Fixed
@@ -84,10 +84,13 @@ class ClickableMetricCard(QFrame):
         text = c.get("text", "#E8EEF8")
         muted = c.get("muted", "#94A3B8")
 
-        border_color = self.accent if self.selected else border
-        background = (
-            c.get("surface_alt", "#17243A")
-            if self.selected else surface
+        border_color = self.accent if self.selected else rgba_color(
+            self.accent,
+            0.48,
+        )
+        background = rgba_color(
+            self.accent,
+            0.20 if self.selected else 0.09,
         )
 
         self.setStyleSheet(f"""
@@ -95,7 +98,7 @@ class ClickableMetricCard(QFrame):
                 background-color: {background};
                 border: 1px solid {border_color};
                 border-left: 4px solid {self.accent};
-                border-radius: 9px;
+                border-radius: 10px;
             }}
             QFrame#MetricCard:hover {{
                 border: 1px solid {self.accent};
@@ -109,7 +112,7 @@ class ClickableMetricCard(QFrame):
             }}
             QLabel#MetricValue {{
                 color: {self.accent};
-                font-size: 24px;
+                font-size: 23px;
                 font-weight: 800;
                 background: transparent;
             }}
@@ -233,7 +236,7 @@ class CirculationView(QWidget):
             QLabel#PageTitle {{
                 color: {c['text']};
                 font-size: 23px;
-                font-weight: 750;
+                font-weight: 700;
                 background: transparent;
             }}
 
@@ -285,8 +288,8 @@ class CirculationView(QWidget):
                 background-color: {c['input']};
                 color: {c['text']};
                 border: 1px solid {c['border']};
-                border-radius: 7px;
-                padding: 9px 12px;
+                border-radius: 8px;
+                padding: 8px 10px;
                 font-size: 12px;
             }}
 
@@ -358,7 +361,7 @@ class CirculationView(QWidget):
 
             QLabel#SectionTitle {{
                 color: {c['text']};
-                font-size: 13px;
+                font-size: 14px;
                 font-weight: 700;
                 background: transparent;
             }}
@@ -368,14 +371,14 @@ class CirculationView(QWidget):
                 alternate-background-color: {c['surface_alt']};
                 color: {c['text']};
                 border: 1px solid {c['border']};
-                border-radius: 9px;
+                border-radius: 10px;
                 selection-background-color: {c['selection']};
                 selection-color: white;
                 outline: none;
             }}
 
             QTableWidget#CirculationTable::item {{
-                padding: 8px;
+                padding: 7px 9px;
                 border-bottom: 1px solid {c['border']};
             }}
 
@@ -384,7 +387,7 @@ class CirculationView(QWidget):
                 color: {c['muted']};
                 border: none;
                 border-bottom: 1px solid {c['border']};
-                padding: 11px 8px;
+                padding: 10px 10px;
                 font-size: 11px;
                 font-weight: 700;
             }}
@@ -441,7 +444,7 @@ class CirculationView(QWidget):
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setContentsMargins(20, 16, 20, 16)
         main_layout.setSpacing(12)
 
         # HEADER
@@ -648,7 +651,7 @@ class CirculationView(QWidget):
         self.table.setMouseTracking(True)
         self.table.viewport().setMouseTracking(True)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(42)
+        self.table.verticalHeader().setDefaultSectionSize(44)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(

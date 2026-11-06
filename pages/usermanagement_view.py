@@ -10,7 +10,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from PyQt6.QtCore import QEvent, QPoint, Qt
+from PyQt6.QtCore import QEvent, QItemSelectionModel, QPoint, Qt
 from PyQt6.QtGui import QColor, QCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -41,8 +41,16 @@ from dialogs import (
     ComplaintManagementDialog,
     UserDialog,
     ViewBooksDialog,
+    BatchCirculationDialog,
+    CustomEmailDialog,
 )
-from utils import clear_layout
+from utils import (
+    clear_layout,
+    is_valid_phone_number,
+    is_valid_user_id,
+    normalize_user_role,
+    rgba_color,
+)
 
 
 # ============================================================
@@ -73,7 +81,7 @@ class ClickableMetricCard(QFrame):
             QCursor(Qt.CursorShape.PointingHandCursor)
         )
 
-        self.setMinimumHeight(84)
+        self.setMinimumHeight(100)
         self.setSizePolicy(
             QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Fixed,
@@ -81,7 +89,7 @@ class ClickableMetricCard(QFrame):
         self.setMinimumWidth(0)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(4)
 
         self.lbl_title = QLabel(title)
@@ -110,19 +118,21 @@ class ClickableMetricCard(QFrame):
         self.apply_style()
 
     def apply_style(self):
-        if self.selected:
-            background = "palette(alternate-base)"
-            border = self.accent
-        else:
-            background = "palette(base)"
-            border = "palette(mid)"
+        background = rgba_color(
+            self.accent,
+            0.20 if self.selected else 0.09,
+        )
+        border = self.accent if self.selected else rgba_color(
+            self.accent,
+            0.48,
+        )
 
         self.setStyleSheet(f"""
             QFrame#MetricCard {{
                 background-color: {background};
                 border: 1px solid {border};
                 border-left: 4px solid {self.accent};
-                border-radius: 9px;
+                border-radius: 10px;
             }}
 
             QFrame#MetricCard:hover {{
@@ -405,7 +415,7 @@ class UserManagementView(QWidget):
             QFrame#MetricCard {{
                 background-color: {c["surface"]};
                 border: 1px solid {c["border"]};
-                border-radius: 9px;
+                border-radius: 10px;
             }}
 
             QLabel#MetricTitle {{
@@ -458,7 +468,7 @@ class UserManagementView(QWidget):
                 color: {c["text"]};
                 border: 1px solid {c["border"]};
                 border-radius: 7px;
-                padding: 8px 11px;
+                padding: 8px 10px;
                 min-height: 20px;
                 selection-background-color: {c["selection"]};
             }}
@@ -555,7 +565,7 @@ class UserManagementView(QWidget):
             }}
 
             QTableWidget::item {{
-                padding: 8px;
+                padding: 7px 9px;
                 border-bottom: 1px solid {c["border"]};
             }}
 
@@ -566,7 +576,7 @@ class UserManagementView(QWidget):
                 font-size: 11px;
                 border: none;
                 border-bottom: 1px solid {c["border"]};
-                padding: 11px 8px;
+                padding: 10px 10px;
             }}
 
             QTabWidget::pane {{
@@ -627,7 +637,7 @@ class UserManagementView(QWidget):
         main_layout = QVBoxLayout(self)
 
         main_layout.setContentsMargins(
-            18, 16, 18, 16
+            20, 16, 20, 16
         )
 
         main_layout.setSpacing(12)
@@ -670,7 +680,7 @@ class UserManagementView(QWidget):
 
         self.refresh_btn = QPushButton("↻ Refresh")
         self.refresh_btn.setObjectName("SecondaryButton")
-        self.refresh_btn.setMinimumHeight(35)
+        self.refresh_btn.setMinimumHeight(36)
         self.refresh_btn.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
@@ -683,7 +693,7 @@ class UserManagementView(QWidget):
 
         self.control_center_btn = QPushButton("Hide Details")
         self.control_center_btn.setObjectName("SecondaryButton")
-        self.control_center_btn.setMinimumHeight(35)
+        self.control_center_btn.setMinimumHeight(36)
         self.control_center_btn.setToolTip(
             "Show or hide the User Control Center"
         )
@@ -738,7 +748,7 @@ class UserManagementView(QWidget):
         self.table.setSortingEnabled(False)
 
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(42)
+        self.table.verticalHeader().setDefaultSectionSize(44)
         self.table.setShowGrid(False)
 
         table_header = self.table.horizontalHeader()
@@ -1704,7 +1714,7 @@ class UserManagementView(QWidget):
             self.table.clearContents()
             self.table.setRowCount(len(rows))
 
-            row_to_reselect = -1
+            rows_to_reselect = []
             c = self.colors
 
             for row_index, row_data in enumerate(rows):
@@ -1726,11 +1736,8 @@ class UserManagementView(QWidget):
                     )
                 )
 
-                if (
-                    len(previously_selected) == 1
-                    and str(user_id) == previously_selected[0]
-                ):
-                    row_to_reselect = row_index
+                if str(user_id) in previously_selected:
+                    rows_to_reselect.append(row_index)
 
                 values = [
                     user_id,
@@ -1814,18 +1821,18 @@ class UserManagementView(QWidget):
             f"{len(rows):,} records"
         )
 
-        if row_to_reselect >= 0:
-
-            self.table.selectRow(
-                row_to_reselect
-            )
-
-            self.display_user_details(
-                previously_selected[0]
-            )
-
+        if rows_to_reselect:
+            selection_model = self.table.selectionModel()
+            selection_model.blockSignals(True)
+            for row in rows_to_reselect:
+                selection_model.select(
+                    self.table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            selection_model.blockSignals(False)
+            self.on_users_selection_changed()
         else:
-
             self.show_default_inspector()
 
     def get_selected_user_ids(self) -> List[str]:
@@ -1892,9 +1899,11 @@ class UserManagementView(QWidget):
 
         if not selected_ids:
 
+            self.tab_widget.setCurrentWidget(self.tab_overview)
             self.show_default_inspector()
 
         elif len(selected_ids) == 1:
+            self.tab_widget.setCurrentWidget(self.tab_overview)
 
             self.display_user_details(
                 selected_ids[0]
@@ -1913,6 +1922,7 @@ class UserManagementView(QWidget):
 
         clear_layout(self.overview_layout)
         clear_layout(self.actions_layout)
+        self.tab_widget.setCurrentWidget(self.tab_actions)
 
         lbl = QLabel(
             f"{len(user_ids)} users selected.\n\n"
@@ -1928,6 +1938,23 @@ class UserManagementView(QWidget):
 
         self.overview_layout.addWidget(lbl)
         self.overview_layout.addStretch()
+
+        for mode, text, object_name in (
+            ("ISSUE", "Issue a Book to Selected Users", "PrimaryButton"),
+            ("RETURN", "Return a Book from Selected Users", "SecondaryButton"),
+        ):
+            button = QPushButton(text)
+            button.setObjectName(object_name)
+            button.setMinimumHeight(34)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(
+                lambda checked=False, selected_mode=mode:
+                self.handle_batch_user_circulation(
+                    selected_mode,
+                    user_ids,
+                )
+            )
+            self.actions_layout.addWidget(button)
 
         delete_button = QPushButton(
             "Delete Selected Users"
@@ -1952,6 +1979,81 @@ class UserManagementView(QWidget):
         )
 
         self.actions_layout.addStretch()
+
+    def handle_batch_user_circulation(self, mode, user_ids=None):
+        selected_ids = user_ids or self.get_selected_user_ids()
+        if not selected_ids:
+            QMessageBox.information(
+                self,
+                "No Users Selected",
+                "Select at least one user before choosing a batch action.",
+            )
+            return
+
+        dialog = BatchCirculationDialog(
+            self.db,
+            mode,
+            selected_ids,
+            "users",
+            self,
+        )
+        if not dialog.exec():
+            return
+
+        book_id, days = dialog.get_data()
+        operation = "issue" if mode == "ISSUE" else "return"
+        answer = QMessageBox.question(
+            self,
+            f"Confirm Batch {operation.title()}",
+            f"{operation.title()} Book ID '{book_id}' "
+            f"for {len(selected_ids)} selected users?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        succeeded = []
+        failed = []
+        for user_id in selected_ids:
+            try:
+                if mode == "ISSUE":
+                    result = self.db.issue_book(
+                        book_id,
+                        user_id,
+                        days,
+                    )
+                    if not isinstance(result, tuple) or len(result) < 2:
+                        raise ValueError("Unexpected issue_book() response.")
+                    success, detail = result[0], result[1]
+                else:
+                    result = self.db.return_book(book_id, user_id)
+                    if not isinstance(result, tuple) or len(result) < 2:
+                        raise ValueError("Unexpected return_book() response.")
+                    success, detail = result[0], result[1]
+                    if success:
+                        detail = f"Fine: ₹{float(detail or 0):.2f}"
+
+                if success:
+                    succeeded.append(user_id)
+                else:
+                    failed.append(f"{user_id}: {detail}")
+            except Exception as error:
+                failed.append(f"{user_id}: {error}")
+
+        self.load_users_to_table()
+        summary = (
+            f"Completed: {len(succeeded)}\n"
+            f"Failed: {len(failed)}"
+        )
+        if failed:
+            summary += "\n\nNot completed:\n" + "\n".join(failed[:10])
+        QMessageBox.information(
+            self,
+            f"Batch {operation.title()} Results",
+            summary,
+        )
 
     def display_user_details(self, user_id: str):
 
@@ -2121,6 +2223,11 @@ class UserManagementView(QWidget):
                 "SecondaryButton",
             ),
             (
+                "Send Custom Email",
+                lambda: self.send_custom_email(user[0]),
+                "SecondaryButton",
+            ),
+            (
                 "Delete User",
                 lambda: self.delete_user(user[0]),
                 "DangerButton",
@@ -2146,6 +2253,73 @@ class UserManagementView(QWidget):
             self.actions_layout.addWidget(button)
 
         self.actions_layout.addStretch()
+
+    def send_custom_email(self, user_id):
+        try:
+            success, user = self.db.get_user_details(user_id)
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Email Lookup Failed",
+                str(error),
+            )
+            return
+
+        if not success or not user:
+            QMessageBox.warning(
+                self,
+                "User Not Found",
+                f"Could not load user '{user_id}'.",
+            )
+            return
+
+        recipient = str(user[6] or "").strip() if len(user) > 6 else ""
+        if not recipient:
+            QMessageBox.warning(
+                self,
+                "Email Address Missing",
+                "Add an email address to this user's profile before "
+                "sending a message.",
+            )
+            return
+
+        dialog = CustomEmailDialog(user[1], self)
+        if not dialog.exec():
+            return
+        subject, body = dialog.get_data()
+
+        try:
+            queue_id = self.db.enqueue_email(
+                recipient,
+                subject,
+                body,
+                "SYSTEM_ALERT",
+            )
+            if not queue_id:
+                raise RuntimeError("The message was not added to the queue.")
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Email Queue Failed",
+                str(error),
+            )
+            return
+
+        app = QApplication.instance()
+        sync_manager = (
+            getattr(app, "email_sync_manager", None)
+            if app
+            else None
+        )
+        if sync_manager:
+            sync_manager.sync_now()
+
+        QMessageBox.information(
+            self,
+            "Email Queued",
+            f"The message for {user[1]} was saved to the email queue. "
+            "It will be delivered when email sync is available.",
+        )
 
     # ========================================================
     # DOUBLE CLICK
@@ -2366,6 +2540,7 @@ class UserManagementView(QWidget):
         users_to_insert = []
         errors = []
         seen_ids = set()
+        seen_phones = {}
 
         current_date = date.today().isoformat()
 
@@ -2412,6 +2587,16 @@ class UserManagementView(QWidget):
         }
 
         try:
+            existing_success, existing_users = self.db.get_users()
+            if not existing_success:
+                raise RuntimeError(
+                    "Could not check existing user IDs and phone numbers."
+                )
+            existing_phones = {
+                str(user[2]).strip().casefold(): str(user[0]).strip().upper()
+                for user in existing_users
+                if len(user) > 2 and str(user[2] or "").strip()
+            }
 
             fieldnames = []
             rows = []
@@ -2555,22 +2740,41 @@ class UserManagementView(QWidget):
                     else ""
                 )
 
-                role = (
+                role_value = (
                     str(row.get(role_col) or "Student").strip()
                     if role_col
                     else "Student"
                 )
+                role = normalize_user_role(role_value)
 
                 department = (
-                    str(row.get(dept_col) or "General").strip()
+                    str(row.get(dept_col) or "").strip()
                     if dept_col
-                    else "General"
+                    else ""
                 )
+
+                if not role:
+                    errors.append(
+                        f"Line {line_number}: Unsupported user role "
+                        f"'{role_value}'."
+                    )
+                    continue
 
                 if not user_id or not name:
                     errors.append(
                         f"Line {line_number}: "
                         "User ID and name are required."
+                    )
+                    continue
+
+                if not is_valid_user_id(user_id, role):
+                    if role == "Student":
+                        expected_format = "24001-CS-097"
+                    else:
+                        expected_format = "CS000001"
+                    errors.append(
+                        f"Line {line_number}: Invalid ID '{user_id}' for "
+                        f"{role}; expected a format like {expected_format}."
                     )
                     continue
 
@@ -2581,14 +2785,32 @@ class UserManagementView(QWidget):
                     )
                     continue
 
-                seen_ids.add(user_id)
-
                 if len(user_id) > 100:
                     errors.append(
                         f"Line {line_number}: "
                         "User ID is too long."
                     )
                     continue
+
+                if phone and not is_valid_phone_number(phone):
+                    errors.append(
+                        f"Line {line_number}: Phone number must contain "
+                        "exactly 10 digits."
+                    )
+                    continue
+
+                if role in ("Student", "Faculty", "Guest Lecturer") and (
+                    not department
+                    or department.casefold()
+                    in {"general", "general administration", "n/a"}
+                ):
+                    errors.append(
+                        f"Line {line_number}: A branch or department is "
+                        f"required for {role}."
+                    )
+                    continue
+                if not department:
+                    department = "General Administration"
 
                 if email and (
                     "@" not in email
@@ -2601,12 +2823,31 @@ class UserManagementView(QWidget):
                     )
                     continue
 
+                phone_key = phone.casefold()
+                if phone_key:
+                    existing_owner = existing_phones.get(phone_key)
+                    if existing_owner and existing_owner != user_id:
+                        errors.append(
+                            f"Line {line_number}: Phone number is already "
+                            f"assigned to user '{existing_owner}'."
+                        )
+                        continue
+                    batch_owner = seen_phones.get(phone_key)
+                    if batch_owner and batch_owner != user_id:
+                        errors.append(
+                            f"Line {line_number}: Phone number is duplicated "
+                            f"for user '{batch_owner}' in the file."
+                        )
+                        continue
+                    seen_phones[phone_key] = user_id
+
+                seen_ids.add(user_id)
                 users_to_insert.append((
                     user_id,
                     name,
                     phone or None,
                     role or "Student",
-                    department or "General",
+                    department,
                     current_date,
                     email or None,
                 ))
@@ -2845,29 +3086,53 @@ class UserManagementView(QWidget):
             or item.text()
         )
 
-        self.table.selectRow(row)
+        selected_rows = {
+            selected.row()
+            for selected in self.table.selectionModel().selectedRows()
+        }
+        if row not in selected_rows:
+            self.table.selectRow(row)
 
         menu = QMenu(self)
 
-        view_action = menu.addAction(
-            "View Assigned Books"
-        )
+        selected_user_ids = self.get_selected_user_ids()
+        if len(selected_user_ids) > 1:
+            issue_action = menu.addAction(
+                "Issue a Book to Selected Users"
+            )
+            return_action = menu.addAction(
+                "Return a Book from Selected Users"
+            )
+            menu.addSeparator()
+            delete_action = menu.addAction("Delete Selected Users")
+            view_action = edit_action = email_action = None
+        else:
+            issue_action = return_action = None
+            view_action = menu.addAction(
+                "View Assigned Books"
+            )
 
-        edit_action = menu.addAction(
-            "Edit User Profile"
-        )
+            edit_action = menu.addAction(
+                "Edit User Profile"
+            )
+            email_action = menu.addAction(
+                "Send Custom Email"
+            )
 
-        menu.addSeparator()
+            menu.addSeparator()
 
-        delete_action = menu.addAction(
-            "Delete User"
-        )
+            delete_action = menu.addAction(
+                "Delete User"
+            )
 
         action = menu.exec(
             self.table.viewport().mapToGlobal(
                 position
             )
         )
+
+        if action is None:
+            return
 
         if action == view_action:
 
@@ -2877,9 +3142,30 @@ class UserManagementView(QWidget):
 
             self.edit_user(user_id)
 
+        elif action == email_action:
+
+            self.send_custom_email(user_id)
+
+        elif action == issue_action:
+
+            self.handle_batch_user_circulation(
+                "ISSUE",
+                selected_user_ids,
+            )
+
+        elif action == return_action:
+
+            self.handle_batch_user_circulation(
+                "RETURN",
+                selected_user_ids,
+            )
+
         elif action == delete_action:
 
-            self.delete_user(user_id)
+            if len(selected_user_ids) > 1:
+                self.handle_batch_delete(selected_user_ids)
+            else:
+                self.delete_user(user_id)
 
     # ========================================================
     # CLEANUP

@@ -62,6 +62,8 @@ campus-library/
 ├── main.py                    # Application entry point
 ├── mainwindow.py             # Main window layout and navigation
 ├── database.py               # SQLite database operations
+├── email_queue.py            # Offline email queue and background SMTP sync
+├── email_service.py          # SMTP delivery and notification payloads
 ├── dialogs.py                # Dialog windows for various operations
 ├── utils.py                  # Utility functions
 ├── pages/
@@ -133,10 +135,24 @@ password is stored in the signed-in Windows account's Credential Manager,
 not in the database. Enable due-date reminders to send one email on a loan's
 due date and one when it becomes overdue. Student email addresses can be
 entered in User Management or included in user CSV/XLSX imports.
+Registration, issue, return, reminder, and system-alert messages are first
+written to the local SQLite email queue. The background sync checks for
+connectivity at startup and every minute, but queued delivery is disabled by
+default. In **Settings**, enable it only after verifying the saved recipient
+addresses; enabling requires confirmation. When delivery is disabled, queued
+messages remain stored locally and are not sent. Use **Manage Queue** to review
+message recipients and content, filter by status, delete selected messages
+(including sent history), or clear all pending and failed messages. Deleting
+messages requires delivery to be disabled. **Sync Now** retries queued or
+previously failed messages only when delivery is enabled. SMTP
+delivery runs on a worker thread, and temporary delivery failures retry with
+backoff before being marked failed. The header and Settings page show the
+queue state.
 
 The librarian can submit and track user complaints in User Management.
-Complaints are saved locally and emailed to the configured library contact;
-this is an in-app librarian workflow, not a public student portal.
+Complaints are saved locally and notifications are added to the email queue
+for the configured library contact and, when available, the student. This is
+an in-app librarian workflow, not a public student portal.
 
 In **Settings → Encrypted Google Drive Backup**, connect with a Google OAuth
 **Desktop app** client JSON file from a Google Cloud project where the Drive
@@ -150,8 +166,8 @@ currently open database.
 Automatic daily uploads are optional and run while the application is open,
 after a successful Drive connection and when enabled in backup settings.
 Without saved Drive authorization, no automatic upload is attempted. Email
-and Drive integrations require an internet connection and are not exercised
-by offline operation.
+messages created while offline remain queued locally until connectivity is
+available; Google Drive backups still require an internet connection.
 
 ## Building a Windows EXE and Installer (PyInstaller + Inno Setup)
 
@@ -315,6 +331,71 @@ rm -rf build dist __pycache__
 Remove-Item -Recurse -Force build,dist,__pycache__
 ```
 
+## In-app Windows Updates
+
+The packaged Windows application includes **Settings → Application Updates**.
+Select **Check for Updates** to query the latest stable GitHub Release. If a
+newer release is available, confirm the update; the app downloads and validates
+`Library-Windows.zip` against GitHub's SHA-256 asset digest, closes, replaces
+its installed application folder, and restarts. The library database is stored
+outside that folder and is not part of the update package.
+If replacement fails, the helper restores and relaunches the prior build; its
+diagnostic log is `%TEMP%\LibraryUpdate.log`.
+
+To publish a Windows update:
+
+1. Set the same new numeric version in `app_version.py` and
+   `installer_scipt.iss` (for example, `2.1`), then build the application:
+
+   ```powershell
+   pyinstaller --noconfirm --clean main.spec
+   ```
+
+2. Create the updater package from the *contents* of `dist\main` so that
+   `Library.exe` is at the ZIP root:
+
+   ```powershell
+   Compress-Archive -Path .\dist\main\* `
+     -DestinationPath .\Library-Windows.zip -Force
+   ```
+
+3. On GitHub, open the repository's **Releases** page, select **Draft a new
+   release**, create a new tag such as `v2.1` targeting `main`, enter release
+   notes, and upload `Library-Windows.zip`.
+4. Publish the release as a normal/latest release, not a draft or pre-release.
+   The updater checks only the latest published stable release. Wait until the
+   uploaded asset is listed with a SHA-256 digest in the release API before
+   testing.
+5. Test from an installed older version (for example, v2.0): open **Settings →
+   Application Updates → Check for Updates**, confirm v2.1, and verify that
+   the application restarts with the new version. Keep the v2.0 installation
+   until the update and restart are confirmed.
+
+The in-app updater requires the exact asset name `Library-Windows.zip`, a
+numeric version tag newer than the installed version, and a ZIP whose root
+contains the full contents of `dist\main`, including `Library.exe`. The
+installer defaults to the current user's writable
+`%LOCALAPPDATA%\Programs\Library` folder so self-update can replace its files.
+If an older installation is under `Program Files`, install that version in the
+user folder before testing self-update. Source-code runs and non-Windows builds
+can check for updates but cannot replace themselves.
+The installed app displays its version in both the title bar and header badge.
+When the updater installs a release, it records the release tag alongside the
+application so those labels and future update checks use the installed version.
+For a new installer or manually downloaded ZIP, still update `app_version.py`
+to the release version before building.
+Administrators can use **Settings → Application Updates → Manage Versions** to
+review published stable releases and install a verified release, including an
+older release as a rollback. Each release must include `Library-Windows.zip`
+with a GitHub SHA-256 digest. Version management requires the administrator
+password; installing or rolling back is available only in the packaged
+Windows application. The installed version is recorded with the application
+files and shown in the title bar and header badge.
+Until the first stable release is published, GitHub's `/releases/latest`
+endpoint returns 404; the app reports that no release is available and links
+to the Releases page. Publish a stable release with the package above before
+expecting an update to be found.
+
 ## Default Configuration
 
 | Setting | Default Value |
@@ -335,13 +416,18 @@ Remove-Item -Recurse -Force build,dist,__pycache__
 - **Add Book**: Click "New Book" to add books to catalog
 - **Edit**: Select a book and click "Edit" to modify details
 - **Delete**: Remove books (only if no copies are currently checked out)
+- **Import CSV/XLSX**: Include `book_id`, `title`, and `publisher`; book IDs must be exactly 5 digits and title/publisher are required
 - **Generate Barcode**: Create and print barcodes for books
+- **Batch Circulation**: Select multiple books, then use the Actions tab to issue or return them for one user
 
 ### 👤 Users Details
 - **Add User**: Register new library users with department and role
 - **Edit User**: Update user information
+- **Import CSV/XLSX**: Student IDs use `24001-CS-097` format (5 digits, a 2-letter branch code, then 3 digits); employee IDs use a 2-letter branch code plus 6 digits (for example, `CS000001`). Phone numbers, when provided, must contain exactly 10 digits. Students need a branch and faculty/guest lecturers need a department.
 - **Delete**: Remove users without active checkouts
 - **View Books**: See all books borrowed by a user
+- **Batch Circulation**: Select multiple users, then use Actions to issue or return one book for each selected user
+- **Send Email**: Select one user, open Actions, and compose an email; it is queued for delivery when email sync is available
 
 ### 📤 Circulation
 - **Issue Book**: Check out books to users using barcode scan or ID entry

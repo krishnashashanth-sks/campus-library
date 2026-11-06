@@ -1,19 +1,41 @@
 import os
 import sqlite3
 import datetime
+import shutil
+import sys
+from pathlib import Path
 
-from PyQt6.QtCore import Qt, QSignalBlocker
+from PyQt6.QtCore import Qt, QSignalBlocker, QThreadPool, QTimer, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QLabel, QHBoxLayout, QVBoxLayout,
     QLineEdit, QCheckBox, QPushButton, QFileDialog,
     QMessageBox, QDoubleSpinBox, QSpinBox, QComboBox,
     QScrollArea, QFrame, QInputDialog, QApplication,
-    QGridLayout, QSizePolicy
+    QGridLayout, QSizePolicy, QProgressBar
 )
 
-from dialogs import DepartmentManagerDialog, RecoveryCodeSetupDialog
-from email_service import LibraryEmailService, SMTP_CREDENTIAL_TARGET
+from dialogs import (
+    DepartmentManagerDialog,
+    EmailQueueManagementDialog,
+    RecoveryCodeSetupDialog,
+    VersionManagerDialog,
+)
+from email_queue import EmailTestWorker
+from email_service import SMTP_CREDENTIAL_TARGET
 from secure_storage import delete_secret, store_secret
+from app_version import get_app_version
+from update_service import (
+    PACKAGE_NAME,
+    RELEASES_PAGE_URL,
+    UpdateCheckWorker,
+    UpdateDownloadWorker,
+    VersionHistoryWorker,
+    can_replace_application,
+    is_packaged_application,
+    is_newer_version,
+    schedule_application_update,
+)
 
 
 class SettingsView(QWidget):
@@ -33,6 +55,10 @@ class SettingsView(QWidget):
         self._loading_settings = False
         self._saving_settings = False
         self._theme_manager = None
+        self._update_pool = QThreadPool(self)
+        self._update_worker = None
+        self._pending_update = None
+        self._email_test_worker = None
 
         self.setObjectName("SettingsView")
 
@@ -401,7 +427,7 @@ class SettingsView(QWidget):
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setContentsMargins(20, 16, 20, 16)
         main_layout.setSpacing(12)
 
         # Header
@@ -449,6 +475,7 @@ class SettingsView(QWidget):
         self.build_appearance_section()
         self.build_circulation_section()
         self.build_email_section()
+        self.build_update_section()
         self.build_database_section()
         self.build_cloud_backup_section()
         self.build_security_section()
@@ -671,7 +698,8 @@ class SettingsView(QWidget):
             self.create_section_header(
                 "Email Notifications & Complaints",
                 "Send due-date reminders to users and forward submitted "
-                "complaints to the library contact.",
+                "complaints to the library contact. Pause delivery and review "
+                "or remove queued messages at any time.",
             )
         )
 
@@ -738,15 +766,380 @@ class SettingsView(QWidget):
         self.email_reminders_checkbox = QCheckBox(
             "Send one reminder on the due date and one when a loan becomes overdue"
         )
+        self.email_delivery_checkbox = QCheckBox(
+            "Enable sending queued emails to recipient addresses"
+        )
+        self.email_delivery_checkbox.setToolTip(
+            "Only enable after confirming all queued recipient addresses are "
+            "real and intended. Fake test-user addresses will fail delivery."
+        )
+        self.email_delivery_checkbox.toggled.connect(
+            self.set_email_delivery_enabled
+        )
         layout.addWidget(
-            self.email_reminders_checkbox,
+            self.email_delivery_checkbox,
             5,
             0,
             1,
             2,
         )
+        layout.addWidget(
+            self.email_reminders_checkbox,
+            6,
+            0,
+            1,
+            2,
+        )
+
+        queue_actions = QHBoxLayout()
+        self.email_queue_status = QLabel("Email queue status unavailable")
+        self.email_queue_status.setObjectName("MutedLabel")
+        self.sync_email_btn = self.create_button(
+            "Sync Now",
+            "SecondaryButton",
+        )
+        self.sync_email_btn.setEnabled(
+            self.email_delivery_checkbox.isChecked()
+        )
+        self.sync_email_btn.clicked.connect(self.sync_email_queue)
+        self.manage_email_queue_btn = self.create_button(
+            "Manage Queue",
+            "SecondaryButton",
+        )
+        self.manage_email_queue_btn.clicked.connect(
+            self.manage_email_queue
+        )
+        queue_actions.addWidget(self.email_queue_status, 1)
+        queue_actions.addWidget(self.manage_email_queue_btn)
+        queue_actions.addWidget(self.sync_email_btn)
+        layout.addLayout(queue_actions, 7, 0, 1, 2)
+
+        app = QApplication.instance()
+        self._email_sync_manager = (
+            getattr(app, "email_sync_manager", None) if app else None
+        )
+        if self._email_sync_manager:
+            self._email_sync_manager.status_changed.connect(
+                self.email_queue_status.setText
+            )
+            self._email_sync_manager.refresh_status()
 
         self.content_layout.addWidget(card)
+
+    def sync_email_queue(self):
+        manager = self._email_sync_manager
+        if manager:
+            manager.retry_failed_now()
+        else:
+            QMessageBox.warning(
+                self,
+                "Email Sync Unavailable",
+                "The background email service is not available.",
+            )
+
+    def manage_email_queue(self):
+        dialog = EmailQueueManagementDialog(self.db, self)
+        dialog.exec()
+        if self._email_sync_manager:
+            self._email_sync_manager.refresh_status()
+
+    def build_update_section(self):
+        self.content_layout.addWidget(
+            self.create_section_header(
+                "Application Updates",
+                "Check for a newer Windows build and update from within "
+                "the application.",
+            )
+        )
+
+        card = self.create_card_frame()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 17, 18, 17)
+        layout.setSpacing(10)
+
+        description = QLabel(
+            f"Installed version: {get_app_version()}. Update checks use the "
+            "official GitHub Releases page. A downloaded update is "
+            "validated and applied after you confirm; the application "
+            "will close and restart."
+        )
+        description.setObjectName("MutedLabel")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        actions = QHBoxLayout()
+        self.update_status_label = QLabel("Ready to check for updates")
+        self.update_status_label.setObjectName("MutedLabel")
+        self.update_button = self.create_button(
+            "Check for Updates",
+            "SecondaryButton",
+        )
+        self.update_button.clicked.connect(self.check_for_updates)
+        actions.addWidget(self.update_status_label, 1)
+        actions.addWidget(self.update_button)
+        self.manage_versions_button = self.create_button(
+            "Manage Versions",
+            "SecondaryButton",
+        )
+        self.manage_versions_button.clicked.connect(
+            self.manage_application_versions
+        )
+        actions.addWidget(self.manage_versions_button)
+        layout.addLayout(actions)
+
+        self.update_progress_bar = QProgressBar()
+        self.update_progress_bar.setRange(0, 100)
+        self.update_progress_bar.setValue(0)
+        self.update_progress_bar.setTextVisible(True)
+        self.update_progress_bar.hide()
+        layout.addWidget(self.update_progress_bar)
+
+        self.content_layout.addWidget(card)
+
+    def check_for_updates(self):
+        if self._update_worker is not None:
+            return
+
+        self.update_button.setEnabled(False)
+        self.update_status_label.setText("Checking for updates...")
+        worker = UpdateCheckWorker()
+        worker.signals.finished.connect(
+            self._on_update_check_finished
+        )
+        self._update_worker = worker
+        self._update_pool.start(worker)
+
+    def manage_application_versions(self):
+        if self._update_worker is not None:
+            return
+        if not self.verify_admin_password(
+            "Administrator Authorization",
+            "Enter the administrator password to manage application versions:",
+        ):
+            return
+
+        self.update_button.setEnabled(False)
+        self.manage_versions_button.setEnabled(False)
+        self.update_status_label.setText("Loading published versions...")
+        worker = VersionHistoryWorker()
+        worker.signals.finished.connect(
+            self._on_version_history_finished
+        )
+        self._update_worker = worker
+        self._update_pool.start(worker)
+
+    def _on_version_history_finished(self, result):
+        self._update_worker = None
+        self.update_button.setEnabled(True)
+        self.manage_versions_button.setEnabled(True)
+        if result.get("error"):
+            self.update_status_label.setText(
+                "Could not load published versions"
+            )
+            QMessageBox.warning(
+                self,
+                "Version History Failed",
+                f"Could not load published versions:\n{result['error']}",
+            )
+            return
+
+        can_install = is_packaged_application() and can_replace_application(
+            Path(sys.executable).resolve().parent
+        )
+        dialog = VersionManagerDialog(
+            result.get("releases", []),
+            result.get("current_version", get_app_version()),
+            can_install,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.update_status_label.setText(
+                f"Installed version: v{get_app_version()}"
+            )
+            return
+
+        selected_release = dialog.selected_release
+        if selected_release:
+            self._on_update_check_finished(selected_release)
+
+    def _on_update_check_finished(self, result):
+        self._update_worker = None
+        self.update_button.setEnabled(True)
+
+        if result.get("error"):
+            self.update_status_label.setText("Update check failed")
+            QMessageBox.warning(
+                self,
+                "Update Check Failed",
+                f"Could not check for updates:\n{result['error']}",
+            )
+            return
+
+        if result.get("release_not_published"):
+            self.update_status_label.setText(
+                "No published update is available"
+            )
+            message = QMessageBox(self)
+            message.setWindowTitle("No Published Update")
+            message.setIcon(QMessageBox.Icon.Information)
+            message.setText(
+                "GitHub has no published stable release for this app yet. "
+                "The updater can check again after a release is published "
+                f"with the {PACKAGE_NAME} package."
+            )
+            open_releases = message.addButton(
+                "Open GitHub Releases",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            message.addButton(
+                QMessageBox.StandardButton.Close
+            )
+            message.exec()
+            if message.clickedButton() is open_releases:
+                QDesktopServices.openUrl(QUrl(RELEASES_PAGE_URL))
+            return
+
+        current_version = get_app_version()
+        latest_version = result.get("latest_version", current_version)
+        if not result.get("available"):
+            self.update_status_label.setText(
+                f"You are up to date (v{current_version})"
+            )
+            QMessageBox.information(
+                self,
+                "No Updates Available",
+                f"You are running the latest version ({current_version}).",
+            )
+            return
+
+        self.update_status_label.setText(
+            f"Update available: v{latest_version}"
+        )
+        if not is_packaged_application():
+            self.update_status_label.setText(
+                f"Update available: v{latest_version} "
+                "(packaged Windows app required)"
+            )
+            QMessageBox.information(
+                self,
+                "Update Available",
+                "A newer release is available. Automatic replacement "
+                "works only in the packaged Windows application.",
+            )
+            return
+
+        if not can_replace_application(
+            Path(sys.executable).resolve().parent
+        ):
+            QMessageBox.warning(
+                self,
+                "Update Permission Required",
+                "Windows does not allow this account to replace the "
+                "application files. Reinstall the application in a "
+                "writable user folder before updating.",
+            )
+            return
+
+        notes = result.get("release_notes", "").strip()
+        if result.get("version_selection"):
+            action = (
+                "upgrade to"
+                if is_newer_version(latest_version, current_version)
+                else "roll back to"
+            )
+            message = (
+                f"Version {latest_version} is selected. Do you want to "
+                f"{action} this release? The application will close and "
+                "restart."
+            )
+        else:
+            message = (
+                f"Version {latest_version} is available.\n\n"
+                "Install it now? The application will close and restart."
+            )
+        if notes:
+            message += f"\n\nRelease notes:\n{notes[:2500]}"
+
+        answer = QMessageBox.question(
+            self,
+            "Application Update Available",
+            message,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.update_status_label.setText(
+                f"Update available: v{latest_version}"
+            )
+            return
+
+        self._pending_update = result
+        self.update_button.setEnabled(False)
+        self.update_status_label.setText("Downloading update...")
+        self.update_progress_bar.setRange(0, 0)
+        self.update_progress_bar.show()
+        worker = UpdateDownloadWorker(result)
+        worker.signals.progress.connect(
+            self._on_update_progress
+        )
+        worker.signals.finished.connect(
+            self._on_update_download_finished
+        )
+        self._update_worker = worker
+        self._update_pool.start(worker)
+
+    def _on_update_progress(self, progress):
+        if self.update_progress_bar.minimum() != 0:
+            return
+        if self.update_progress_bar.maximum() == 0:
+            self.update_progress_bar.setRange(0, 100)
+        self.update_progress_bar.setValue(progress)
+
+    def _on_update_download_finished(self, result):
+        self._update_worker = None
+        self.update_progress_bar.hide()
+        self.update_button.setEnabled(True)
+
+        if result.get("error"):
+            self._pending_update = None
+            self.update_status_label.setText("Update download failed")
+            QMessageBox.warning(
+                self,
+                "Update Download Failed",
+                f"The update was not applied:\n{result['error']}",
+            )
+            return
+
+        staged_path = result["staged_path"]
+        try:
+            schedule_application_update(staged_path)
+        except Exception as error:
+            shutil.rmtree(
+                Path(staged_path).parent,
+                ignore_errors=True,
+            )
+            self._pending_update = None
+            self.update_status_label.setText("Update could not be applied")
+            QMessageBox.critical(
+                self,
+                "Update Could Not Be Applied",
+                str(error),
+            )
+            return
+
+        latest_version = (
+            self._pending_update.get("latest_version", "new version")
+            if self._pending_update
+            else "new version"
+        )
+        self._pending_update = None
+        self.update_status_label.setText(
+            f"Installing v{latest_version} and restarting..."
+        )
+        application = QApplication.instance()
+        if application:
+            QTimer.singleShot(400, application.quit)
 
     def build_cloud_backup_section(self):
         self.content_layout.addWidget(
@@ -813,7 +1206,7 @@ class SettingsView(QWidget):
         layout.addLayout(actions)
         self.content_layout.addWidget(card)
 
-    def save_email_settings(self):
+    def save_email_settings(self, show_confirmation=True):
         sender = self.email_sender_input.text().strip().casefold()
         library_contact = (
             self.library_contact_input.text().strip().casefold()
@@ -855,12 +1248,13 @@ class SettingsView(QWidget):
                     raise RuntimeError(f"Unable to save {key}.")
 
             self.smtp_app_password_input.clear()
-            QMessageBox.information(
-                self,
-                "Email Settings Saved",
-                "Email settings saved. The app password is protected "
-                "by Windows Credential Manager.",
-            )
+            if show_confirmation:
+                QMessageBox.information(
+                    self,
+                    "Email Settings Saved",
+                    "Email settings saved. The app password is protected "
+                    "by Windows Credential Manager.",
+                )
             return True
         except Exception as error:
             QMessageBox.critical(
@@ -869,6 +1263,72 @@ class SettingsView(QWidget):
                 str(error),
             )
             return False
+
+    def set_email_delivery_enabled(self, enabled):
+        if self._loading_settings:
+            return
+
+        if enabled:
+            try:
+                counts = self.db.get_email_queue_counts()
+                queued = counts["pending"] + counts["failed"]
+            except Exception as error:
+                self._set_email_delivery_checkbox(False)
+                QMessageBox.critical(
+                    self,
+                    "Email Queue Unavailable",
+                    str(error),
+                )
+                return
+
+            if queued:
+                queue_summary = (
+                    f"{counts['pending']} pending and {counts['failed']} "
+                    "failed email(s)"
+                )
+            else:
+                queue_summary = "No emails are currently queued"
+
+            answer = QMessageBox.warning(
+                self,
+                "Confirm Email Delivery",
+                f"{queue_summary}. Enabling delivery allows these and future "
+                "queued messages to be sent to their saved recipient "
+                "addresses. Continue only if those addresses are real and "
+                "intended; fake test-user addresses will fail delivery.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._set_email_delivery_checkbox(False)
+                return
+
+        try:
+            if not self.db.set_setting(
+                "email_delivery_enabled",
+                "1" if enabled else "0",
+            ):
+                raise RuntimeError(
+                    "Unable to save the email delivery setting."
+                )
+            self.sync_email_btn.setEnabled(enabled)
+            if self._email_sync_manager:
+                self._email_sync_manager.sync_now()
+        except Exception as error:
+            self._set_email_delivery_checkbox(not enabled)
+            QMessageBox.critical(
+                self,
+                "Email Delivery Setting Error",
+                str(error),
+            )
+
+    def _set_email_delivery_checkbox(self, enabled):
+        self.email_delivery_checkbox.blockSignals(True)
+        self.email_delivery_checkbox.setChecked(enabled)
+        self.email_delivery_checkbox.blockSignals(False)
+        if hasattr(self, "sync_email_btn"):
+            self.sync_email_btn.setEnabled(enabled)
 
     def send_test_email(self):
         if not self.email_sender_input.text().strip():
@@ -879,26 +1339,42 @@ class SettingsView(QWidget):
             )
             return
 
-        if not self.save_email_settings():
+        if self._email_test_worker is not None:
+            return
+        if not self.save_email_settings(show_confirmation=False):
             return
 
-        try:
-            LibraryEmailService(self.db).send(
-                self.email_sender_input.text().strip(),
-                "Library email configuration test",
-                "Your library email service is configured successfully.",
-            )
+        worker = EmailTestWorker(self.db.database_path)
+        worker.signals.finished.connect(
+            self._on_test_email_finished
+        )
+        self._email_test_worker = worker
+        self.test_email_btn.setEnabled(False)
+        self.update_status_label_if_available(
+            "Sending test email to the configured sender..."
+        )
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_test_email_finished(self, result):
+        self._email_test_worker = None
+        self.test_email_btn.setEnabled(True)
+        if result.get("sent"):
             QMessageBox.information(
                 self,
                 "Test Email Sent",
-                "A test email was sent to the configured Gmail sender.",
+                "The test email was sent directly to the configured Gmail "
+                "sender. The queued user emails were not sent.",
             )
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Email Test Failed",
-                str(error),
-            )
+            return
+        QMessageBox.warning(
+            self,
+            "Test Email Failed",
+            f"The test email could not be sent:\n{result.get('error', 'Unknown error')}",
+        )
+
+    def update_status_label_if_available(self, message):
+        if hasattr(self, "email_queue_status"):
+            self.email_queue_status.setText(message)
 
     def remove_email_secret(self):
         answer = QMessageBox.question(
@@ -1268,6 +1744,10 @@ class SettingsView(QWidget):
                 "due_email_reminders_enabled",
                 "0",
             )
+            email_delivery_enabled = self.db.get_setting(
+                "email_delivery_enabled",
+                "0",
+            )
             auto_backup_enabled = self.db.get_setting(
                 "google_drive_auto_backup_enabled",
                 "0",
@@ -1297,6 +1777,13 @@ class SettingsView(QWidget):
             self.email_reminders_checkbox.setChecked(
                 str(reminders_enabled).casefold()
                 in ("1", "true", "yes")
+            )
+            self.email_delivery_checkbox.setChecked(
+                str(email_delivery_enabled).casefold()
+                in ("1", "true", "yes")
+            )
+            self.sync_email_btn.setEnabled(
+                self.email_delivery_checkbox.isChecked()
             )
             self.auto_drive_backup_checkbox.setChecked(
                 str(auto_backup_enabled).casefold()

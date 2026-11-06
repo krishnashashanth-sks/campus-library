@@ -158,6 +158,30 @@ class LocalDatabase:
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS email_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recipient_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    trigger_type TEXT NOT NULL CHECK(
+                        trigger_type IN (
+                            'REGISTRATION', 'ISSUE', 'RETURN',
+                            'DUE_ALERT', 'SYSTEM_ALERT'
+                        )
+                    ),
+                    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(
+                        status IN ('PENDING', 'SENT', 'FAILED')
+                    ),
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    sent_at TIMESTAMP NULL,
+                    dedupe_key TEXT UNIQUE,
+                    reminder_loan_id INTEGER,
+                    reminder_type TEXT,
+                    next_attempt_at REAL NOT NULL DEFAULT 0
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS complaints (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT,
@@ -202,6 +226,8 @@ class LocalDatabase:
                 CREATE INDEX IF NOT EXISTS idx_logs_book_status ON circulation_logs(book_id, status);
                 CREATE INDEX IF NOT EXISTS idx_logs_due_status ON circulation_logs(due_date, status);
                 CREATE INDEX IF NOT EXISTS idx_logs_checkout ON circulation_logs(checkout_date);
+                CREATE INDEX IF NOT EXISTS idx_email_queue_status_created
+                    ON email_queue(status, created_at);
             """)
 
             if cur.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
@@ -277,6 +303,285 @@ class LocalDatabase:
         except Exception as exc:
             logging.error("Could not save setting %s: %s", key, exc)
             return False
+
+    def _enqueue_email_in_transaction(
+        self,
+        recipient_email,
+        subject,
+        body,
+        trigger_type,
+        dedupe_key=None,
+        reminder_loan_id=None,
+        reminder_type=None,
+    ):
+        trigger_type = self._clean(trigger_type).upper()
+        if trigger_type not in {
+            "REGISTRATION", "ISSUE", "RETURN", "DUE_ALERT", "SYSTEM_ALERT"
+        }:
+            raise ValueError(f"Unsupported email trigger type: {trigger_type}")
+
+        cursor = self.conn.execute("""
+            INSERT INTO email_queue(
+                recipient_email, subject, body, trigger_type, dedupe_key,
+                reminder_loan_id, reminder_type
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dedupe_key) DO NOTHING
+        """, (
+            self._clean(recipient_email),
+            self._clean(subject),
+            str(body or ""),
+            trigger_type,
+            dedupe_key,
+            reminder_loan_id,
+            reminder_type,
+        ))
+        if cursor.rowcount:
+            return cursor.lastrowid
+        row = self.conn.execute(
+            "SELECT id FROM email_queue WHERE dedupe_key = ?",
+            (dedupe_key,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def _queue_registration_email_in_transaction(
+        self,
+        user_id,
+        full_name,
+        recipient_email,
+    ):
+        if not recipient_email:
+            return
+        self._enqueue_email_in_transaction(
+            recipient_email,
+            "Library registration confirmation",
+            (
+                f"Hello {full_name},\n\n"
+                "Your library account has been created "
+                f"successfully. Your user ID is {user_id}.\n\n"
+                "Library"
+            ),
+            "REGISTRATION",
+        )
+
+    def enqueue_email(
+        self,
+        recipient_email,
+        subject,
+        body,
+        trigger_type="SYSTEM_ALERT",
+        dedupe_key=None,
+    ):
+        recipient = self._clean(recipient_email)
+        if not recipient:
+            raise ValueError("The recipient email address is required.")
+        with self._transaction(immediate=True):
+            return self._enqueue_email_in_transaction(
+                recipient,
+                subject,
+                body,
+                trigger_type,
+                dedupe_key,
+            )
+
+    def get_pending_emails(self, limit=100):
+        limit = max(1, min(int(limit), 500))
+        return self.conn.execute("""
+            SELECT id, recipient_email, subject, body
+            FROM email_queue
+            WHERE status = 'PENDING' AND next_attempt_at <= ?
+            ORDER BY created_at, id
+            LIMIT ?
+        """, (datetime.datetime.now().timestamp(), limit)).fetchall()
+
+    def get_email_queue_counts(self):
+        counts = dict(self.conn.execute("""
+            SELECT status, COUNT(*) FROM email_queue GROUP BY status
+        """).fetchall())
+        return {
+            "pending": int(counts.get("PENDING", 0)),
+            "failed": int(counts.get("FAILED", 0)),
+            "sent": int(counts.get("SENT", 0)),
+        }
+
+    def get_email_queue_items(self, status=None, limit=5000):
+        allowed_statuses = {"PENDING", "FAILED", "SENT"}
+        if status is not None:
+            status = str(status).upper()
+            if status not in allowed_statuses:
+                raise ValueError(f"Unsupported email status: {status}")
+            query = """
+                SELECT id, recipient_email, subject, trigger_type, status,
+                       retry_count, created_at, sent_at, body
+                FROM email_queue
+                WHERE status = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            """
+            parameters = (status, max(1, min(int(limit), 10000)))
+        else:
+            query = """
+                SELECT id, recipient_email, subject, trigger_type, status,
+                       retry_count, created_at, sent_at, body
+                FROM email_queue
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            """
+            parameters = (max(1, min(int(limit), 10000)),)
+        return self.conn.execute(query, parameters).fetchall()
+
+    def delete_unsent_email_queue_items(self, email_ids=None):
+        with self._transaction(immediate=True):
+            delivery_enabled = str(
+                self.get_setting("email_delivery_enabled", "0")
+            ).casefold() in ("1", "true", "yes")
+            if delivery_enabled:
+                raise RuntimeError(
+                    "Disable queued email delivery before deleting messages."
+                )
+            if email_ids is None:
+                cursor = self.conn.execute("""
+                    DELETE FROM email_queue
+                    WHERE status IN ('PENDING', 'FAILED')
+                """)
+                return cursor.rowcount
+
+            return self._delete_email_queue_ids(email_ids)
+
+    def delete_email_queue_items(self, email_ids):
+        with self._transaction(immediate=True):
+            delivery_enabled = str(
+                self.get_setting("email_delivery_enabled", "0")
+            ).casefold() in ("1", "true", "yes")
+            if delivery_enabled:
+                raise RuntimeError(
+                    "Disable queued email delivery before deleting messages."
+                )
+            return self._delete_email_queue_ids(email_ids)
+
+    def _delete_email_queue_ids(self, email_ids):
+        ids = sorted({int(email_id) for email_id in email_ids})
+        deleted = 0
+        for offset in range(0, len(ids), 500):
+            batch = ids[offset:offset + 500]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            cursor = self.conn.execute(
+                f"""
+                DELETE FROM email_queue
+                WHERE id IN ({placeholders})
+                """,
+                batch,
+            )
+            deleted += cursor.rowcount
+        return deleted
+
+    def mark_email_sent(self, email_id, sent_at=None):
+        sent_at = sent_at or datetime.datetime.now().isoformat(timespec="seconds")
+        with self._transaction(immediate=True):
+            row = self.conn.execute("""
+                SELECT reminder_loan_id, reminder_type
+                FROM email_queue
+                WHERE id = ? AND status IN ('PENDING', 'FAILED')
+            """, (int(email_id),)).fetchone()
+            if not row:
+                return False
+            self.conn.execute("""
+                UPDATE email_queue
+                SET status = 'SENT', sent_at = ?
+                WHERE id = ? AND status IN ('PENDING', 'FAILED')
+            """, (sent_at, int(email_id)))
+            loan_id, reminder_type = row
+            if loan_id is not None and reminder_type:
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO email_notifications(
+                        loan_id, reminder_type, sent_at
+                    )
+                    VALUES (?, ?, ?)
+                """, (loan_id, reminder_type, sent_at))
+        return True
+
+    def mark_email_failed(self, email_id, max_retries=5):
+        with self._transaction(immediate=True):
+            row = self.conn.execute("""
+                SELECT retry_count FROM email_queue
+                WHERE id = ? AND status = 'PENDING'
+            """, (int(email_id),)).fetchone()
+            if not row:
+                return None
+            retry_count = int(row[0]) + 1
+            status = "FAILED" if retry_count >= max_retries else "PENDING"
+            next_attempt_at = (
+                datetime.datetime.now().timestamp()
+                + min(60 * (2 ** (retry_count - 1)), 3600)
+            )
+            self.conn.execute("""
+                UPDATE email_queue
+                SET retry_count = ?, status = ?, next_attempt_at = ?
+                WHERE id = ? AND status = 'PENDING'
+            """, (retry_count, status, next_attempt_at, int(email_id)))
+        return retry_count
+
+    def requeue_failed_emails(self):
+        with self._transaction(immediate=True):
+            cursor = self.conn.execute("""
+                UPDATE email_queue
+                SET status = 'PENDING', next_attempt_at = 0
+                WHERE status = 'FAILED'
+            """)
+        return cursor.rowcount
+
+    def prepare_email_queue_for_manual_sync(self):
+        with self._transaction(immediate=True):
+            cursor = self.conn.execute("""
+                UPDATE email_queue
+                SET status = 'PENDING', next_attempt_at = 0
+                WHERE status IN ('PENDING', 'FAILED')
+            """)
+        return cursor.rowcount
+
+    def enqueue_due_email_reminders(self, today=None):
+        today = today or datetime.date.today().isoformat()
+        queued = 0
+        for (
+            loan_id, email, full_name, book_title, due_date, reminder_type
+        ) in self.get_due_email_reminders(today):
+            if reminder_type == "due_today":
+                subject = f"Library book due today: {book_title}"
+                body = (
+                    f"Hello {full_name},\n\n"
+                    f"'{book_title}' is due today ({due_date}). "
+                    "Please return it to the library today or contact "
+                    "the library if you need assistance.\n\nLibrary"
+                )
+            else:
+                subject = f"Overdue library book: {book_title}"
+                body = (
+                    f"Hello {full_name},\n\n"
+                    f"'{book_title}' was due on {due_date} and is now "
+                    "overdue. Please return it to the library as soon "
+                    "as possible. Contact the library if it has already "
+                    "been returned.\n\nLibrary"
+                )
+            dedupe_key = f"due:{loan_id}:{reminder_type}:{today}"
+            with self._transaction(immediate=True):
+                existing = self.conn.execute(
+                    "SELECT 1 FROM email_queue WHERE dedupe_key = ?",
+                    (dedupe_key,),
+                ).fetchone()
+                self._enqueue_email_in_transaction(
+                    email,
+                    subject,
+                    body,
+                    "DUE_ALERT",
+                    dedupe_key=dedupe_key,
+                    reminder_loan_id=loan_id,
+                    reminder_type=reminder_type,
+                )
+                if not existing:
+                    queued += 1
+        return queued
 
     @staticmethod
     def _hash_admin_secret(secret):
@@ -645,6 +950,11 @@ class LocalDatabase:
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (uid, name, phone, role, dept, email, created))
+                self._queue_registration_email_in_transaction(
+                    uid,
+                    name,
+                    email,
+                )
             return True, "User created successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "user registration")
@@ -849,14 +1159,35 @@ class LocalDatabase:
                 due = now + datetime.timedelta(days=days)
                 checkout_text = now.strftime("%Y-%m-%d %H:%M")
                 due_text = due.strftime("%Y-%m-%d %H:%M")
-                self.conn.execute("""
+                cursor = self.conn.execute("""
                     INSERT INTO circulation_logs(book_id, user_id, checkout_date, due_date, status)
                     VALUES (?, ?, ?, ?, 'ISSUED')
                 """, (bid, uid, checkout_text, due_text))
+                loan_id = cursor.lastrowid
                 self.conn.execute("""
                     UPDATE books SET available_copies = available_copies - 1
                     WHERE id = ? AND available_copies > 0
                 """, (bid,))
+                details = self.conn.execute("""
+                    SELECT u.email, u.full_name, b.title
+                    FROM users u
+                    JOIN books b ON b.id = ?
+                    WHERE u.id = ?
+                """, (bid, uid)).fetchone()
+                if details and details[0]:
+                    email, full_name, title = details
+                    self._enqueue_email_in_transaction(
+                        email,
+                        f"Book issued: {title}",
+                        (
+                            f"Hello {full_name},\n\n"
+                            f"Book '{title}' (Book ID: {bid}) has been "
+                            f"issued to your account. It is due on "
+                            f"{due_text}.\n\nLibrary"
+                        ),
+                        "ISSUE",
+                        dedupe_key=f"issue:{loan_id}",
+                    )
             return True, f"Book issued successfully! Due Date: {due_text}"
         except Exception as exc:
             return False, self._parse_db_error(exc, "book issue")
@@ -912,6 +1243,31 @@ class LocalDatabase:
                     UPDATE books SET available_copies = MIN(total_copies, available_copies + 1)
                     WHERE id = ?
                 """, (bid,))
+                details = self.conn.execute("""
+                    SELECT u.email, u.full_name, b.title
+                    FROM users u
+                    JOIN books b ON b.id = ?
+                    WHERE u.id = ?
+                """, (bid, uid)).fetchone()
+                if details and details[0]:
+                    email, full_name, title = details
+                    fine_status = (
+                        f"A fine of {fine:.2f} is due."
+                        if fine > 0
+                        else "No fine is due."
+                    )
+                    self._enqueue_email_in_transaction(
+                        email,
+                        f"Book returned: {title}",
+                        (
+                            f"Hello {full_name},\n\n"
+                            f"Book '{title}' (Book ID: {bid}) was "
+                            f"returned on {returned_text}. {fine_status}\n\n"
+                            "Library"
+                        ),
+                        "RETURN",
+                        dedupe_key=f"return:{log_id}",
+                    )
             return True, fine, "Book returned successfully."
         except Exception as exc:
             return False, 0.0, self._parse_db_error(exc, "book return")
@@ -961,7 +1317,7 @@ class LocalDatabase:
             row = self.conn.execute("""
                 SELECT
                     (SELECT COUNT(*) FROM users),
-                    (SELECT COUNT(*) FROM books),
+                    (SELECT COUNT(DISTINCT title) FROM books),
                     (SELECT COALESCE(SUM(total_copies), 0) FROM books),
                     (SELECT COALESCE(SUM(available_copies), 0) FROM books),
                     (SELECT COUNT(*) FROM circulation_logs WHERE status = 'ISSUED'),
@@ -1195,41 +1551,53 @@ class LocalDatabase:
 
     # IMPORT / EXPORT
     def import_books_batch(self, books_data: list):
-        """Atomically insert or merge books; input rows retain the legacy 7-column format."""
+        """Atomically insert or merge legacy 7-column or ISBN-aware 8-column rows."""
         if not books_data:
             return True, 0
         try:
             normalized = []
+            seen_ids = set()
+            seen_isbns = set()
             for row in books_data:
-                if len(row) != 7:
-                    raise ValueError("Each book import row must contain 7 values.")
-                bid, title, author, publisher, total, available, created = row
+                if len(row) not in (7, 8):
+                    raise ValueError("Each book import row must contain 7 or 8 values.")
+                bid, title, author, publisher, total, available, created = row[:7]
+                isbn = row[7] if len(row) == 8 else None
                 bid, title = self._clean(bid), self._clean(title)
                 total, available = int(total), int(available)
                 if not bid or not title or total < 0 or available < 0 or available > total:
                     raise ValueError(f"Invalid book import data for ID '{bid}'.")
+                id_key = bid.casefold()
+                if id_key in seen_ids:
+                    raise ValueError(f"Duplicate book ID '{bid}' in import batch.")
+                seen_ids.add(id_key)
+                normalized_isbn = self._clean(isbn) or None
+                if normalized_isbn:
+                    isbn_key = normalized_isbn.casefold()
+                    if isbn_key in seen_isbns:
+                        raise ValueError(
+                            f"Duplicate ISBN '{normalized_isbn}' in import batch."
+                        )
+                    seen_isbns.add(isbn_key)
                 normalized.append((bid, title, self._clean(author), self._clean(publisher),
-                                   total, available, created or datetime.date.today().isoformat()))
+                                   total, available, created or datetime.date.today().isoformat(),
+                                   normalized_isbn))
             with self._transaction(immediate=True):
-                for row in normalized:
-                    bid, title, author, publisher, total, available, created = row
-                    existing = self.conn.execute(
-                        "SELECT total_copies, available_copies FROM books WHERE id = ?", (bid,)
-                    ).fetchone()
-                    if existing:
-                        issued = int(existing[0]) - int(existing[1])
-                        new_total = int(existing[0]) + total
-                        self.conn.execute("""
-                            UPDATE books SET title = ?, author = ?, publisher = ?,
-                                total_copies = ?, available_copies = ?
-                            WHERE id = ?
-                        """, (title, author, publisher, new_total, new_total - issued, bid))
-                    else:
-                        self.conn.execute("""
-                            INSERT INTO books(id, title, author, publisher, total_copies,
-                                available_copies, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, row)
+                self.conn.executemany("""
+                    INSERT INTO books(
+                        id, title, author, publisher, total_copies,
+                        available_copies, created_at, isbn
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title = excluded.title,
+                        author = excluded.author,
+                        publisher = excluded.publisher,
+                        total_copies = books.total_copies + excluded.total_copies,
+                        available_copies =
+                            books.available_copies + excluded.available_copies,
+                        isbn = COALESCE(excluded.isbn, books.isbn)
+                """, normalized)
             return True, len(normalized)
         except Exception as exc:
             self.conn.rollback()
@@ -1243,6 +1611,8 @@ class LocalDatabase:
         try:
             normalized = []
             departments_to_register = {}
+            seen_ids = set()
+            seen_phones = set()
             for row in users_data:
                 if len(row) not in (6, 7):
                     raise ValueError(
@@ -1253,6 +1623,16 @@ class LocalDatabase:
                 uid, name, role = self._clean(uid).upper(), self._clean(name), self._clean(role)
                 if not uid or not name or not role:
                     raise ValueError("Imported users require an ID, full name, and role.")
+                if uid in seen_ids:
+                    raise ValueError(f"Duplicate user ID '{uid}' in import batch.")
+                seen_ids.add(uid)
+                phone_key = self._clean(phone).casefold()
+                if phone_key and phone_key in seen_phones:
+                    raise ValueError(
+                        f"Duplicate phone number '{phone}' in import batch."
+                    )
+                if phone_key:
+                    seen_phones.add(phone_key)
                 department = self._clean(dept)
                 role_key = role.casefold()
                 department_category = (
@@ -1287,6 +1667,14 @@ class LocalDatabase:
                     VALUES (?, ?, 3)
                     ON CONFLICT(name) DO NOTHING
                 """, list(departments_to_register.values()))
+                new_user_ids = {
+                    row[0]
+                    for row in normalized
+                    if not self.conn.execute(
+                        "SELECT 1 FROM users WHERE id = ?",
+                        (row[0],),
+                    ).fetchone()
+                }
                 self.conn.executemany("""
                     INSERT INTO users(
                         id, full_name, phone_number, role, department,
@@ -1300,6 +1688,16 @@ class LocalDatabase:
                         department = excluded.department,
                         email = COALESCE(excluded.email, users.email)
                 """, normalized)
+                for user_id in new_user_ids:
+                    user = self.conn.execute("""
+                        SELECT full_name, email FROM users WHERE id = ?
+                    """, (user_id,)).fetchone()
+                    if user:
+                        self._queue_registration_email_in_transaction(
+                            user_id,
+                            user[0],
+                            user[1],
+                        )
             return True, len(normalized)
         except Exception as exc:
             self.conn.rollback()

@@ -1,7 +1,15 @@
 import csv
+import math
+import re
 from datetime import date
 import openpyxl
-from PyQt6.QtCore import QEvent, QPoint, Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QEvent,
+    QItemSelectionModel,
+    QPoint,
+    Qt,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QColor, QCursor
 from pathlib import Path
 from PyQt6.QtWidgets import (
@@ -32,9 +40,10 @@ from dialogs import (
     BookHistoryDialog,
     IssueBookDialog,
     ReturnBookDialog,
+    BatchCirculationDialog,
 )
 
-from utils import clear_layout
+from utils import clear_layout, is_valid_book_id, rgba_color
 
 
 # ============================================================
@@ -78,14 +87,14 @@ class MetricCard(QFrame):
         self.setObjectName("MetricCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self.setMinimumHeight(88)
+        self.setMinimumHeight(100)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(5)
 
         self.lbl_title = QLabel(title)
@@ -115,16 +124,13 @@ class MetricCard(QFrame):
         self.apply_style()
 
     def apply_style(self):
-        background = (
-            "palette(alternate-base)"
-            if self.selected
-            else "palette(base)"
+        background = rgba_color(
+            self.accent,
+            0.20 if self.selected else 0.09,
         )
-
-        border = (
-            self.accent
-            if self.selected
-            else "palette(mid)"
+        border = self.accent if self.selected else rgba_color(
+            self.accent,
+            0.48,
         )
 
         self.setStyleSheet(f"""
@@ -132,7 +138,7 @@ class MetricCard(QFrame):
                 background-color: {background};
                 border: 1px solid {border};
                 border-left: 4px solid {self.accent};
-                border-radius: 9px;
+                border-radius: 10px;
             }}
 
             QFrame#MetricCard:hover {{
@@ -223,7 +229,7 @@ class CatalogView(QWidget):
 
         main_layout = QVBoxLayout(self)
 
-        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setContentsMargins(20, 16, 20, 16)
         main_layout.setSpacing(12)
 
         # HEADER
@@ -260,7 +266,7 @@ class CatalogView(QWidget):
 
         self.refresh_btn = QPushButton("↻ Refresh")
         self.refresh_btn.setObjectName("SecondaryButton")
-        self.refresh_btn.setMinimumHeight(35)
+        self.refresh_btn.setMinimumHeight(36)
         self.refresh_btn.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
@@ -272,7 +278,7 @@ class CatalogView(QWidget):
 
         self.control_center_btn = QPushButton("Hide Details")
         self.control_center_btn.setObjectName("SecondaryButton")
-        self.control_center_btn.setMinimumHeight(35)
+        self.control_center_btn.setMinimumHeight(36)
         self.control_center_btn.setToolTip(
             "Show or hide the Book Control Center"
         )
@@ -512,7 +518,7 @@ class CatalogView(QWidget):
         self.table.viewport().setMouseTracking(True)
 
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(43)
+        self.table.verticalHeader().setDefaultSectionSize(44)
 
         header_view.setMinimumSectionSize(65)
         header_view.setHighlightSections(False)
@@ -771,7 +777,7 @@ class CatalogView(QWidget):
             QFrame#MetricCard {{
                 background-color: {c["surface"]};
                 border: 1px solid {c["border"]};
-                border-radius: 9px;
+                border-radius: 10px;
             }}
 
             QLabel#MetricTitle {{
@@ -823,8 +829,8 @@ class CatalogView(QWidget):
                 background-color: {c["input"]};
                 color: {c["text"]};
                 border: 1px solid {c["border"]};
-                border-radius: 7px;
-                padding: 9px 12px;
+                border-radius: 8px;
+                padding: 8px 10px;
                 font-size: 12px;
             }}
 
@@ -883,14 +889,14 @@ class CatalogView(QWidget):
                 alternate-background-color: {c["surface_alt"]};
                 color: {c["text"]};
                 border: 1px solid {c["border"]};
-                border-radius: 9px;
+                border-radius: 10px;
                 selection-background-color: {c["selection"]};
                 selection-color: white;
                 outline: none;
             }}
 
             QTableWidget#CatalogTable::item {{
-                padding: 8px;
+                padding: 7px 9px;
                 border-bottom: 1px solid {c["border"]};
             }}
 
@@ -899,7 +905,7 @@ class CatalogView(QWidget):
                 color: {c["muted"]};
                 border: none;
                 border-bottom: 1px solid {c["border"]};
-                padding: 11px 8px;
+                padding: 10px 10px;
                 font-size: 11px;
                 font-weight: 700;
             }}
@@ -1572,9 +1578,11 @@ class CatalogView(QWidget):
 
         if not rows:
 
+            self.tab_widget.setCurrentWidget(self.tab_overview)
             self.show_default_inspector()
 
         elif len(rows) == 1:
+            self.tab_widget.setCurrentWidget(self.tab_overview)
 
             item = self.table.item(rows[0], 0)
 
@@ -1585,19 +1593,69 @@ class CatalogView(QWidget):
 
         else:
 
-            self.current_book_id = None
+            self.show_batch_book_inspector()
 
-            clear_layout(self.overview_layout)
-            clear_layout(self.actions_layout)
+    def get_selected_books(self):
+        selected = []
+        for index in self.table.selectionModel().selectedRows():
+            row = index.row()
+            id_item = self.table.item(row, 0)
+            if not id_item:
+                continue
+            title_item = self.table.item(row, 1)
+            selected.append((
+                id_item.text().strip(),
+                title_item.text().strip() if title_item else "",
+            ))
+        return list(dict.fromkeys(selected))
 
-            label = QLabel(
-                f"{len(rows)} books selected. "
-                "Select one book to inspect its details."
+    def select_books_by_ids(self, book_ids):
+        wanted = {str(book_id) for book_id in book_ids}
+        selection_model = self.table.selectionModel()
+        selection_model.clearSelection()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.text() in wanted:
+                selection_model.select(
+                    self.table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+        self.on_books_selection_changed()
+
+    def show_batch_book_inspector(self):
+        books = self.get_selected_books()
+        if not books:
+            self.show_default_inspector()
+            return
+
+        self.current_book_id = None
+        self.tab_widget.setCurrentWidget(self.tab_actions)
+        clear_layout(self.overview_layout)
+        clear_layout(self.actions_layout)
+
+        label = QLabel(
+            f"{len(books)} books selected.\n\n"
+            "Choose a batch action to issue or return all selected titles "
+            "for the same user."
+        )
+        label.setWordWrap(True)
+        self.overview_layout.addWidget(label)
+
+        for mode, text, object_name in (
+            ("ISSUE", "Issue Selected Books", "PrimaryButton"),
+            ("RETURN", "Return Selected Books", "SecondaryButton"),
+        ):
+            button = QPushButton(text)
+            button.setObjectName(object_name)
+            button.setMinimumHeight(34)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(
+                lambda checked=False, selected_mode=mode:
+                self.handle_batch_book_circulation(selected_mode)
             )
-
-            label.setWordWrap(True)
-
-            self.overview_layout.addWidget(label)
+            self.actions_layout.addWidget(button)
+        self.actions_layout.addStretch()
 
     # ========================================================
     # BOOK OPERATIONS
@@ -1734,6 +1792,84 @@ class CatalogView(QWidget):
                 str(exc),
             )
 
+    def handle_batch_book_circulation(self, mode, books=None):
+        selected_books = books or self.get_selected_books()
+        if not selected_books:
+            QMessageBox.information(
+                self,
+                "No Books Selected",
+                "Select at least one book before choosing a batch action.",
+            )
+            return
+
+        dialog = BatchCirculationDialog(
+            self.db,
+            mode,
+            [book_id for book_id, _title in selected_books],
+            "books",
+            self,
+        )
+        if not dialog.exec():
+            return
+
+        user_id, days = dialog.get_data()
+        operation = "issue" if mode == "ISSUE" else "return"
+        answer = QMessageBox.question(
+            self,
+            f"Confirm Batch {operation.title()}",
+            f"{operation.title()} {len(selected_books)} selected books "
+            f"for user '{user_id}'?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        succeeded = []
+        failed = []
+        for book_id, title in selected_books:
+            try:
+                if mode == "ISSUE":
+                    result = self.db.issue_book(
+                        book_id,
+                        user_id,
+                        days,
+                    )
+                    if not isinstance(result, tuple) or len(result) < 2:
+                        raise ValueError("Unexpected issue_book() response.")
+                    success, detail = result[0], result[1]
+                else:
+                    result = self.db.return_book(book_id, user_id)
+                    if not isinstance(result, tuple) or len(result) < 2:
+                        raise ValueError("Unexpected return_book() response.")
+                    success, detail = result[0], result[1]
+                    if success:
+                        detail = f"Fine: ₹{float(detail or 0):.2f}"
+
+                if success:
+                    succeeded.append(f"{book_id} — {title}")
+                else:
+                    failed.append(f"{book_id}: {detail}")
+            except Exception as error:
+                failed.append(f"{book_id}: {error}")
+
+        self.load_books_to_table()
+        self.select_books_by_ids(
+            [book_id for book_id, _title in selected_books]
+        )
+        summary = (
+            f"Completed: {len(succeeded)}\n"
+            f"Failed: {len(failed)}"
+        )
+        if failed:
+            summary += "\n\nNot completed:\n" + "\n".join(failed[:10])
+        QMessageBox.information(
+            self,
+            f"Batch {operation.title()} Results",
+            summary,
+        )
+
     def edit_book(self, book_id):
 
         dialog = BookDialog(
@@ -1825,12 +1961,23 @@ class CatalogView(QWidget):
             else ""
         )
 
-        self.table.selectRow(row)
+        selected_rows = {
+            selected.row()
+            for selected in self.table.selectionModel().selectedRows()
+        }
+        if row not in selected_rows:
+            self.table.selectRow(row)
+
+        selected_books = self.get_selected_books()
 
         menu = QMenu(self)
 
-        issue = menu.addAction("Issue Books")
-        ret = menu.addAction("Return Books")
+        if len(selected_books) > 1:
+            issue = menu.addAction("Issue Selected Books")
+            ret = menu.addAction("Return Selected Books")
+        else:
+            issue = menu.addAction("Issue Books")
+            ret = menu.addAction("Return Books")
 
         menu.addSeparator()
 
@@ -1844,16 +1991,16 @@ class CatalogView(QWidget):
         )
 
         if action == issue:
-            self.handle_issue_book(
-                book_id,
-                book_title,
-            )
+            if len(selected_books) > 1:
+                self.handle_batch_book_circulation("ISSUE", selected_books)
+            else:
+                self.handle_issue_book(book_id, book_title)
 
         elif action == ret:
-            self.handle_return_book(
-                book_id,
-                book_title,
-            )
+            if len(selected_books) > 1:
+                self.handle_batch_book_circulation("RETURN", selected_books)
+            else:
+                self.handle_return_book(book_id, book_title)
 
         elif action == barcode:
             self.open_barcode_dialog_for_selected(
@@ -1945,11 +2092,21 @@ class CatalogView(QWidget):
         if not file_path:
             return
 
+        file_extension = Path(file_path).suffix.casefold()
+        if file_extension not in (".csv", ".xlsx"):
+            QMessageBox.warning(
+                self,
+                "Unsupported File",
+                "Select a CSV or XLSX file.",
+            )
+            return
+
         required_aliases = {
             "id": ("book_id", "id"),
             "title": ("title",),
             "author": ("author",),
             "publisher": ("publisher",),
+            "isbn": ("isbn", "isbn_13", "isbn_10"),
             "copies": (
                 "total_copies",
                 "copies",
@@ -1966,7 +2123,7 @@ class CatalogView(QWidget):
             rows = []
             fieldnames = []
 
-            if file_path.lower().endswith(".xlsx"):
+            if file_extension == ".xlsx":
                 if openpyxl is None:
                     QMessageBox.critical(
                         self,
@@ -1975,21 +2132,38 @@ class CatalogView(QWidget):
                     )
                     return
 
-                wb = openpyxl.load_workbook(file_path, data_only=True)
-                sheet = wb.active
-                excel_rows = list(sheet.iter_rows(values_only=True))
-
-                if excel_rows:
-                    # Convert headers to strings, handling potential empty cells
-                    fieldnames = [str(cell).strip() if cell else "" for cell in excel_rows[0]]
-
-                    # Create dictionary for each row to mimic csv.DictReader
-                    for row_data in excel_rows[1:]:
-                        row_dict = {
-                            fieldnames[i]: (str(cell).strip() if cell is not None else "")
-                            for i, cell in enumerate(row_data) if i < len(fieldnames)
-                        }
-                        rows.append(row_dict)
+                workbook = openpyxl.load_workbook(
+                    file_path,
+                    data_only=True,
+                    read_only=True,
+                )
+                try:
+                    excel_rows = workbook.active.iter_rows(
+                        values_only=True
+                    )
+                    header_row = next(excel_rows, None)
+                    if header_row:
+                        fieldnames = [
+                            str(cell).strip() if cell is not None else ""
+                            for cell in header_row
+                        ]
+                        for row_data in excel_rows:
+                            row_dict = {}
+                            for index, cell in enumerate(row_data):
+                                if index >= len(fieldnames) or not fieldnames[index]:
+                                    continue
+                                if (
+                                    isinstance(cell, float)
+                                    and math.isfinite(cell)
+                                    and cell.is_integer()
+                                ):
+                                    value = str(int(cell))
+                                else:
+                                    value = str(cell).strip() if cell is not None else ""
+                                row_dict[fieldnames[index]] = value
+                            rows.append(row_dict)
+                finally:
+                    workbook.close()
             else:
                 # Handle CSV
                 with open(file_path, "r", newline="", encoding="utf-8-sig") as csv_file:
@@ -2007,33 +2181,44 @@ class CatalogView(QWidget):
                 return
 
             normalized_headers = {
-                str(name).strip().casefold(): name
+                re.sub(
+                    r"[^a-z0-9]+",
+                    "_",
+                    str(name).strip().casefold(),
+                ).strip("_"): name
                 for name in fieldnames
                 if name
             }
 
             def find_column(aliases):
                 for alias in aliases:
-                    if alias in normalized_headers:
-                        return normalized_headers[alias]
+                    normalized_alias = re.sub(
+                        r"[^a-z0-9]+",
+                        "_",
+                        alias.strip().casefold(),
+                    ).strip("_")
+                    if normalized_alias in normalized_headers:
+                        return normalized_headers[normalized_alias]
                 return None
 
             id_col = find_column(required_aliases["id"])
             title_col = find_column(required_aliases["title"])
             author_col = find_column(required_aliases["author"])
             publisher_col = find_column(required_aliases["publisher"])
+            isbn_col = find_column(required_aliases["isbn"])
             copies_col = find_column(required_aliases["copies"])
 
-            if not id_col or not title_col:
+            if not id_col or not title_col or not publisher_col:
                 QMessageBox.warning(
                     self,
                     "Missing Headers",
-                    "Required columns: book_id (or id), title",
+                    "Required columns: book_id (or id), title, publisher",
                 )
                 return
 
             # 3. PROCESS ROWS
             seen_ids = set()
+            seen_isbns = set()
 
             for line_number, row in enumerate(rows, start=2):
                 book_id = str(row.get(id_col, "") or "").strip()
@@ -2041,25 +2226,54 @@ class CatalogView(QWidget):
 
                 author = str(row.get(author_col, "") or "").strip() if author_col else ""
                 publisher = str(row.get(publisher_col, "") or "").strip() if publisher_col else ""
+                isbn = str(row.get(isbn_col, "") or "").strip() if isbn_col else ""
                 copies_text = str(row.get(copies_col, "") or "").strip() if copies_col else "1"
 
-                if not book_id or not title:
-                    errors.append(f"Line {line_number}: Book ID and title are required.")
+                if not is_valid_book_id(book_id):
+                    errors.append(
+                        f"Line {line_number}: Book ID must contain exactly 5 digits."
+                    )
                     continue
 
-                if book_id in seen_ids:
+                if not title or len(title) > 200:
+                    errors.append(
+                        f"Line {line_number}: Title is required and must be "
+                        "no longer than 200 characters."
+                    )
+                    continue
+
+                if not publisher or len(publisher) > 100:
+                    errors.append(
+                        f"Line {line_number}: Publisher is required and must be "
+                        "no longer than 100 characters."
+                    )
+                    continue
+
+                if book_id.casefold() in seen_ids:
                     errors.append(f"Line {line_number}: Duplicate ID '{book_id}' in file.")
                     continue
 
-                seen_ids.add(book_id)
-
                 try:
-                    copies = int(copies_text or "1")
-                    if copies < 1:
+                    copies_value = float(copies_text or "1")
+                    if (
+                        not math.isfinite(copies_value)
+                        or not copies_value.is_integer()
+                        or copies_value < 1
+                    ):
                         raise ValueError
+                    copies = int(copies_value)
                 except ValueError:
                     errors.append(f"Line {line_number}: Invalid total copies value.")
                     continue
+                isbn_key = isbn.casefold()
+                if isbn_key and isbn_key in seen_isbns:
+                    errors.append(
+                        f"Line {line_number}: Duplicate ISBN '{isbn}' in file."
+                    )
+                    continue
+                seen_ids.add(book_id.casefold())
+                if isbn_key:
+                    seen_isbns.add(isbn_key)
 
                 books_to_insert.append((
                     book_id,
@@ -2069,6 +2283,7 @@ class CatalogView(QWidget):
                     copies,
                     copies,
                     current_date,
+                    isbn or None,
                 ))
 
             # 4. DATABASE INSERTION

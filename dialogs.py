@@ -21,10 +21,15 @@ from PyQt6.QtCore import (
 
 from PyQt6.QtGui import (
     QPixmap, QImage, QFont, QRegularExpressionValidator,
-    QIntValidator, QValidator, QColor
+    QIntValidator, QColor
 )
 
-from utils import clear_layout
+from utils import (
+    clear_layout,
+    is_valid_book_id,
+    is_valid_phone_number,
+    is_valid_user_id,
+)
 
 
 # ============================================================
@@ -142,11 +147,11 @@ class BookDialog(QDialog):
         form.setSpacing(13)
 
         self.input_id = QLineEdit()
-        self.input_id.setPlaceholderText("Example: CS-101")
-        self.input_id.setMaxLength(50)
+        self.input_id.setPlaceholderText("5-digit book ID")
+        self.input_id.setMaxLength(5)
 
         id_regex = QRegularExpression(
-            r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$"
+            r"^[0-9]{5}$"
         )
         self.input_id.setValidator(
             QRegularExpressionValidator(id_regex, self.input_id)
@@ -276,6 +281,14 @@ class BookDialog(QDialog):
             )
             return
 
+        if self.book_id is None and not is_valid_book_id(book_id):
+            show_warning(
+                self,
+                "Invalid Book ID",
+                "Book ID must contain exactly 5 digits.",
+            )
+            return
+
         counts = self.validate_counts()
 
         if counts is None:
@@ -398,9 +411,9 @@ class ComplaintDialog(QDialog):
         except Exception as error:
             show_warning(
                 self,
-                "Complaint Saved; Email Not Sent",
+                "Complaint Saved; Email Not Queued",
                 f"Complaint #{complaint[0]} was saved locally, but the "
-                f"email notification failed:\n\n{error}",
+                f"email notification could not be added to the queue:\n\n{error}",
             )
             self.accept()
             return
@@ -408,7 +421,8 @@ class ComplaintDialog(QDialog):
         show_success(
             self,
             "Complaint Submitted",
-            f"Complaint #{complaint[0]} was saved and emailed to the library.",
+            f"Complaint #{complaint[0]} was saved and its notifications were "
+            "added to the email queue.",
         )
         self.accept()
 
@@ -554,6 +568,441 @@ class ComplaintManagementDialog(QDialog):
         self.load_complaints()
 
 
+class EmailQueueManagementDialog(QDialog):
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.email_items = []
+        configure_dialog(self, "Email Queue Manager", 1100, 680)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setSpacing(12)
+        layout.addWidget(create_heading("Email queue"))
+        layout.addWidget(QLabel(
+            "Review messages without sending them. Delete selected messages, "
+            "including sent history, or clear all pending and failed messages."
+        ))
+
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("Show:"))
+        self.status_filter = QComboBox()
+        self.status_filter.addItem("All", None)
+        self.status_filter.addItem("Pending", "PENDING")
+        self.status_filter.addItem("Failed", "FAILED")
+        self.status_filter.addItem("Sent", "SENT")
+        self.status_filter.currentIndexChanged.connect(self.load_items)
+        self.count_label = QLabel()
+        filters.addWidget(self.status_filter)
+        filters.addStretch()
+        filters.addWidget(self.count_label)
+        layout.addLayout(filters)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText(
+            "Filter by recipient, subject, or message content"
+        )
+        self.search_input.textChanged.connect(self.filter_items)
+        layout.addWidget(self.search_input)
+
+        self.delivery_warning = QLabel()
+        self.delivery_warning.setWordWrap(True)
+        layout.addWidget(self.delivery_warning)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "ID", "Recipient", "Subject", "Type", "Status",
+            "Attempts", "Created",
+        ])
+        configure_table(self.table)
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        self.table.itemSelectionChanged.connect(self.show_selected_body)
+        layout.addWidget(self.table, 1)
+
+        self.body_view = QPlainTextEdit()
+        self.body_view.setReadOnly(True)
+        self.body_view.setPlaceholderText(
+            "Select a message to preview its body."
+        )
+        self.body_view.setMaximumHeight(120)
+        layout.addWidget(self.body_view)
+
+        actions = QHBoxLayout()
+        refresh_button = create_button("Refresh", self.load_items)
+        self.delete_selected_button = create_button(
+            "Delete Selected",
+            self.delete_selected,
+        )
+        self.delete_all_button = create_button(
+            "Delete All Pending / Failed",
+            self.delete_all_unsent,
+        )
+        close_button = create_button("Close", self.accept)
+        actions.addWidget(refresh_button)
+        actions.addWidget(self.delete_selected_button)
+        actions.addWidget(self.delete_all_button)
+        actions.addStretch()
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        self.load_items()
+
+    def load_items(self):
+        try:
+            counts = self.db.get_email_queue_counts()
+            selected_status = self.status_filter.currentData()
+            self.email_items = self.db.get_email_queue_items(
+                selected_status
+            )
+            delivery_enabled = str(
+                self.db.get_setting("email_delivery_enabled", "0")
+            ).casefold() in ("1", "true", "yes")
+        except Exception as error:
+            show_error(self, "Email Queue Error", error)
+            return
+
+        self.count_label.setText(
+            f"{counts['pending']} pending · {counts['failed']} failed · "
+            f"{counts['sent']} sent"
+        )
+        self.delivery_warning.setText(
+            "Queued delivery is enabled. Disable it in Settings before "
+            "managing queued messages."
+            if delivery_enabled
+            else "Queued delivery is disabled. Messages will stay queued "
+            "until you explicitly enable delivery in Settings."
+        )
+
+        self.filter_items()
+        self._update_delete_buttons(delivery_enabled, counts)
+
+    def filter_items(self):
+        query = self.search_input.text().strip().casefold()
+        visible_items = [
+            email for email in self.email_items
+            if not query
+            or any(
+                query in str(value or "").casefold()
+                for value in (email[1], email[2], email[8])
+            )
+        ]
+        self.table.setRowCount(len(visible_items))
+        for row_index, email in enumerate(visible_items):
+            (
+                email_id, recipient, subject, trigger, status,
+                retry_count, created_at, _sent_at, _body,
+            ) = email
+            values = (
+                email_id,
+                recipient,
+                subject,
+                str(trigger).replace("_", " ").title(),
+                status.title(),
+                retry_count,
+                created_at,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value or ""))
+                item.setData(Qt.ItemDataRole.UserRole, int(email_id))
+                self.table.setItem(row_index, column, item)
+
+        self.body_view.clear()
+
+    def _update_delete_buttons(self, delivery_enabled, counts):
+        self.delete_selected_button.setEnabled(
+            bool(self.email_items) and not delivery_enabled
+        )
+        self.delete_all_button.setEnabled(
+            counts["pending"] + counts["failed"] > 0
+            and not delivery_enabled
+        )
+
+    def show_selected_body(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            self.body_view.clear()
+            return
+        selected_ids = {
+            self.table.item(row.row(), 0).data(Qt.ItemDataRole.UserRole)
+            for row in rows
+        }
+        selected = next(
+            (
+                email for email in self.email_items
+                if int(email[0]) in selected_ids
+            ),
+            None,
+        )
+        if selected:
+            self.body_view.setPlainText(str(selected[8] or ""))
+
+    def _delivery_is_enabled(self):
+        return str(
+            self.db.get_setting("email_delivery_enabled", "0")
+        ).casefold() in ("1", "true", "yes")
+
+    def delete_selected(self):
+        try:
+            if self._delivery_is_enabled():
+                show_warning(
+                    self,
+                    "Disable Email Delivery",
+                    "Disable queued email delivery in Settings before "
+                    "deleting queued messages.",
+                )
+                self.load_items()
+                return
+
+            rows = self.table.selectionModel().selectedRows()
+            selected_ids = {
+                int(self.table.item(row.row(), 0).data(
+                    Qt.ItemDataRole.UserRole
+                ))
+                for row in rows
+            }
+            deletable_ids = [
+                int(email[0])
+                for email in self.email_items
+                if int(email[0]) in selected_ids
+            ]
+            if not deletable_ids:
+                show_warning(
+                    self,
+                    "Select Messages",
+                    "Select one or more messages to delete.",
+                )
+                return
+            selected_counts = {
+                status: sum(
+                    1 for email in self.email_items
+                    if int(email[0]) in selected_ids and email[4] == status
+                )
+                for status in ("PENDING", "FAILED", "SENT")
+            }
+            summary = ", ".join(
+                f"{count} {status.lower()}"
+                for status, count in selected_counts.items()
+                if count
+            )
+            answer = QMessageBox.question(
+                self,
+                "Delete Selected Messages",
+                f"Permanently delete {len(deletable_ids)} selected message(s) "
+                f"({summary})? Sent messages are part of the email history. "
+                "This cannot be undone.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.db.delete_email_queue_items(deletable_ids)
+        except Exception as error:
+            show_error(self, "Email Queue Delete Error", error)
+            return
+        self.load_items()
+
+    def delete_all_unsent(self):
+        try:
+            if self._delivery_is_enabled():
+                show_warning(
+                    self,
+                    "Disable Email Delivery",
+                    "Disable queued email delivery in Settings before "
+                    "deleting queued messages.",
+                )
+                self.load_items()
+                return
+            counts = self.db.get_email_queue_counts()
+            queued = counts["pending"] + counts["failed"]
+            if queued == 0:
+                return
+            answer = QMessageBox.question(
+                self,
+                "Delete All Queued Messages",
+                f"Permanently delete all {queued} pending or failed queued "
+                "message(s)? Sent email history will be kept. This cannot "
+                "be undone.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.db.delete_unsent_email_queue_items()
+        except Exception as error:
+            show_error(self, "Email Queue Delete Error", error)
+            return
+        self.load_items()
+
+
+class VersionManagerDialog(QDialog):
+
+    def __init__(
+        self,
+        releases,
+        current_version,
+        can_install,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.releases = list(releases)
+        self.current_version = current_version
+        self.can_install = can_install
+        self.selected_release = None
+        configure_dialog(self, "Application Version Manager", 980, 620)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setSpacing(12)
+        layout.addWidget(create_heading("Published application versions"))
+        layout.addWidget(QLabel(
+            f"Installed version: {current_version}. Select a published "
+            "release to install it or roll back to it."
+        ))
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels([
+            "Version", "Published", "Package", "Availability",
+        ])
+        configure_table(self.table)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            3,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        self.table.itemSelectionChanged.connect(self.show_release_details)
+        self.table.cellDoubleClicked.connect(
+            lambda _row, _column: self.install_selected()
+        )
+        layout.addWidget(self.table, 1)
+
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMaximumHeight(150)
+        layout.addWidget(self.details)
+
+        self.install_button = create_button(
+            "Install / Roll Back to Selected",
+            self.install_selected,
+            enabled=False,
+        )
+        if not can_install:
+            self.install_button.setText(
+                "Install Requires Packaged Windows App"
+            )
+        actions = QHBoxLayout()
+        refresh_note = QLabel(
+            "Only stable releases with a verified Library-Windows.zip can "
+            "be installed."
+        )
+        refresh_note.setWordWrap(True)
+        close_button = create_button("Close", self.reject)
+        actions.addWidget(refresh_note, 1)
+        actions.addWidget(self.install_button)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        self._populate()
+
+    def _populate(self):
+        self.table.setRowCount(len(self.releases))
+        for row, release in enumerate(self.releases):
+            package_text = (
+                "Verified"
+                if release.get("installable")
+                else "Unavailable"
+            )
+            availability = (
+                "Installed version"
+                if release.get("current")
+                else (
+                    "Ready to install"
+                    if release.get("installable")
+                    else release.get("reason", "Package unavailable")
+                )
+            )
+            values = (
+                release["tag_name"],
+                release.get("published_at", ""),
+                package_text,
+                availability,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, row)
+                self.table.setItem(row, column, item)
+        if self.releases:
+            self.table.selectRow(0)
+        else:
+            self.details.setPlainText(
+                "No stable numeric releases were found."
+            )
+
+    def show_release_details(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            self.details.clear()
+            self.install_button.setEnabled(False)
+            return
+        index = self.table.item(
+            rows[0].row(),
+            0,
+        ).data(Qt.ItemDataRole.UserRole)
+        release = self.releases[index]
+        notes = release.get("release_notes", "").strip()
+        self.details.setPlainText(
+            f"{release['tag_name']} — "
+            f"{'Currently installed' if release.get('current') else 'Published release'}\n\n"
+            f"{notes or release.get('reason') or 'No release notes.'}"
+        )
+        self.install_button.setEnabled(
+            self.can_install
+            and release.get("installable", False)
+            and not release.get("current", False)
+        )
+
+    def install_selected(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return
+        index = self.table.item(
+            rows[0].row(),
+            0,
+        ).data(Qt.ItemDataRole.UserRole)
+        release = self.releases[index]
+        if (
+            not self.can_install
+            or not release.get("installable")
+            or release.get("current")
+        ):
+            return
+        self.selected_release = {
+            "available": True,
+            "current_version": self.current_version,
+            "latest_version": release["tag_name"],
+            "version_selection": True,
+            "release_notes": release.get("release_notes", ""),
+            "release_url": release.get("release_url", ""),
+            "download_url": release["download_url"],
+            "digest": release["digest"],
+            "size": release["size"],
+        }
+        self.accept()
+
+
 class UserDialog(QDialog):
     data_updated = pyqtSignal()
 
@@ -607,9 +1056,9 @@ class UserDialog(QDialog):
 
         self.input_phoneno = QLineEdit()
         self.input_phoneno.setPlaceholderText("10-digit mobile number")
-        self.input_phoneno.setMaxLength(13)
+        self.input_phoneno.setMaxLength(10)
 
-        phone_regex = QRegularExpression(r"^\+?[0-9]{10,12}$")
+        phone_regex = QRegularExpression(r"^[0-9]{10}$")
         self.input_phoneno.setValidator(
             QRegularExpressionValidator(
                 phone_regex,
@@ -719,7 +1168,7 @@ class UserDialog(QDialog):
     def set_id_validator(self, role):
         if role == "Student":
             regex = QRegularExpression(
-                r"^[0-9]{5}-[A-Za-z]{2,4}-[0-9]{3}$"
+                r"^[0-9]{5}-[A-Za-z]{2}-[0-9]{3}$"
             )
             placeholder = "Example: 24001-CS-097"
 
@@ -729,8 +1178,8 @@ class UserDialog(QDialog):
             "Admin",
             "Librarian"
         ):
-            regex = QRegularExpression(r"^[0-9]{5}$")
-            placeholder = "5-digit Staff ID"
+            regex = QRegularExpression(r"^[A-Za-z]{2}[0-9]{6}$")
+            placeholder = "Branch code + 6 digits (e.g. CS000001)"
 
         else:
             regex = QRegularExpression(r"^$")
@@ -774,11 +1223,11 @@ class UserDialog(QDialog):
             )
             return
 
-        if phone and not phone.lstrip("+").isdigit():
+        if phone and not is_valid_phone_number(phone):
             show_warning(
                 self,
                 "Invalid Phone",
-                "Enter a valid phone number."
+                "Enter exactly 10 digits for the phone number."
             )
             return
 
@@ -795,18 +1244,17 @@ class UserDialog(QDialog):
             )
             return
 
-        validator = self.input_id.validator()
+        if self.user_id is None and not is_valid_user_id(user_id, role):
+            show_warning(
+                self,
+                "Invalid User ID",
+                "Students must use 5 digits, a 2-letter branch, and 3 digits "
+                "(for example, 24001-CS-097). Employee IDs must use a "
+                "2-letter branch code followed by 6 digits.",
+            )
+            return
 
-        if validator:
-            state = validator.validate(user_id, 0)[0]
-
-            if state != QValidator.State.Acceptable:
-                show_warning(
-                    self,
-                    "Invalid User ID",
-                    "The User ID format is invalid for the selected role."
-                )
-                return
+        user_id = user_id.upper()
 
         if role in ("Student", "Faculty", "Guest Lecturer"):
             department = self.combo_department.currentText()
@@ -2901,4 +3349,154 @@ class ReturnBookDialog(QDialog):
         return (
             self.input_book.text().strip(),
             self.input_user.text().strip()
+        )
+
+
+class BatchCirculationDialog(QDialog):
+    """Collect the common user or book details for a batch operation."""
+
+    def __init__(
+        self,
+        db,
+        mode,
+        selected_ids,
+        selection_type,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.mode = str(mode).upper()
+        self.selected_ids = [str(value) for value in selected_ids]
+        self.selection_type = selection_type
+        self.is_book_selection = selection_type == "books"
+        operation = "Issue" if self.mode == "ISSUE" else "Return"
+        selected_label = "books" if self.is_book_selection else "users"
+        target_label = "User ID" if self.is_book_selection else "Book ID"
+
+        configure_dialog(
+            self,
+            f"{operation} Books for Selected {selected_label.title()}",
+            480,
+            380 if self.mode == "ISSUE" else 330,
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
+        layout.addWidget(
+            create_heading(
+                f"{operation} {len(self.selected_ids)} selected "
+                f"{selected_label}"
+            )
+        )
+
+        details = QLabel(", ".join(self.selected_ids))
+        details.setWordWrap(True)
+        layout.addWidget(details)
+
+        hint = (
+            "All selected books will be processed for this user."
+            if self.is_book_selection
+            else "The selected book will be processed for each user."
+        )
+        hint_label = QLabel(hint)
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+
+        form = QFormLayout()
+        form.setSpacing(12)
+        self.target_input = QLineEdit()
+        self.target_input.setPlaceholderText(
+            f"Enter {target_label} or scan barcode"
+        )
+        form.addRow(f"{target_label}:", self.target_input)
+
+        self.spin_days = QSpinBox()
+        self.spin_days.setRange(1, 365)
+        try:
+            default_days = int(db.get_setting("default_days", 14))
+        except (TypeError, ValueError):
+            default_days = 14
+        self.spin_days.setValue(max(1, min(default_days, 365)))
+        self.spin_days.setSuffix(" days")
+        if self.mode == "ISSUE":
+            form.addRow("Loan Duration:", self.spin_days)
+
+        layout.addLayout(form)
+        layout.addStretch()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(create_button("Cancel", self.reject))
+        buttons.addWidget(
+            create_button(
+                f"{operation} Selected",
+                self.validate_and_accept,
+            )
+        )
+        layout.addLayout(buttons)
+
+    def validate_and_accept(self):
+        if not self.target_input.text().strip():
+            target = "User ID" if self.is_book_selection else "Book ID"
+            show_warning(
+                self,
+                f"Missing {target}",
+                f"Enter a {target}.",
+            )
+            self.target_input.setFocus()
+            return
+        self.accept()
+
+    def get_data(self):
+        return self.target_input.text().strip(), self.spin_days.value()
+
+
+class CustomEmailDialog(QDialog):
+    """Compose a one-off message for a library user."""
+
+    def __init__(self, recipient_name, parent=None):
+        super().__init__(parent)
+        configure_dialog(self, "Send Email to User", 540, 430)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
+        layout.addWidget(
+            create_heading(f"Compose message for {recipient_name}")
+        )
+
+        form = QFormLayout()
+        form.setSpacing(12)
+        self.subject_input = QLineEdit()
+        self.subject_input.setPlaceholderText("Email subject")
+        self.body_input = QPlainTextEdit()
+        self.body_input.setPlaceholderText("Write your message...")
+        self.body_input.setMinimumHeight(190)
+        form.addRow("Subject:", self.subject_input)
+        form.addRow("Message:", self.body_input)
+        layout.addLayout(form, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Send
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def validate_and_accept(self):
+        if not self.subject_input.text().strip():
+            show_warning(self, "Missing Subject", "Enter an email subject.")
+            self.subject_input.setFocus()
+            return
+        if not self.body_input.toPlainText().strip():
+            show_warning(self, "Missing Message", "Enter a message.")
+            self.body_input.setFocus()
+            return
+        self.accept()
+
+    def get_data(self):
+        return (
+            self.subject_input.text().strip(),
+            self.body_input.toPlainText().strip(),
         )

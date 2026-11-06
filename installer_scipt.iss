@@ -1,8 +1,8 @@
 [Setup]
 ; App Details
 AppName=Library
-AppVersion=1.0
-DefaultDirName={autopf}\Library
+AppVersion=2.0
+DefaultDirName={localappdata}\Programs\Library
 DefaultGroupName=Library
 PrivilegesRequired=lowest
 OutputDir=OutputInstaller
