@@ -1,13 +1,25 @@
 __pycache__/
-
 pages/__pycache__/
+*.pyc
+*.pyo
 
 build/
-
-OutputInstaller
-
 dist/
+OutputInstaller/
+Library-Windows.zip
+SHA256SUMS.txt
 
-*.pyc
+.venv/
+venv/
+env/
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+*.log
+*.db
+*.sqlite
+*.sqlite3
 
 .vscode/

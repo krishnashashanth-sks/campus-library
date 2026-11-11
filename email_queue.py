@@ -1,7 +1,16 @@
 import logging
 import socket
+import threading
 
-from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
+from PyQt6 import sip
+from PyQt6.QtCore import (
+    QCoreApplication,
+    QObject,
+    QRunnable,
+    QThreadPool,
+    QTimer,
+    pyqtSignal,
+)
 
 from database import LocalDatabase
 from email_service import LibraryEmailService, SMTP_HOST, SMTP_PORT
@@ -11,14 +20,32 @@ class _WorkerSignals(QObject):
     finished = pyqtSignal(dict)
 
 
+def _safe_emit(signals_obj, signal_name, *args):
+    if signals_obj is None:
+        return
+    try:
+        if sip.isdeleted(signals_obj):
+            return
+        app = QCoreApplication.instance()
+        if app is not None and app.closingDown():
+            return
+        signal = getattr(signals_obj, signal_name, None)
+        if signal is not None:
+            signal.emit(*args)
+    except (RuntimeError, AttributeError):
+        pass
+
+
 class EmailTestWorker(QRunnable):
-    def __init__(self, database_path):
+    def __init__(self, database_path, stop_event=None):
         super().__init__()
         self.database_path = database_path
+        self._stop_event = stop_event
         self.signals = _WorkerSignals()
 
     def run(self):
         db = None
+        payload = None
         try:
             db = LocalDatabase(self.database_path)
             sender = str(db.get_setting("email_sender", "")).strip()
@@ -31,21 +58,28 @@ class EmailTestWorker(QRunnable):
                 "Library email configuration test",
                 "Your library email service is configured successfully.",
             )
-            self.signals.finished.emit({"sent": True})
+            payload = {"sent": True}
         except Exception as error:
-            self.signals.finished.emit(
-                {"sent": False, "error": str(error)}
-            )
+            payload = {"sent": False, "error": str(error)}
         finally:
             if db is not None:
-                db.close()
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            if (
+                payload is not None
+                and (self._stop_event is None or not self._stop_event.is_set())
+            ):
+                _safe_emit(self.signals, "finished", payload)
 
 
 class EmailWorker(QRunnable):
-    def __init__(self, database_path, retry_failed=False):
+    def __init__(self, database_path, retry_failed=False, stop_event=None):
         super().__init__()
         self.database_path = database_path
         self.retry_failed = retry_failed
+        self._stop_event = stop_event
         self.signals = _WorkerSignals()
 
     @staticmethod
@@ -71,6 +105,9 @@ class EmailWorker(QRunnable):
             "error": None,
         }
         try:
+            if self._stop_event is not None and self._stop_event.is_set():
+                return
+
             db = LocalDatabase(self.database_path)
             result["enabled"] = (
                 str(
@@ -93,12 +130,16 @@ class EmailWorker(QRunnable):
 
             if not result["configured"]:
                 return
+            if self._stop_event is not None and self._stop_event.is_set():
+                return
 
             result["online"] = self._is_online()
             if not result["online"]:
                 return
 
             for email_id, recipient, subject, body in db.get_pending_emails():
+                if self._stop_event is not None and self._stop_event.is_set():
+                    break
                 if str(
                     db.get_setting("email_delivery_enabled", "0")
                 ).casefold() not in ("1", "true", "yes"):
@@ -125,8 +166,12 @@ class EmailWorker(QRunnable):
             logging.exception("Email queue synchronization failed.")
         finally:
             if db is not None:
-                db.close()
-            self.signals.finished.emit(result)
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            if self._stop_event is None or not self._stop_event.is_set():
+                _safe_emit(self.signals, "finished", result)
 
 
 class EmailQueueManager(QObject):
@@ -144,6 +189,8 @@ class EmailQueueManager(QObject):
         self.status_timer = QTimer(self)
         self.status_timer.setInterval(5_000)
         self.status_timer.timeout.connect(self.refresh_status)
+        self._shutting_down = False
+        self._stop_event = threading.Event()
         self._sync_in_progress = False
         self._sync_requested = False
         self._retry_failed_requested = False
@@ -154,12 +201,32 @@ class EmailQueueManager(QObject):
         self._retrying = False
 
     def start(self):
+        if self._shutting_down:
+            return
+        self._stop_event.clear()
         self.sync_timer.start()
         self.status_timer.start()
         QTimer.singleShot(0, self.sync_now)
         self.refresh_status()
 
+    def stop(self, wait_ms=3500):
+        self._shutting_down = True
+        self._sync_requested = False
+        self._retry_failed_requested = False
+        self._stop_event.set()
+        for timer in (self.sync_timer, self.status_timer):
+            try:
+                timer.stop()
+            except (RuntimeError, AttributeError):
+                pass
+        try:
+            return self.thread_pool.waitForDone(wait_ms)
+        except (RuntimeError, AttributeError):
+            return True
+
     def sync_now(self):
+        if self._shutting_down or self._stop_event.is_set():
+            return
         if self._sync_in_progress:
             self._sync_requested = True
             return
@@ -170,17 +237,22 @@ class EmailQueueManager(QObject):
         worker = EmailWorker(
             self.database_path,
             retry_failed=self._retry_failed_requested,
+            stop_event=self._stop_event,
         )
         self._retry_failed_requested = False
         worker.signals.finished.connect(self._sync_finished)
         self.thread_pool.start(worker)
 
     def retry_failed_now(self):
+        if self._shutting_down or self._stop_event.is_set():
+            return
         self._retry_failed_requested = True
         self.sync_now()
 
     def _sync_finished(self, result):
         self._sync_in_progress = False
+        if self._shutting_down or sip.isdeleted(self):
+            return
         self._configured = result.get("configured")
         self._enabled = result.get("enabled")
         self._online = result.get("online")
@@ -188,11 +260,13 @@ class EmailQueueManager(QObject):
         self._retrying = bool(result.get("failed"))
         self.refresh_status()
 
-        if self._sync_requested:
+        if self._sync_requested and not self._shutting_down:
             self._sync_requested = False
             self.sync_now()
 
     def refresh_status(self):
+        if self._shutting_down or sip.isdeleted(self):
+            return
         try:
             if self.status_database is not None:
                 counts = self.status_database.get_email_queue_counts()
@@ -204,7 +278,7 @@ class EmailQueueManager(QObject):
                     db.close()
         except Exception:
             logging.exception("Could not read the email queue status.")
-            self.status_changed.emit("Email queue status unavailable")
+            _safe_emit(self, "status_changed", "Email queue status unavailable")
             return
 
         pending = counts["pending"]
@@ -232,4 +306,4 @@ class EmailQueueManager(QObject):
         else:
             message = f"Email sync checking ({queued_text})"
 
-        self.status_changed.emit(message)
+        _safe_emit(self, "status_changed", message)

@@ -15,7 +15,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
+from PyQt6 import sip
+from PyQt6.QtCore import QCoreApplication, QObject, QRunnable, pyqtSignal
 
 from app_version import (
     INSTALLED_VERSION_FILE,
@@ -40,6 +41,22 @@ MAX_EXTRACTED_BYTES = 2_000_000_000
 class _UpdateSignals(QObject):
     finished = pyqtSignal(object)
     progress = pyqtSignal(int)
+
+
+def _safe_emit_update(signals_obj, signal_name, value):
+    if signals_obj is None:
+        return
+    try:
+        if sip.isdeleted(signals_obj):
+            return
+        app = QCoreApplication.instance()
+        if app is not None and app.closingDown():
+            return
+        signal = getattr(signals_obj, signal_name, None)
+        if signal is not None:
+            signal.emit(value)
+    except (RuntimeError, AttributeError):
+        pass
 
 
 def _version_parts(version):
@@ -293,11 +310,13 @@ class UpdateCheckWorker(QRunnable):
 
     def run(self):
         try:
-            self.signals.finished.emit(_fetch_release())
+            _safe_emit_update(self.signals, "finished", _fetch_release())
         except Exception as error:
-            self.signals.finished.emit({
-                "error": format_update_error(error),
-            })
+            _safe_emit_update(
+                self.signals,
+                "finished",
+                {"error": format_update_error(error)},
+            )
 
 
 class VersionHistoryWorker(QRunnable):
@@ -307,11 +326,15 @@ class VersionHistoryWorker(QRunnable):
 
     def run(self):
         try:
-            self.signals.finished.emit(_fetch_release_history())
+            _safe_emit_update(
+                self.signals, "finished", _fetch_release_history()
+            )
         except Exception as error:
-            self.signals.finished.emit({
-                "error": format_update_error(error),
-            })
+            _safe_emit_update(
+                self.signals,
+                "finished",
+                {"error": format_update_error(error)},
+            )
 
 
 def _safe_extract_package(archive_path, destination):
@@ -435,15 +458,21 @@ class UpdateDownloadWorker(QRunnable):
         try:
             staged_path = _download_and_stage(
                 self.release,
-                self.signals.progress.emit,
+                lambda pct: _safe_emit_update(
+                    self.signals, "progress", pct
+                ),
             )
-            self.signals.finished.emit(
-                {"staged_path": staged_path}
+            _safe_emit_update(
+                self.signals,
+                "finished",
+                {"staged_path": staged_path},
             )
         except Exception as error:
-            self.signals.finished.emit({
-                "error": format_update_error(error),
-            })
+            _safe_emit_update(
+                self.signals,
+                "finished",
+                {"error": format_update_error(error)},
+            )
 
 
 _UPDATE_HELPER = r"""

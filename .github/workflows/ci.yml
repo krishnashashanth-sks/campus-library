@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate & Package (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            requirements-services.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q -x "(\.venv|build|dist)" .
+
+      - name: Run release readiness tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Ensure Inno Setup 6 is installed
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            choco install innosetup -y
+          }
+
+      - name: Build application and installer
+        shell: pwsh
+        run: .\scripts\build_windows.ps1
+
+      - name: Upload preview build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-preview-installer
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            OutputInstaller/LibraryInstaller.exe
+            Library-Windows.zip
+            SHA256SUMS.txt

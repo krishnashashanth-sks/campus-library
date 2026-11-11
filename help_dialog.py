@@ -1,5 +1,6 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QLabel,
@@ -8,16 +9,18 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ui_responsive import clamp_widget_to_screen
+
 
 class HelpDialog(QDialog):
     SECTIONS = (
         (
             "Getting Started",
-            "Navigation\n"
+            "Navigation & Quick Desk Actions\n"
             "Use the left sidebar to switch between Dashboard, Books, Users, "
-            "Circulation, Reports, and Settings. The Dashboard summarizes "
-            "inventory and loans, provides the Express Desk and Quick "
-            "Actions, and lists recent circulation.\n\n"
+            "Circulation, Reports, and Settings. Click ⚡ Quick Actions in the "
+            "bottom-right corner on any page (or press Ctrl+K) to open the "
+            "Quick Desk Actions drawer without scrolling.\n\n"
             "Global search\n"
             "Type a book ID, title, author, ISBN, member ID, member name, "
             "or transaction detail in the search field at the top of the "
@@ -53,43 +56,54 @@ class HelpDialog(QDialog):
         ),
         (
             "Batch Circulation",
-            "Issue or return several records in one operation:\n"
+            "Issue, return, renew, or settle multiple records at once:\n"
             "• In Books, Ctrl-click or Shift-click multiple books, then "
             "open Actions to issue or return the selected titles for one "
             "user.\n"
             "• In Users, select multiple users, then open Actions to issue "
-            "or return one title for each selected user.\n\n"
+            "or return one title for each selected user.\n"
+            "• In Circulation, select multiple transactions to batch renew "
+            "active loans, batch return books, or mark selected unpaid "
+            "fines as paid.\n\n"
             "Each transaction is processed separately. Review the result "
             "summary for successful and failed items; the selection remains "
             "available so you can check or retry failures.",
         ),
         (
             "Circulation",
-            "Issue and return books\n"
-            "Use Issue Book or Return Book on the Dashboard or open "
-            "Circulation from the sidebar. Follow the prompts and check "
-            "the selected user and book before confirming. The Express "
-            "Desk accepts a member ID and book ID; press Enter to issue or "
-            "Shift+Enter to return.\n\n"
-            "Recent circulation\n"
+            "Issue, renew, and return books\n"
+            "Use Issue Book, Return Book, or the Express Desk on the "
+            "Dashboard, or open Circulation from the sidebar. On the Express "
+            "Desk, press Enter to issue, click ↻ Renew when an active loan "
+            "exists for the entered Member ID + Book ID, or press Shift+Enter "
+            "to return.\n\n"
+            "Recent circulation & Fines\n"
             "Use the Dashboard activity filters to view recent activity, "
-            "today's issues, items due today, or overdue alerts. Return "
-            "processes an eligible loan. Inspect opens the selected "
-            "transaction's details. View All opens searchable activity "
-            "history. The Circulation page's table and inspector show "
-            "transaction details and available actions.",
+            "today's issues, items due today, overdue alerts, or renewed "
+            "loans. Renew opens the Advanced Renewal configurator to extend "
+            "the due date with preset or custom days, overdue fine handling, "
+            "policy limits and overrides, and renewal history tracking. "
+            "Inspect opens the selected transaction's full details and "
+            "renewal timeline, and View All opens searchable history.\n\n"
+            "Pending Fines Desk\n"
+            "Click Unpaid Fines on the Dashboard or Pending Fines in "
+            "Circulation to inspect unpaid/carried fines, mark individual "
+            "or member-wide fines as Paid or Waived, and export CSVs. "
+            "Individual loans can also have fines settled from Circulation, "
+            "Users (View Assigned Books / Inspector), and Book History.",
         ),
         (
             "Quick Scan",
-            "Open Quick Scan from the Dashboard's Quick Actions or press "
-            "Ctrl+Shift+K from anywhere in the application. Scan with the "
+            "Open Quick Scan from Quick Desk Actions (bottom-right ⚡ Quick Actions) "
+            "or press Ctrl+Shift+K from anywhere in the application. Scan with the "
             "camera or a USB barcode scanner, or type the book ID manually. "
-            "Enter the member ID/PIN, choose a loan duration, then select "
-            "Issue Book or Return Book. If the camera is unavailable, the "
-            "USB scanner and manual entry remain available.",
+            "Enter the member ID/PIN to preview live copy availability, "
+            "member role defaults, and active loan status, then choose "
+            "Issue Book, Renew Book, or Return Book. If the camera is "
+            "unavailable, the USB scanner and manual entry remain available.",
         ),
         (
-            "Email & Offline Use",
+            "Email && Offline Use",
             "Email notifications are saved to the local queue before "
             "delivery. When the network or mail service is unavailable, "
             "queued messages remain pending and are retried by background "
@@ -98,20 +112,25 @@ class HelpDialog(QDialog):
             "configuration, enable due reminders, or select Sync Now.",
         ),
         (
-            "Reports & Settings",
-            "Use Reports to review library activity and available summaries. "
-            "Settings contains circulation policies, theme preferences, "
-            "academic and security options, database maintenance, email "
-            "configuration, and Application Updates. Check for Updates "
-            "compares the installed version with the latest stable release; "
-            "confirm before applying an update and restarting the app. "
-            "Review confirmation dialogs before maintenance or security-"
-            "sensitive actions.",
+            "Reports && Settings",
+            "Use Reports to analyze Books Issued, Books Returned, Loan "
+            "Renewals (+extension days), Issued vs. Overdue breakdowns, "
+            "and Fine collections/waivers/pending balances, and export "
+            "detailed CSV reports.\n\n"
+            "Settings contains global circulation/renewal rules, Role-Based "
+            "Borrowing & Fine Policies (Max Books, Loan Days, Daily Fine per "
+            "role), theme preferences, academic and security options, "
+            "database maintenance, email configuration, and Application "
+            "Updates. Check for Updates compares the installed version with "
+            "the latest stable release; confirm before applying an update "
+            "and restarting the app. Review confirmation dialogs before "
+            "maintenance or security-sensitive actions.",
         ),
         (
             "Keyboard Shortcuts",
             "General\n"
             "F1 - Open Help\n"
+            "Ctrl+K - Open Quick Desk Actions drawer (available on every page)\n"
             "Ctrl+F - Focus global search\n\n"
             "Circulation and records\n"
             "Ctrl+I - Open Issue Book\n"
@@ -129,20 +148,67 @@ class HelpDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Library Management System Help")
-        self.setMinimumSize(600, 420)
-        self.resize(760, 520)
+        clamp_widget_to_screen(self, 920, 560, min_width=460, min_height=340)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 14)
         layout.setSpacing(12)
 
+        heading = QLabel("📖  Library Management System Guide")
+        heading.setWordWrap(True)
+        heading.setProperty("class", "dialog-heading")
+        layout.addWidget(heading)
+
         introduction = QLabel(
-            "Quick guidance for common workflows and offline email sync."
+            "Quick guidance for common workflows, batch operations, renewals, fines, and offline email sync."
         )
         introduction.setWordWrap(True)
         layout.addWidget(introduction)
 
         tabs = QTabWidget()
+        tabs.setObjectName("HelpTabs")
+        tabs.tabBar().setExpanding(False)
+        tabs.tabBar().setUsesScrollButtons(True)
+        app = QApplication.instance()
+        tm = app.property("theme_manager") if app is not None else None
+        colors = None
+        if tm is not None and hasattr(tm, "COLORS"):
+            active = tm.get_active_theme() if hasattr(tm, "get_active_theme") else "Dark"
+            colors = tm.COLORS.get(active)
+        if not colors:
+            colors = {
+                "surface_alt": "#CFDDF3",
+                "muted": "#283D5E",
+                "border": "#88A4CE",
+                "primary": "#1D4ED8",
+                "indigo": "#4338CA",
+                "primary_soft": "rgba(29, 78, 216, 0.20)",
+                "text": "#0A1628",
+            }
+        tabs.setStyleSheet(
+            f"QTabWidget#HelpTabs QTabBar::tab {{"
+            f" background-color: {colors['surface_alt']};"
+            f" color: {colors['muted']};"
+            f" border: 1px solid {colors['border']};"
+            f" border-bottom: none;"
+            f" border-top-left-radius: 8px;"
+            f" border-top-right-radius: 8px;"
+            f" padding: 7px 10px;"
+            f" margin-right: 3px;"
+            f" font-size: 11px;"
+            f" font-weight: 600;"
+            f"}}"
+            f"QTabWidget#HelpTabs QTabBar::tab:hover {{"
+            f" background-color: {colors['primary_soft']};"
+            f" color: {colors['text']};"
+            f"}}"
+            f"QTabWidget#HelpTabs QTabBar::tab:selected {{"
+            f" background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {colors['primary']}, stop:1 {colors['indigo']});"
+            f" color: #FFFFFF;"
+            f" border-color: {colors['primary']};"
+            f" font-weight: 700;"
+            f"}}"
+        )
         for title, content in self.SECTIONS:
             page = QPlainTextEdit()
             page.setReadOnly(True)
@@ -162,5 +228,6 @@ class HelpDialog(QDialog):
             QDialogButtonBox.StandardButton.Close
         )
         if close_button:
+            close_button.setObjectName("PrimaryButton")
             close_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(buttons)

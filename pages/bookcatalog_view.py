@@ -7,6 +7,7 @@ from PyQt6.QtCore import (
     QEvent,
     QItemSelectionModel,
     QPoint,
+    QSize,
     Qt,
     pyqtSignal,
 )
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QTabWidget,
     QFormLayout,
+    QSplitter,
 )
 
 from dialogs import (
@@ -41,6 +43,14 @@ from dialogs import (
     IssueBookDialog,
     ReturnBookDialog,
     BatchCirculationDialog,
+)
+from ui_responsive import (
+    FlowLayout,
+    configure_inspector_button,
+    configure_inspector_form,
+    configure_wrapped_label,
+    make_scrollable_tab,
+    sync_responsive_splitter,
 )
 
 from utils import clear_layout, is_valid_book_id, rgba_color
@@ -77,31 +87,37 @@ class MetricCard(QFrame):
         accent=ACCENT_BLUE,
         filter_key="ALL",
         parent=None,
+        colors=None,
     ):
         super().__init__(parent)
 
         self.accent = accent
         self.filter_key = filter_key
         self.selected = False
+        self._colors = colors or {}
 
         self.setObjectName("MetricCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self.setMinimumHeight(100)
+        self.setMinimumWidth(0)
+        self.setMinimumHeight(60)
         self.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(5)
+        layout.setContentsMargins(11, 5, 11, 5)
+        layout.setSpacing(2)
 
         self.lbl_title = QLabel(title)
         self.lbl_title.setObjectName("MetricTitle")
+        self.lbl_title.setWordWrap(True)
+        self.lbl_title.setMinimumWidth(0)
 
         self.lbl_value = QLabel(str(value))
         self.lbl_value.setObjectName("MetricValue")
+        self.lbl_value.setMinimumWidth(0)
 
         self.lbl_title.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents
@@ -114,49 +130,83 @@ class MetricCard(QFrame):
         layout.addWidget(self.lbl_title)
         layout.addWidget(self.lbl_value)
 
-        self.apply_style()
+        self.apply_style(self._colors)
+
+    def minimumSizeHint(self):
+        return QSize(0, self.minimumHeight())
 
     def set_value(self, value):
         self.lbl_value.setText(str(value))
 
     def set_selected(self, selected):
         self.selected = bool(selected)
-        self.apply_style()
+        self.apply_style(self._colors)
 
-    def apply_style(self):
-        background = rgba_color(
+    def set_accent(self, accent, colors=None):
+        if accent:
+            self.accent = accent
+        if colors is not None:
+            self._colors = colors
+        self.apply_style(self._colors)
+
+    def apply_style(self, colors=None):
+        if colors is not None:
+            self._colors = colors
+        c = self._colors or {}
+        is_dark = QColor(c.get("window", "#090E1A")).lightness() < 128
+        muted = c.get("muted", "#9BB0CE")
+        bg_start = rgba_color(
             self.accent,
-            0.20 if self.selected else 0.09,
+            (0.25 if self.selected else 0.14)
+            if is_dark
+            else (0.42 if self.selected else 0.30),
         )
+        bg_end = rgba_color(
+            self.accent,
+            (0.12 if self.selected else 0.04)
+            if is_dark
+            else (0.20 if self.selected else 0.14),
+        )
+        hover_start = rgba_color(self.accent, 0.28 if is_dark else 0.46)
+        hover_end = rgba_color(self.accent, 0.12 if is_dark else 0.22)
         border = self.accent if self.selected else rgba_color(
             self.accent,
-            0.48,
+            0.52 if is_dark else 0.65,
         )
 
         self.setStyleSheet(f"""
             QFrame#MetricCard {{
-                background-color: {background};
-                border: 1px solid {border};
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {bg_start}, stop:1 {bg_end}
+                );
+                border: {2 if self.selected else 1}px solid {border};
                 border-left: 4px solid {self.accent};
-                border-radius: 10px;
+                border-radius: 11px;
             }}
 
             QFrame#MetricCard:hover {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {hover_start},
+                    stop:1 {hover_end}
+                );
                 border: 2px solid {self.accent};
                 border-left: 5px solid {self.accent};
             }}
 
             QLabel#MetricTitle {{
-                color: palette(placeholder-text);
+                color: {muted};
                 font-size: 10px;
-                font-weight: 700;
+                font-weight: 800;
+                letter-spacing: 0.6px;
                 background: transparent;
                 border: none;
             }}
 
             QLabel#MetricValue {{
                 color: {self.accent};
-                font-size: 23px;
+                font-size: 20px;
                 font-weight: 800;
                 background: transparent;
                 border: none;
@@ -207,7 +257,11 @@ class CatalogView(QWidget):
 
         self.metric_cards = {}
         self._metrics_columns = None
-        self._compact_layout = None
+        self._header_compact = None
+        self._toolbar_compact = None
+        self._splitter_vertical = None
+        self._table_compact = None
+        self._page_compact = None
         self._control_center_expanded = True
 
         app = QApplication.instance()
@@ -226,17 +280,24 @@ class CatalogView(QWidget):
     # ========================================================
 
     def _build_ui(self):
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         main_layout = QVBoxLayout(self)
-
-        main_layout.setContentsMargins(20, 16, 20, 16)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(16, 10, 16, 40)
+        main_layout.setSpacing(8)
+        self.main_layout = main_layout
 
         # HEADER
-        header = QHBoxLayout()
+        header = QGridLayout()
+        header.setHorizontalSpacing(10)
+        header.setVerticalSpacing(8)
+        self.header_layout = header
 
         title_column = QVBoxLayout()
         title_column.setSpacing(2)
+        self.title_column_host = QWidget()
+        self.title_column_host.setLayout(title_column)
+        self.title_column_host.setMinimumWidth(0)
 
         self.lbl_title = QLabel("Book Catalog")
         self.lbl_title.setObjectName("PageTitle")
@@ -262,11 +323,14 @@ class CatalogView(QWidget):
         title_column.addWidget(self.lbl_title)
         title_column.addWidget(self.lbl_subtitle)
 
-        header.addLayout(title_column, 1)
+        self.header_actions_host = QWidget()
+        header_actions = QHBoxLayout(self.header_actions_host)
+        header_actions.setContentsMargins(0, 0, 0, 0)
+        header_actions.setSpacing(8)
 
         self.refresh_btn = QPushButton("↻ Refresh")
         self.refresh_btn.setObjectName("SecondaryButton")
-        self.refresh_btn.setMinimumHeight(36)
+        self.refresh_btn.setMinimumHeight(32)
         self.refresh_btn.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
@@ -274,11 +338,11 @@ class CatalogView(QWidget):
             self.load_books_to_table
         )
 
-        header.addWidget(self.refresh_btn)
+        header_actions.addWidget(self.refresh_btn)
 
         self.control_center_btn = QPushButton("Hide Details")
         self.control_center_btn.setObjectName("SecondaryButton")
-        self.control_center_btn.setMinimumHeight(36)
+        self.control_center_btn.setMinimumHeight(32)
         self.control_center_btn.setToolTip(
             "Show or hide the Book Control Center"
         )
@@ -288,8 +352,10 @@ class CatalogView(QWidget):
         self.control_center_btn.clicked.connect(
             self.toggle_control_center
         )
-        header.addWidget(self.control_center_btn)
+        header_actions.addWidget(self.control_center_btn)
+        self.header_actions_stretch = header_actions
 
+        self._reflow_header(compact=False)
         main_layout.addLayout(header)
 
         # ====================================================
@@ -371,10 +437,11 @@ class CatalogView(QWidget):
         toolbar = QFrame()
         toolbar.setObjectName("CatalogToolbar")
 
-        toolbar_layout = QHBoxLayout(toolbar)
-
-        toolbar_layout.setContentsMargins(10, 8, 10, 8)
-        toolbar_layout.setSpacing(8)
+        toolbar_layout = QGridLayout(toolbar)
+        toolbar_layout.setContentsMargins(8, 6, 8, 6)
+        toolbar_layout.setHorizontalSpacing(8)
+        toolbar_layout.setVerticalSpacing(6)
+        self.toolbar_layout = toolbar_layout
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("CatalogSearch")
@@ -384,29 +451,30 @@ class CatalogView(QWidget):
         )
 
         self.search_input.setClearButtonEnabled(True)
-        self.search_input.setMinimumHeight(36)
+        self.search_input.setMinimumHeight(32)
+        self.search_input.setMinimumWidth(0)
 
         self.search_input.textChanged.connect(
             self.apply_filters
         )
 
         self.export_btn = QPushButton("Export CSV")
-        self.export_btn.setObjectName("SecondaryButton")
-        self.export_btn.setMinimumHeight(36)
+        self.export_btn.setObjectName("SuccessButton")
+        self.export_btn.setMinimumHeight(32)
         self.export_btn.clicked.connect(
             self.export_books_to_csv
         )
 
         self.import_btn = QPushButton("Import CSV / XLSX")
-        self.import_btn.setObjectName("SecondaryButton")
-        self.import_btn.setMinimumHeight(36)
+        self.import_btn.setObjectName("InfoButton")
+        self.import_btn.setMinimumHeight(32)
         self.import_btn.clicked.connect(
             self.import_books_from_file
         )
 
         self.addbook_btn = QPushButton("+ Add New Book")
         self.addbook_btn.setObjectName("PrimaryButton")
-        self.addbook_btn.setMinimumHeight(36)
+        self.addbook_btn.setMinimumHeight(32)
         self.addbook_btn.clicked.connect(self.add_book)
 
         for button in (
@@ -417,11 +485,9 @@ class CatalogView(QWidget):
             button.setCursor(
                 Qt.CursorShape.PointingHandCursor
             )
+            button.setMinimumWidth(0)
 
-        toolbar_layout.addWidget(self.search_input, 1)
-        toolbar_layout.addWidget(self.export_btn)
-        toolbar_layout.addWidget(self.import_btn)
-        toolbar_layout.addWidget(self.addbook_btn)
+        self._reflow_toolbar(compact=False)
 
         main_layout.addWidget(toolbar)
 
@@ -432,10 +498,19 @@ class CatalogView(QWidget):
         filter_frame = QFrame()
         filter_frame.setObjectName("FilterBar")
 
-        filter_layout = QHBoxLayout(filter_frame)
+        filter_outer = QHBoxLayout(filter_frame)
+        filter_outer.setContentsMargins(6, 5, 8, 5)
+        filter_outer.setSpacing(8)
 
-        filter_layout.setContentsMargins(6, 4, 6, 4)
-        filter_layout.setSpacing(4)
+        filters_host = QWidget()
+        filters_host.setObjectName("FilterButtonsHost")
+        filters_host.setMinimumWidth(0)
+        filters_host.setStyleSheet("background: transparent; border: none;")
+        filters_host.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        filter_layout = FlowLayout(filters_host, margin=0, h_spacing=6, v_spacing=5)
 
         self.filter_buttons = {}
 
@@ -443,7 +518,10 @@ class CatalogView(QWidget):
 
             button = QPushButton(label)
             button.setObjectName("FilterButton")
+            button.setProperty("filterRole", key)
             button.setCheckable(True)
+            button.setFixedHeight(28)
+            button.setMinimumWidth(0)
             button.setChecked(key == "ALL")
 
             button.setCursor(
@@ -459,12 +537,22 @@ class CatalogView(QWidget):
 
             filter_layout.addWidget(button)
 
-        filter_layout.addStretch()
+        filter_outer.addWidget(filters_host, 1)
 
         self.lbl_count = QLabel("0 titles")
         self.lbl_count.setObjectName("CountLabel")
+        self.lbl_count.setFixedHeight(28)
+        self.lbl_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_count.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
 
-        filter_layout.addWidget(self.lbl_count)
+        filter_outer.addWidget(
+            self.lbl_count,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
 
         main_layout.addWidget(filter_frame)
 
@@ -472,8 +560,10 @@ class CatalogView(QWidget):
         # CONTENT AREA
         # ====================================================
 
-        content_layout = QHBoxLayout()
-        content_layout.setSpacing(12)
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setObjectName("CatalogSplitter")
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.setHandleWidth(8)
 
         # BOOK TABLE
         self.table = QTableWidget()
@@ -482,6 +572,8 @@ class CatalogView(QWidget):
 
         self.table.setColumnCount(len(self.HEADERS))
         self.table.setHorizontalHeaderLabels(self.HEADERS)
+        self.table.setMinimumHeight(110)
+        self.table.setMinimumWidth(0)
 
         # Configure Header Resizing
         header_view = self.table.horizontalHeader()
@@ -493,12 +585,9 @@ class CatalogView(QWidget):
                 QHeaderView.ResizeMode.Interactive,
             )
 
-        # Stretch the text columns to fill the remaining empty space
-        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)          # Title
-        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)          # Author
-        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)          # Publisher
-        for column, width in ((0, 105), (4, 95), (5, 90), (6, 115)):
+        for column, width in ((0, 72), (4, 82), (5, 72), (6, 86)):
             self.table.setColumnWidth(column, width)
+        self._apply_table_column_modes(compact=False)
 
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -518,9 +607,9 @@ class CatalogView(QWidget):
         self.table.viewport().setMouseTracking(True)
 
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(44)
+        self.table.verticalHeader().setDefaultSectionSize(40)
 
-        header_view.setMinimumSectionSize(65)
+        header_view.setMinimumSectionSize(44)
         header_view.setHighlightSections(False)
 
         self.table.setContextMenuPolicy(
@@ -541,7 +630,7 @@ class CatalogView(QWidget):
 
         self._create_book_hover_preview()
 
-        content_layout.addWidget(self.table, 1)
+        self.content_splitter.addWidget(self.table)
 
         # ====================================================
         # BOOK INSPECTOR
@@ -550,8 +639,8 @@ class CatalogView(QWidget):
         self.detail_container = QFrame()
         self.detail_container.setObjectName("BookInspector")
 
-        self.detail_container.setMinimumWidth(265)
-        self.detail_container.setMaximumWidth(360)
+        self.detail_container.setMinimumWidth(220)
+        self.detail_container.setMaximumWidth(340)
 
         self.detail_container.setSizePolicy(
             QSizePolicy.Policy.Preferred,
@@ -569,6 +658,8 @@ class CatalogView(QWidget):
             "Book Control Center"
         )
         self.inspector_title.setObjectName("SectionTitle")
+        self.inspector_title.setWordWrap(True)
+        self.inspector_title.setMinimumWidth(0)
 
         inspector_layout.addWidget(
             self.inspector_title
@@ -576,57 +667,153 @@ class CatalogView(QWidget):
 
         self.tab_widget = QTabWidget()
         self.tab_widget.setObjectName("InspectorTabs")
+        self.tab_widget.tabBar().setExpanding(False)
+        self.tab_widget.tabBar().setUsesScrollButtons(True)
 
-        # DETAILS TAB
-        self.tab_overview = QWidget()
-
-        self.overview_layout = QVBoxLayout(
-            self.tab_overview
-        )
-
-        self.overview_layout.setContentsMargins(
-            8, 8, 8, 8
-        )
-
-        self.overview_layout.setSpacing(8)
-
-        self.tab_widget.addTab(
-            self.tab_overview,
+        # DETAILS TAB (scrollable so content is never clipped on small displays)
+        self.tab_overview, self.overview_layout, _overview_content = make_scrollable_tab(
+            self.tab_widget,
             "Details",
+            margins=(8, 8, 8, 8),
+            spacing=8,
+            object_name="BookOverviewScroll",
         )
 
-        # ACTIONS TAB
-        self.tab_actions = QWidget()
-
-        self.actions_layout = QVBoxLayout(
-            self.tab_actions
-        )
-
-        self.actions_layout.setContentsMargins(
-            8, 8, 8, 8
-        )
-
-        self.actions_layout.setSpacing(6)
-
-        self.tab_widget.addTab(
-            self.tab_actions,
+        # ACTIONS TAB (scrollable)
+        self.tab_actions, self.actions_layout, _actions_content = make_scrollable_tab(
+            self.tab_widget,
             "Actions",
+            margins=(8, 8, 8, 8),
+            spacing=6,
+            object_name="BookActionsScroll",
         )
 
         inspector_layout.addWidget(
             self.tab_widget
         )
 
-        content_layout.addWidget(
+        self.content_splitter.addWidget(
             self.detail_container
         )
 
-        main_layout.addLayout(
-            content_layout,
+        main_layout.addWidget(
+            self.content_splitter,
             1,
         )
 
+        self._sync_responsive_layout()
         self.show_default_inspector()
+
+    def _reflow_header(self, compact: bool):
+        if compact == self._header_compact:
+            return
+        self.header_layout.removeWidget(self.title_column_host)
+        self.header_layout.removeWidget(self.header_actions_host)
+        self.header_layout.setColumnStretch(0, 1)
+        self.header_layout.setColumnStretch(1, 0)
+        if compact:
+            self.header_layout.addWidget(self.title_column_host, 0, 0)
+            self.header_layout.addWidget(
+                self.header_actions_host,
+                1,
+                0,
+                Qt.AlignmentFlag.AlignLeft,
+            )
+        else:
+            self.header_layout.addWidget(self.title_column_host, 0, 0)
+            self.header_layout.addWidget(
+                self.header_actions_host,
+                0,
+                1,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+        self._header_compact = compact
+
+    def _reflow_toolbar(self, compact: bool):
+        if compact == self._toolbar_compact:
+            return
+        for widget in (self.search_input, self.export_btn, self.import_btn, self.addbook_btn):
+            self.toolbar_layout.removeWidget(widget)
+        for col in range(4):
+            self.toolbar_layout.setColumnStretch(col, 0)
+        if compact:
+            self.toolbar_layout.addWidget(self.search_input, 0, 0, 1, 3)
+            self.toolbar_layout.addWidget(self.export_btn, 1, 0)
+            self.toolbar_layout.addWidget(self.import_btn, 1, 1)
+            self.toolbar_layout.addWidget(self.addbook_btn, 1, 2)
+            for col in range(3):
+                self.toolbar_layout.setColumnStretch(col, 1)
+        else:
+            self.toolbar_layout.addWidget(self.search_input, 0, 0)
+            self.toolbar_layout.addWidget(self.export_btn, 0, 1)
+            self.toolbar_layout.addWidget(self.import_btn, 0, 2)
+            self.toolbar_layout.addWidget(self.addbook_btn, 0, 3)
+            self.toolbar_layout.setColumnStretch(0, 1)
+        self._toolbar_compact = compact
+
+    def _apply_table_column_modes(self, compact: bool):
+        if compact == self._table_compact:
+            return
+        header_view = self.table.horizontalHeader()
+        if compact:
+            for col, width in ((0, 74), (1, 185), (2, 140), (3, 130), (4, 82), (5, 72), (6, 86)):
+                header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+                self.table.setColumnWidth(col, width)
+        else:
+            for col, width in ((0, 72), (4, 108), (5, 62), (6, 76)):
+                header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+                self.table.setColumnWidth(col, width)
+            for col in (1, 2, 3):
+                header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        self._table_compact = compact
+
+    def _update_splitter_min_height(self):
+        if self._splitter_vertical and self._control_center_expanded:
+            self.content_splitter.setMinimumHeight(250)
+        else:
+            self.content_splitter.setMinimumHeight(120)
+
+    def _sync_responsive_layout(self):
+        avail_w = self.width() if self.width() > 0 else 1000
+
+        compact_page = avail_w < 860
+        if compact_page != self._page_compact:
+            self._page_compact = compact_page
+            if compact_page:
+                self.main_layout.setContentsMargins(12, 6, 12, 40)
+                self.main_layout.setSpacing(6)
+            else:
+                self.main_layout.setContentsMargins(16, 10, 16, 40)
+                self.main_layout.setSpacing(8)
+
+        self._reflow_header(avail_w < 640)
+        self._reflow_toolbar(avail_w < 880)
+
+        columns = (
+            1 if avail_w < 460
+            else 2 if avail_w < 680
+            else 5
+        )
+        self._reflow_metric_cards(columns)
+
+        content_w = max(300, avail_w - (24 if compact_page else 32))
+        self._splitter_vertical = sync_responsive_splitter(
+            self.content_splitter,
+            self.detail_container,
+            content_w,
+            breakpoint=680,
+            max_panel_width=340,
+            min_panel_width=220,
+            min_panel_height=130,
+            current_vertical=self._splitter_vertical,
+        )
+        self._update_splitter_min_height()
+
+        est_table_w = (
+            content_w if self._splitter_vertical or not self._control_center_expanded
+            else max(280, content_w - 290)
+        )
+        self._apply_table_column_modes(est_table_w < 500)
 
     def _reflow_metric_cards(self, columns):
         if self._metrics_columns == columns:
@@ -659,29 +846,11 @@ class CatalogView(QWidget):
             if self._control_center_expanded
             else "Show Details"
         )
+        self._update_splitter_min_height()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-
-        compact = self.width() < 1080
-        if compact != self._compact_layout:
-            self._compact_layout = compact
-            self._control_center_expanded = not compact
-            self.detail_container.setVisible(
-                self._control_center_expanded
-            )
-            self.control_center_btn.setText(
-                "Hide Details"
-                if self._control_center_expanded
-                else "Show Details"
-            )
-
-        columns = (
-            2 if self.width() < 850
-            else 3 if self.width() < 1050
-            else 5
-        )
-        self._reflow_metric_cards(columns)
+        self._sync_responsive_layout()
 
     # ========================================================
     # THEME MANAGEMENT
@@ -705,41 +874,59 @@ class CatalogView(QWidget):
                 pass
 
     def _get_colors(self):
+        defaults = {
+            "window": "#090E1A",
+            "surface": "#111A2E",
+            "surface_alt": "#182542",
+            "surface_elevated": "#1F2F52",
+            "input": "#0C1426",
+            "border": "#28385C",
+            "border_bright": "#384F82",
+            "text": "#F8FAFC",
+            "muted": "#9BB0CE",
+            "primary": "#3B82F6",
+            "primary_hover": "#2563EB",
+            "primary_soft": "rgba(59, 130, 246, 0.16)",
+            "selection": "#2563EB",
+            "indigo": "#818CF8",
+            "indigo_hover": "#6366F1",
+            "cyan": "#22D3EE",
+            "cyan_hover": "#06B6D4",
+            "cyan_soft": "rgba(34, 211, 238, 0.16)",
+            "teal": "#2DD4BF",
+            "purple": "#A78BFA",
+            "success": "#10B981",
+            "success_hover": "#059669",
+            "success_soft": "rgba(16, 185, 129, 0.16)",
+            "warning": "#F59E0B",
+            "warning_hover": "#D97706",
+            "warning_soft": "rgba(245, 158, 11, 0.16)",
+            "danger": "#F43F5E",
+            "danger_hover": "#E11D48",
+            "danger_soft": "rgba(244, 63, 94, 0.16)",
+            "table_row": "#0F182B",
+            "table_alt": "#142038",
+            "header_bg": "#182745",
+        }
 
         if self.theme_manager is not None:
-
             try:
                 active_theme = (
                     self.theme_manager.get_active_theme()
                 )
-
                 colors = (
                     self.theme_manager.COLORS.get(
                         active_theme
                     )
                 )
-
                 if colors:
-                    return colors
-
+                    merged = dict(defaults)
+                    merged.update(colors)
+                    return merged
             except Exception:
                 pass
 
-        return {
-            "window": "#0B1220",
-            "surface": "#111C2E",
-            "surface_alt": "#17243A",
-            "input": "#0F1B2D",
-            "border": "#293B55",
-            "text": "#E8EEF8",
-            "muted": "#94A3B8",
-            "primary": "#3B82F6",
-            "primary_hover": "#2563EB",
-            "selection": "#1D4ED8",
-            "success": "#16A34A",
-            "warning": "#D97706",
-            "danger": "#DC2626",
-        }
+        return defaults
 
     def apply_theme(self, *_):
 
@@ -759,7 +946,7 @@ class CatalogView(QWidget):
 
             QLabel#PageTitle {{
                 font-size: 23px;
-                font-weight: 700;
+                font-weight: 800;
                 color: {c["text"]};
             }}
 
@@ -771,32 +958,36 @@ class CatalogView(QWidget):
             QLabel#SectionTitle {{
                 font-size: 14px;
                 font-weight: 700;
-                color: {c["text"]};
+                color: {c["primary"]};
             }}
 
-            QFrame#MetricCard {{
-                background-color: {c["surface"]};
-                border: 1px solid {c["border"]};
-                border-radius: 10px;
-            }}
-
-            QLabel#MetricTitle {{
-                font-size: 10px;
+            QLabel#CountLabel {{
+                background-color: {c["primary_soft"]};
+                color: {c["primary"]};
+                border: 1px solid {rgba_color(c["primary"], 0.35)};
+                border-radius: 9px;
+                padding: 0px 12px;
+                min-height: 26px;
+                max-height: 26px;
+                font-size: 11px;
                 font-weight: 700;
-                color: {c["muted"]};
             }}
 
             QFrame#CatalogToolbar,
             QFrame#FilterBar,
             QFrame#BookInspector {{
                 background-color: {c["surface"]};
-                border: 1px solid {c["border"]};
-                border-radius: 10px;
+                border: 1.5px solid {c["border"]};
+                border-radius: 11px;
+            }}
+
+            QFrame#BookInspector {{
+                border-top: 3px solid {c["primary"]};
             }}
 
             QFrame#BookHoverPreview {{
                 background-color: {c["surface"]};
-                border: 1px solid {c["border"]};
+                border: 1.5px solid {c["border_bright"]};
                 border-left: 4px solid {c["primary"]};
                 border-radius: 10px;
             }}
@@ -828,70 +1019,160 @@ class CatalogView(QWidget):
             QLineEdit#CatalogSearch {{
                 background-color: {c["input"]};
                 color: {c["text"]};
-                border: 1px solid {c["border"]};
+                border: 1.5px solid {c["border"]};
                 border-radius: 8px;
-                padding: 8px 10px;
+                padding: 5px 10px;
                 font-size: 12px;
             }}
 
             QLineEdit#CatalogSearch:focus {{
-                border: 1px solid {c["primary"]};
+                border: 1.5px solid {c["primary"]};
             }}
 
             QPushButton {{
                 font-size: 12px;
                 font-weight: 600;
-                border-radius: 7px;
-                padding: 8px 13px;
+                border-radius: 8px;
+                padding: 5px 12px;
             }}
 
             QPushButton#PrimaryButton {{
-                background-color: {c["primary"]};
-                color: white;
-                border: none;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["primary"]};
+                font-weight: 700;
             }}
 
             QPushButton#PrimaryButton:hover {{
-                background-color: {c["primary_hover"]};
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary_hover"]}, stop:1 {c["indigo_hover"]}
+                );
+            }}
+
+            QPushButton#SuccessButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["success"]}, stop:1 {c["teal"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["success"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#SuccessButton:hover {{
+                background-color: {c["success_hover"]};
+            }}
+
+            QPushButton#InfoButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["cyan"]}, stop:1 {c["primary"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["cyan"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#InfoButton:hover {{
+                background-color: {c["cyan_hover"]};
+            }}
+
+            QPushButton#WarningButton {{
+                background-color: {c["warning"]};
+                color: #FFFFFF;
+                border: 1px solid {c["warning"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#WarningButton:hover {{
+                background-color: {c["warning_hover"]};
             }}
 
             QPushButton#SecondaryButton {{
                 background-color: {c["surface_alt"]};
                 color: {c["text"]};
-                border: 1px solid {c["border"]};
+                border: 1px solid {c["border_bright"]};
             }}
 
             QPushButton#SecondaryButton:hover {{
+                background-color: {c["surface_elevated"]};
                 border-color: {c["primary"]};
+                color: {c["primary"]};
             }}
 
             QPushButton#DangerButton {{
-                background-color: rgba(220, 38, 38, 0.15);
+                background-color: {c["danger_soft"]};
                 color: {c["danger"]};
-                border: 1px solid {c["danger"]};
+                border: 1px solid {rgba_color(c["danger"], 0.65)};
+                font-weight: 700;
+            }}
+
+            QPushButton#DangerButton:hover {{
+                background-color: {c["danger"]};
+                color: #FFFFFF;
+                border-color: {c["danger"]};
             }}
 
             QPushButton#FilterButton {{
-                background: transparent;
-                color: {c["muted"]};
-                border: none;
-                padding: 7px 12px;
+                background: {c["surface_alt"]};
+                color: {c["text"]};
+                border: 1px solid {c["border_bright"]};
+                border-radius: 7px;
+                padding: 0px 11px;
+                min-height: 26px;
+                max-height: 26px;
+                font-size: 11px;
+                font-weight: 600;
             }}
 
-            QPushButton#FilterButton:checked {{
-                background-color: {c["primary"]};
-                color: white;
-                border-radius: 4px;
+            QPushButton#FilterButton:hover {{
+                background: {c["surface_elevated"]};
+                color: {c["text"]};
+                border-color: {c["primary"]};
+            }}
+
+            QPushButton#FilterButton[filterRole="ALL"]:checked {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
+                font-weight: 700;
+            }}
+
+            QPushButton#FilterButton[filterRole="AVAILABLE"]:checked {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["success"]}, stop:1 {c["teal"]}
+                );
+                color: #FFFFFF;
+                font-weight: 700;
+            }}
+
+            QPushButton#FilterButton[filterRole="ISSUED"]:checked {{
+                background-color: {c["warning"]};
+                color: #FFFFFF;
+                font-weight: 700;
+            }}
+
+            QPushButton#FilterButton[filterRole="LOW_STOCK"]:checked {{
+                background-color: {c["danger"]};
+                color: #FFFFFF;
+                font-weight: 700;
             }}
 
             QTableWidget#CatalogTable {{
-                background-color: {c["surface"]};
-                alternate-background-color: {c["surface_alt"]};
+                background-color: {c["table_row"]};
+                alternate-background-color: {c["table_alt"]};
                 color: {c["text"]};
                 border: 1px solid {c["border"]};
                 border-radius: 10px;
                 selection-background-color: {c["selection"]};
-                selection-color: white;
+                selection-color: #FFFFFF;
                 outline: none;
             }}
 
@@ -901,10 +1182,10 @@ class CatalogView(QWidget):
             }}
 
             QHeaderView::section {{
-                background-color: {c["surface_alt"]};
-                color: {c["muted"]};
+                background-color: {c["header_bg"]};
+                color: {c["text"]};
                 border: none;
-                border-bottom: 1px solid {c["border"]};
+                border-bottom: 2px solid {c["border_bright"]};
                 padding: 10px 10px;
                 font-size: 11px;
                 font-weight: 700;
@@ -913,29 +1194,49 @@ class CatalogView(QWidget):
             QTabWidget::pane {{
                 border: 1px solid {c["border"]};
                 background: {c["surface"]};
-                border-radius: 6px;
+                border-radius: 8px;
             }}
 
             QTabBar::tab {{
                 background: {c["surface_alt"]};
                 color: {c["muted"]};
-                padding: 6px 12px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
+                padding: 7px 14px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
                 font-size: 11px;
-                font-weight: 600;
+                font-weight: 700;
             }}
 
             QTabBar::tab:selected {{
-                background: {c["primary"]};
-                color: white;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
             }}
         """)
 
-        for card in self.metric_cards.values():
-            card.apply_style()
+        accent_map = {
+            "TOTAL TITLES": c["primary"],
+            "TOTAL COPIES": c["purple"],
+            "AVAILABLE": c["success"],
+            "ISSUED": c["warning"],
+            "LOW STOCK": c["danger"],
+        }
+        for title_key, card in self.metric_cards.items():
+            card.set_accent(accent_map.get(title_key, card.accent), c)
 
-        self._refresh_inspector_theme()
+        if (
+            hasattr(self, "table")
+            and self.table.rowCount() > 0
+            and getattr(self, "filtered_books", None)
+        ):
+            selected_ids = [b[0] for b in self.get_selected_books()]
+            self.populate_table(self.filtered_books)
+            if selected_ids:
+                self.select_books_by_ids(selected_ids)
+        else:
+            self._refresh_inspector_theme()
 
     def _refresh_inspector_theme(self):
 
@@ -943,6 +1244,8 @@ class CatalogView(QWidget):
             self.display_book_details_by_id(
                 self.current_book_id
             )
+        elif hasattr(self, "table") and len(self.get_selected_books()) > 1:
+            self.show_batch_book_inspector()
         else:
             self.show_default_inspector()
 
@@ -1057,14 +1360,18 @@ class CatalogView(QWidget):
             bounds = screen.availableGeometry()
             if position.x() + self.hover_preview.width() > bounds.right():
                 position.setX(
-                    bounds.right() - self.hover_preview.width()
+                    max(bounds.left(), bounds.right() - self.hover_preview.width())
                 )
+            if position.x() < bounds.left():
+                position.setX(bounds.left())
             if position.y() + self.hover_preview.height() > bounds.bottom():
                 position.setY(
                     self.table.viewport().mapToGlobal(
                         QPoint(item_rect.left(), item_rect.top())
                     ).y() - self.hover_preview.height() - 8
                 )
+            if position.y() < bounds.top():
+                position.setY(bounds.top())
 
         self.hover_preview.move(position)
         self.hover_preview.show()
@@ -1282,6 +1589,7 @@ class CatalogView(QWidget):
 
     def populate_table(self, rows):
 
+        self.filtered_books = list(rows or [])
         self.hover_preview.hide()
         self._updating_table = True
         self.table.blockSignals(True)
@@ -1314,6 +1622,12 @@ class CatalogView(QWidget):
                             Qt.AlignmentFlag.AlignCenter
                         )
 
+                    if col_idx == 0:
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                        item.setForeground(QColor(c["primary"]))
+
                     if col_idx == 5:
 
                         if available <= 0:
@@ -1325,6 +1639,9 @@ class CatalogView(QWidget):
                         else:
                             color = c["success"]
 
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
                         item.setForeground(
                             QColor(color)
                         )
@@ -1385,7 +1702,7 @@ class CatalogView(QWidget):
             "information, availability and management actions."
         )
 
-        label.setWordWrap(True)
+        configure_wrapped_label(label)
 
         label.setStyleSheet(
             f"color: {c['muted']}; font-size: 12px;"
@@ -1437,17 +1754,29 @@ class CatalogView(QWidget):
         status_label.setAlignment(
             Qt.AlignmentFlag.AlignCenter
         )
+        configure_wrapped_label(status_label)
+
+        if available > 0:
+            status_bg = (
+                f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                f"stop:0 {c['success']}, stop:1 {c['teal']})"
+            )
+            status_border = c["success"]
+        else:
+            status_bg = (
+                f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                f"stop:0 {c['danger']}, stop:1 {c['danger_hover']})"
+            )
+            status_border = c["danger"]
 
         status_label.setStyleSheet(f"""
-            background: {
-                c['success'] if available > 0
-                else c['danger']
-            };
-            color: white;
-            border-radius: 6px;
-            padding: 8px;
-            font-weight: 700;
-            font-size: 10px;
+            background: {status_bg};
+            color: #FFFFFF;
+            border: 1px solid {status_border};
+            border-radius: 8px;
+            padding: 9px;
+            font-weight: 800;
+            font-size: 11px;
         """)
 
         self.overview_layout.addWidget(
@@ -1456,9 +1785,8 @@ class CatalogView(QWidget):
 
         # BOOK INFORMATION
         form = QFormLayout()
-
+        configure_inspector_form(form, horizontal_spacing=10, vertical_spacing=7)
         form.setContentsMargins(0, 4, 0, 4)
-        form.setVerticalSpacing(8)
 
         fields = [
             ("Book ID", book[0]),
@@ -1474,6 +1802,7 @@ class CatalogView(QWidget):
         for key, value in fields:
 
             key_label = QLabel(key)
+            configure_wrapped_label(key_label, expanding_width=False)
 
             value_label = QLabel(
                 str(
@@ -1482,6 +1811,7 @@ class CatalogView(QWidget):
                     else "—"
                 )
             )
+            configure_wrapped_label(value_label, expanding_width=True)
 
             key_label.setStyleSheet(
                 f"color: {c['muted']}; "
@@ -1492,8 +1822,6 @@ class CatalogView(QWidget):
                 f"color: {c['text']}; "
                 "font-size: 11px; font-weight: 600;"
             )
-
-            value_label.setWordWrap(True)
 
             form.addRow(
                 key_label,
@@ -1519,14 +1847,14 @@ class CatalogView(QWidget):
                     book[0],
                     book[1],
                 ),
-                "SecondaryButton",
+                "SuccessButton",
             ),
             (
                 "Print Barcode",
                 lambda: self.open_barcode_dialog_for_selected(
                     book[0]
                 ),
-                "SecondaryButton",
+                "InfoButton",
             ),
             (
                 "Audit History",
@@ -1534,7 +1862,7 @@ class CatalogView(QWidget):
                     book[0],
                     book[1],
                 ),
-                "SecondaryButton",
+                "WarningButton",
             ),
             (
                 "Edit Record",
@@ -1553,6 +1881,7 @@ class CatalogView(QWidget):
             button = QPushButton(text)
             button.setObjectName(object_name)
             button.setMinimumHeight(32)
+            configure_inspector_button(button)
 
             button.setCursor(
                 Qt.CursorShape.PointingHandCursor
@@ -1634,21 +1963,29 @@ class CatalogView(QWidget):
         clear_layout(self.overview_layout)
         clear_layout(self.actions_layout)
 
+        c = self._get_colors()
         label = QLabel(
             f"{len(books)} books selected.\n\n"
             "Choose a batch action to issue or return all selected titles "
             "for the same user."
         )
-        label.setWordWrap(True)
+        configure_wrapped_label(label)
+        label.setStyleSheet(
+            f"background-color: {c['primary_soft']}; "
+            f"color: {c['text']}; "
+            f"border: 1px solid {rgba_color(c['primary'], 0.35)}; "
+            "border-radius: 8px; padding: 10px; font-weight: 600;"
+        )
         self.overview_layout.addWidget(label)
 
         for mode, text, object_name in (
             ("ISSUE", "Issue Selected Books", "PrimaryButton"),
-            ("RETURN", "Return Selected Books", "SecondaryButton"),
+            ("RETURN", "Return Selected Books", "SuccessButton"),
         ):
             button = QPushButton(text)
             button.setObjectName(object_name)
             button.setMinimumHeight(34)
+            configure_inspector_button(button)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(
                 lambda checked=False, selected_mode=mode:
@@ -2070,12 +2407,15 @@ class CatalogView(QWidget):
 
     def open_book_history(self, book_id, book_title):
 
-        BookHistoryDialog(
+        dialog = BookHistoryDialog(
             self.db,
             book_id,
             book_title,
             parent=self,
-        ).exec()
+        )
+        dialog.data_updated.connect(self.load_books_to_table)
+        dialog.exec()
+        self.load_books_to_table()
 
     # ========================================================
     # CSV / XLSX IMPORT

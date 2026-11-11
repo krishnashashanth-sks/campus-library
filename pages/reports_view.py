@@ -3,8 +3,8 @@ import csv
 from datetime import datetime
 from collections import defaultdict
 
-from PyQt6.QtCore import Qt, QDate, pyqtSignal, QMargins
-from PyQt6.QtGui import QColor, QPainter, QPen, QFont
+from PyQt6.QtCore import Qt, QDate, pyqtSignal, QMargins, QSize
+from PyQt6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -29,6 +29,7 @@ from PyQt6.QtCharts import (
     QBarCategoryAxis,
     QValueAxis,
 )
+from ui_responsive import FlowLayout, configure_wrapped_label
 from utils import rgba_color
 
 
@@ -65,26 +66,28 @@ class InteractiveStatCard(QFrame):
 
         self.setObjectName("StatCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(116)
+        self.setMinimumWidth(0)
+        self.setMinimumHeight(72)
         self.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(11, 6, 11, 6)
+        layout.setSpacing(2)
 
         top = QHBoxLayout()
-        top.setSpacing(6)
+        top.setSpacing(4)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("CardTitle")
+        self.title_label.setMinimumWidth(0)
         self.title_label.setWordWrap(True)
 
         top.addWidget(self.title_label, 1)
 
-        self.indicator = QLabel("VIEW ANALYTICS")
+        self.indicator = QLabel("VIEW")
         self.indicator.setObjectName("CardIndicator")
         self.indicator.setAlignment(
             Qt.AlignmentFlag.AlignRight |
@@ -96,6 +99,7 @@ class InteractiveStatCard(QFrame):
 
         self.value_label = QLabel(str(value))
         self.value_label.setObjectName("CardValue")
+        self.value_label.setMinimumWidth(0)
         self.value_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
@@ -104,6 +108,7 @@ class InteractiveStatCard(QFrame):
 
         self.subtitle_label = QLabel(subtitle)
         self.subtitle_label.setObjectName("CardSubtitle")
+        self.subtitle_label.setMinimumWidth(0)
         self.subtitle_label.setWordWrap(True)
 
         layout.addWidget(self.subtitle_label)
@@ -111,43 +116,70 @@ class InteractiveStatCard(QFrame):
 
         self.set_theme_style()
 
+    def minimumSizeHint(self):
+        return QSize(0, self.minimumHeight())
+
     def set_theme_style(self):
+        is_dark = QColor(self.colors.get("window", "#090E1A")).lightness() < 128
         border = (
             self.accent
             if self.selected
-            else rgba_color(self.accent, 0.48)
+            else rgba_color(self.accent, 0.52 if is_dark else 0.65)
         )
-        background = rgba_color(
+        bg_start = rgba_color(
             self.accent,
-            0.20 if self.selected else 0.09,
+            (0.25 if self.selected else 0.14)
+            if is_dark
+            else (0.42 if self.selected else 0.30),
         )
-        hover_background = rgba_color(self.accent, 0.20)
+        bg_end = rgba_color(
+            self.accent,
+            (0.12 if self.selected else 0.04)
+            if is_dark
+            else (0.20 if self.selected else 0.14),
+        )
+        hover_start = rgba_color(self.accent, 0.28 if is_dark else 0.46)
+        hover_end = rgba_color(self.accent, 0.12 if is_dark else 0.22)
+        badge_bg = self.accent if self.selected else rgba_color(
+            self.accent, 0.18 if is_dark else 0.24
+        )
+        badge_fg = "#FFFFFF" if self.selected else self.accent
+        badge_border = self.accent if self.selected else rgba_color(
+            self.accent, 0.40 if is_dark else 0.60
+        )
 
         self.setStyleSheet(f"""
             QFrame#StatCard {{
-                background: {background};
-                border: 1px solid {border};
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {bg_start}, stop:1 {bg_end}
+                );
+                border: {2 if self.selected else 1}px solid {border};
                 border-left: 5px solid {self.accent};
-                border-radius: 10px;
+                border-radius: 11px;
             }}
 
             QFrame#StatCard:hover {{
-                background: {hover_background};
-                border: 1px solid {self.accent};
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {hover_start}, stop:1 {hover_end}
+                );
+                border: 2px solid {self.accent};
                 border-left: 5px solid {self.accent};
             }}
 
             QLabel#CardTitle {{
                 color: {self.colors["muted"]};
                 font-size: 10px;
-                font-weight: 700;
+                font-weight: 800;
+                letter-spacing: 0.6px;
                 border: none;
                 background: transparent;
             }}
 
             QLabel#CardValue {{
-                color: {self.colors["text"]};
-                font-size: 23px;
+                color: {self.accent};
+                font-size: 20px;
                 font-weight: 800;
                 border: none;
                 background: transparent;
@@ -156,22 +188,30 @@ class InteractiveStatCard(QFrame):
             QLabel#CardSubtitle {{
                 color: {self.colors["muted"]};
                 font-size: 10px;
+                font-weight: 600;
                 border: none;
                 background: transparent;
             }}
 
             QLabel#CardIndicator {{
-                color: {self.accent};
+                color: {badge_fg};
+                background-color: {badge_bg};
+                border: 1px solid {badge_border};
+                border-radius: 9px;
+                padding: 2px 6px;
                 font-size: 9px;
                 font-weight: 800;
-                border: none;
-                background: transparent;
             }}
         """)
 
         self.indicator.setText(
-            "● SELECTED" if self.selected else "VIEW ANALYTICS"
+            "● ACTIVE" if self.selected else "VIEW"
         )
+
+    def set_accent(self, accent):
+        if accent:
+            self.accent = accent
+            self.set_theme_style()
 
     def set_colors(self, colors):
         self.colors = {
@@ -191,6 +231,16 @@ class InteractiveStatCard(QFrame):
         super().mousePressEvent(event)
 
 
+class _ResponsiveChartView(QChartView):
+    """QChartView with balanced sizeHint so charts fit cleanly inside standard windows."""
+
+    def minimumSizeHint(self):
+        return QSize(200, 130)
+
+    def sizeHint(self):
+        return QSize(320, 170)
+
+
 # ============================================================
 # REPORTS AND ANALYTICS
 # ============================================================
@@ -198,26 +248,39 @@ class InteractiveStatCard(QFrame):
 class ReportsView(QWidget):
 
     DEFAULT_COLORS = {
-        "window": "#0B1220",
-        "surface": "#111C2E",
-        "surface_alt": "#17243A",
-        "input": "#0F1B2D",
-        "border": "#293B55",
-        "text": "#E8EEF8",
-        "muted": "#94A3B8",
+        "window": "#090E1A",
+        "surface": "#111A2E",
+        "surface_alt": "#182542",
+        "surface_elevated": "#1F2F52",
+        "input": "#0C1426",
+        "border": "#28385C",
+        "border_bright": "#384F82",
+        "text": "#F8FAFC",
+        "muted": "#9BB0CE",
         "primary": "#3B82F6",
         "primary_hover": "#2563EB",
-        "selection": "#1D4ED8",
-        "success": "#16A34A",
-        "warning": "#D97706",
-        "danger": "#DC2626",
-        "tooltip": "#17243A",
+        "primary_soft": "rgba(59, 130, 246, 0.16)",
+        "selection": "#2563EB",
+        "indigo": "#818CF8",
+        "indigo_hover": "#6366F1",
+        "cyan": "#22D3EE",
+        "cyan_hover": "#06B6D4",
+        "teal": "#2DD4BF",
+        "purple": "#A78BFA",
+        "success": "#10B981",
+        "success_hover": "#059669",
+        "success_soft": "rgba(16, 185, 129, 0.16)",
+        "warning": "#F59E0B",
+        "warning_hover": "#D97706",
+        "danger": "#F43F5E",
+        "tooltip": "#182542",
     }
 
     ACCENTS = {
         "ISSUED": "#3B82F6",
         "RETURNED": "#10B981",
-        "ACTIVE": "#8B5CF6",
+        "RENEWED": "#22D3EE",
+        "ACTIVE": "#A78BFA",
         "FINES": "#F59E0B",
     }
 
@@ -235,19 +298,29 @@ class ReportsView(QWidget):
         self.filtered_rows = []
         self.all_rows = []
         self.current_metric = "ISSUED"
+        self._cards_columns = None
+        self._graph_header_stacked = None
+        self._card_order = ["ISSUED", "RETURNED", "RENEWED", "ACTIVE", "FINES"]
 
         self.stats_summary = {
             "issued": 0,
             "returned": 0,
+            "renewed": 0,
+            "renewed_days": 0,
+            "unique_renewed": 0,
             "active": 0,
             "overdue": 0,
             "fines": 0.0,
+            "fines_collected": 0.0,
+            "fines_pending": 0.0,
+            "fines_waived": 0.0,
         }
 
         self.daily_stats = defaultdict(
             lambda: {
                 "issued": 0,
                 "returned": 0,
+                "renewed": 0,
                 "fines": 0.0,
             }
         )
@@ -316,6 +389,13 @@ class ReportsView(QWidget):
             self.colors = self.DEFAULT_COLORS.copy()
 
         c = self.colors
+        self.accents = {
+            "ISSUED": c["primary"],
+            "RETURNED": c["success"],
+            "RENEWED": c["cyan"],
+            "ACTIVE": c["purple"],
+            "FINES": c["warning"],
+        }
 
         self.setStyleSheet(f"""
             QWidget#ReportsView {{
@@ -334,20 +414,28 @@ class ReportsView(QWidget):
 
             QFrame#ControlPanel {{
                 background: {c["surface"]};
-                border: 1px solid {c["border"]};
+                border: 1.5px solid {c["border"]};
+                border-left: 4px solid {c["indigo"]};
                 border-radius: 12px;
             }}
 
             QFrame#GraphField {{
                 background: {c["surface"]};
-                border: 1px solid {c["border"]};
+                border: 1.5px solid {c["border"]};
+                border-top: 3px solid {c["primary"]};
                 border-radius: 14px;
+            }}
+
+            QFrame#PanelSeparator {{
+                background: {c["border_bright"]};
+                max-height: 1px;
+                border: none;
             }}
 
             QLabel#PageTitle {{
                 color: {c["text"]};
                 font-size: 23px;
-                font-weight: 700;
+                font-weight: 800;
                 background: transparent;
                 border: none;
             }}
@@ -360,9 +448,9 @@ class ReportsView(QWidget):
             }}
 
             QLabel#SectionTitle {{
-                color: {c["text"]};
-                font-size: 14px;
-                font-weight: 700;
+                color: {c["primary"]};
+                font-size: 15px;
+                font-weight: 800;
                 background: transparent;
                 border: none;
             }}
@@ -384,26 +472,26 @@ class ReportsView(QWidget):
 
             QLabel#Readout {{
                 color: {c["primary"]};
-                background: {c["input"]};
-                border: 1px solid {c["border"]};
-                border-radius: 7px;
-                padding: 8px 12px;
+                background: {c["primary_soft"]};
+                border: 1px solid {rgba_color(c["primary"], 0.38)};
+                border-radius: 8px;
+                padding: 6px 12px;
                 font-size: 11px;
-                font-weight: 600;
+                font-weight: 700;
             }}
 
             QDateEdit {{
                 background: {c["input"]};
                 color: {c["text"]};
-                border: 1px solid {c["border"]};
-                border-radius: 7px;
-                padding: 8px 10px;
-                min-width: 115px;
+                border: 1.5px solid {c["border"]};
+                border-radius: 8px;
+                padding: 5px 7px;
+                min-width: 86px;
                 font-size: 12px;
             }}
 
             QDateEdit:focus {{
-                border: 1px solid {c["primary"]};
+                border: 1.5px solid {c["primary"]};
             }}
 
             QDateEdit::drop-down {{
@@ -412,72 +500,70 @@ class ReportsView(QWidget):
             }}
 
             QPushButton {{
-                border-radius: 7px;
-                padding: 9px 14px;
+                border-radius: 8px;
+                padding: 6px 11px;
                 font-size: 11px;
                 font-weight: 700;
             }}
 
             QPushButton#PresetBtn {{
-                background: {c["input"]};
-                color: {c["muted"]};
-                border: 1px solid {c["border"]};
+                background: {c["surface_alt"]};
+                color: {c["text"]};
+                border: 1px solid {c["border_bright"]};
             }}
 
             QPushButton#PresetBtn:hover {{
-                background: {c["surface_alt"]};
+                background: {c["surface_elevated"]};
                 color: {c["text"]};
                 border: 1px solid {c["primary"]};
             }}
 
+            QPushButton#PresetBtn:checked {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["cyan"]}, stop:1 {c["primary"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["cyan"]};
+            }}
+
             QPushButton#PrimaryBtn {{
-                background: {c["primary"]};
-                color: white;
-                border: none;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["primary"]};
             }}
 
             QPushButton#PrimaryBtn:hover {{
-                background: {c["primary_hover"]};
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary_hover"]}, stop:1 {c["indigo_hover"]}
+                );
             }}
 
             QPushButton#ExportBtn {{
-                background: {c["success"]};
-                color: white;
-                border: none;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["success"]}, stop:1 {c["teal"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["success"]};
             }}
 
             QPushButton#ExportBtn:hover {{
-                background: #15803D;
+                background: {c["success_hover"]};
             }}
 
             QScrollArea {{
                 background: transparent;
                 border: none;
             }}
-
-            QScrollBar:vertical {{
-                background: {c["window"]};
-                width: 9px;
-                border-radius: 4px;
-            }}
-
-            QScrollBar::handle:vertical {{
-                background: {c["border"]};
-                border-radius: 4px;
-                min-height: 35px;
-            }}
-
-            QScrollBar::handle:vertical:hover {{
-                background: {c["muted"]};
-            }}
-
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical {{
-                height: 0px;
-            }}
         """)
 
-        for card in getattr(self, "cards", {}).values():
+        for key, card in getattr(self, "cards", {}).items():
+            card.accent = self.accents.get(key, card.accent)
             card.set_colors(self.colors)
 
         if hasattr(self, "chart_view"):
@@ -489,31 +575,29 @@ class ReportsView(QWidget):
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 16, 20, 16)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(16, 8, 16, 40)
+        main_layout.setSpacing(8)
+        self.main_layout = main_layout
 
         header = QFrame()
         header.setObjectName("ReportHeader")
 
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-
-        title_box = QVBoxLayout()
-        title_box.setSpacing(5)
+        title_box = QVBoxLayout(header)
+        title_box.setContentsMargins(0, 0, 0, 0)
+        title_box.setSpacing(4)
 
         title = QLabel("Library Analytics")
         title.setObjectName("PageTitle")
+        configure_wrapped_label(title)
 
         subtitle = QLabel(
             "Circulation performance, lending trends and financial reports"
         )
         subtitle.setObjectName("PageSubtitle")
+        configure_wrapped_label(subtitle)
 
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
-
-        header_layout.addLayout(title_box)
-        header_layout.addStretch()
 
         main_layout.addWidget(header)
 
@@ -522,31 +606,39 @@ class ReportsView(QWidget):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
         self.content = QWidget()
         self.content.setObjectName("ReportsScrollContent")
+        self.content.setMinimumWidth(0)
 
         self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(2, 2, 8, 12)
-        self.content_layout.setSpacing(12)
+        self.content_layout.setContentsMargins(2, 2, 2, 2)
+        self.content_layout.setSpacing(6)
 
         self._build_stat_cards()
         self._build_graph_panel()
 
         self.scroll_area.setWidget(self.content)
         main_layout.addWidget(self.scroll_area, 1)
+        self._reflow_layout()
 
     def _build_filter_panel(self, parent_layout):
         panel = QFrame()
         panel.setObjectName("ControlPanel")
+        panel.setMinimumWidth(0)
 
-        layout = QHBoxLayout(panel)
-        layout.setContentsMargins(16, 13, 16, 13)
-        layout.setSpacing(9)
+        layout = FlowLayout(panel, margin=8, h_spacing=7, v_spacing=6)
 
+        from_pair = QWidget()
+        from_layout = QHBoxLayout(from_pair)
+        from_layout.setContentsMargins(0, 0, 0, 0)
+        from_layout.setSpacing(6)
         from_label = QLabel("FROM")
         from_label.setObjectName("ControlLabel")
-        layout.addWidget(from_label)
+        from_layout.addWidget(from_label)
 
         self.start_date = QDateEdit()
         self.start_date.setCalendarPopup(True)
@@ -557,11 +649,16 @@ class ReportsView(QWidget):
         self.start_date.dateChanged.connect(
             self._on_date_changed
         )
-        layout.addWidget(self.start_date)
+        from_layout.addWidget(self.start_date)
+        layout.addWidget(from_pair)
 
+        to_pair = QWidget()
+        to_layout = QHBoxLayout(to_pair)
+        to_layout.setContentsMargins(0, 0, 0, 0)
+        to_layout.setSpacing(6)
         to_label = QLabel("TO")
         to_label.setObjectName("ControlLabel")
-        layout.addWidget(to_label)
+        to_layout.addWidget(to_label)
 
         self.end_date = QDateEdit()
         self.end_date.setCalendarPopup(True)
@@ -570,10 +667,10 @@ class ReportsView(QWidget):
         self.end_date.dateChanged.connect(
             self._on_date_changed
         )
-        layout.addWidget(self.end_date)
+        to_layout.addWidget(self.end_date)
+        layout.addWidget(to_pair)
 
-        layout.addSpacing(7)
-
+        self.preset_buttons = {}
         for label, days in (
             ("7 DAYS", 7),
             ("30 DAYS", 30),
@@ -581,20 +678,24 @@ class ReportsView(QWidget):
         ):
             button = QPushButton(label)
             button.setObjectName("PresetBtn")
+            button.setCheckable(True)
+            button.setChecked(days == 30)
             button.setCursor(
                 Qt.CursorShape.PointingHandCursor
             )
             button.clicked.connect(
                 lambda checked=False, d=days: self.set_quick_range(d)
             )
+            self.preset_buttons[days] = button
             layout.addWidget(button)
 
         all_button = QPushButton("ALL TIME")
         all_button.setObjectName("PresetBtn")
+        all_button.setCheckable(True)
+        all_button.setCursor(Qt.CursorShape.PointingHandCursor)
         all_button.clicked.connect(self.set_all_time)
+        self.preset_buttons[36500] = all_button
         layout.addWidget(all_button)
-
-        layout.addStretch()
 
         refresh = QPushButton("↻  Refresh")
         refresh.setObjectName("PrimaryBtn")
@@ -611,8 +712,8 @@ class ReportsView(QWidget):
         parent_layout.addWidget(panel)
 
     def _build_stat_cards(self):
-        grid = QGridLayout()
-        grid.setSpacing(14)
+        self.cards_grid = QGridLayout()
+        self.cards_grid.setSpacing(10)
 
         self.card_issued = InteractiveStatCard(
             "ISSUED",
@@ -630,6 +731,14 @@ class ReportsView(QWidget):
             self.ACCENTS["RETURNED"],
         )
 
+        self.card_renewed = InteractiveStatCard(
+            "RENEWED",
+            "LOAN RENEWALS",
+            "0",
+            "Extensions completed in period",
+            self.ACCENTS["RENEWED"],
+        )
+
         self.card_active = InteractiveStatCard(
             "ACTIVE",
             "ISSUED BOOKS",
@@ -640,32 +749,35 @@ class ReportsView(QWidget):
 
         self.card_fines = InteractiveStatCard(
             "FINES",
-            "FINES COLLECTED",
+            "FINES RECORDED",
             "₹0.00",
-            "Fines recorded for returned books",
+            "Collected, waived & pending balance",
             self.ACCENTS["FINES"],
         )
 
         self.cards = {
             "ISSUED": self.card_issued,
             "RETURNED": self.card_returned,
+            "RENEWED": self.card_renewed,
             "ACTIVE": self.card_active,
             "FINES": self.card_fines,
         }
 
         for index, card in enumerate(self.cards.values()):
-            grid.addWidget(card, 0, index)
+            self.cards_grid.addWidget(card, 0, index)
+            self.cards_grid.setColumnStretch(index, 1)
             card.card_activated.connect(
                 self.switch_graph_view
             )
             card.set_colors(self.colors)
 
-        self.content_layout.addLayout(grid)
+        self.content_layout.addLayout(self.cards_grid)
 
     def _build_graph_panel(self):
         self.graph_frame = QFrame()
         self.graph_frame.setObjectName("GraphField")
-        self.graph_frame.setMinimumHeight(590)
+        self.graph_frame.setMinimumWidth(0)
+        self.graph_frame.setMinimumHeight(182)
 
         self.graph_frame.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -673,52 +785,58 @@ class ReportsView(QWidget):
         )
 
         layout = QVBoxLayout(self.graph_frame)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setSpacing(5)
 
-        header = QHBoxLayout()
+        self.graph_header_grid = QGridLayout()
+        self.graph_header_grid.setHorizontalSpacing(10)
+        self.graph_header_grid.setVerticalSpacing(6)
 
-        title_box = QVBoxLayout()
+        self.graph_title_box = QWidget()
+        self.graph_title_box.setMinimumWidth(0)
+        title_box = QVBoxLayout(self.graph_title_box)
+        title_box.setContentsMargins(0, 0, 0, 0)
         title_box.setSpacing(4)
 
         self.graph_title = QLabel("Daily Books Issued")
         self.graph_title.setObjectName("SectionTitle")
+        configure_wrapped_label(self.graph_title)
 
         self.graph_subtitle = QLabel(
             "Daily circulation activity across the selected date range"
         )
         self.graph_subtitle.setObjectName("SectionSubtitle")
+        configure_wrapped_label(self.graph_subtitle)
 
         title_box.addWidget(self.graph_title)
         title_box.addWidget(self.graph_subtitle)
-
-        header.addLayout(title_box)
-        header.addStretch()
 
         self.hover_readout = QLabel(
             "Hover over a chart element to inspect its value"
         )
         self.hover_readout.setObjectName("Readout")
-        self.hover_readout.setMinimumWidth(260)
+        configure_wrapped_label(self.hover_readout, expanding_width=False)
         self.hover_readout.setAlignment(
             Qt.AlignmentFlag.AlignCenter
         )
 
-        header.addWidget(self.hover_readout)
-        layout.addLayout(header)
+        self.graph_header_grid.addWidget(self.graph_title_box, 0, 0)
+        self.graph_header_grid.addWidget(self.hover_readout, 0, 1)
+        self.graph_header_grid.setColumnStretch(0, 1)
+        self.graph_header_grid.setColumnStretch(1, 0)
+        layout.addLayout(self.graph_header_grid)
 
         separator = QFrame()
+        separator.setObjectName("PanelSeparator")
         separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setStyleSheet(
-            f"background: {self.colors['border']}; max-height: 1px;"
-        )
         layout.addWidget(separator)
 
-        self.chart_view = QChartView()
+        self.chart_view = _ResponsiveChartView()
+        self.chart_view.setMinimumWidth(0)
         self.chart_view.setRenderHint(
             QPainter.RenderHint.Antialiasing
         )
-        self.chart_view.setMinimumHeight(490)
+        self.chart_view.setMinimumHeight(130)
 
         self.chart_view.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -732,6 +850,62 @@ class ReportsView(QWidget):
         layout.addWidget(self.chart_view, 1)
         self.content_layout.addWidget(self.graph_frame, 1)
 
+    def _reflow_layout(self):
+        if not hasattr(self, "cards_grid"):
+            return
+        avail_w = max(320, self.width()) if self.width() > 0 else 1080
+        margin = 12 if avail_w < 840 else 16
+        self.main_layout.setContentsMargins(margin, 6, margin, 40)
+
+        cols = (
+            5 if avail_w >= 960
+            else (3 if avail_w >= 620 else (2 if avail_w >= 420 else 1))
+        )
+        if cols != self._cards_columns:
+            self._cards_columns = cols
+            for key in self._card_order:
+                card = self.cards.get(key)
+                if card is not None:
+                    self.cards_grid.removeWidget(card)
+            for col in range(5):
+                self.cards_grid.setColumnStretch(col, 1 if col < cols else 0)
+            for idx, key in enumerate(self._card_order):
+                card = self.cards.get(key)
+                if card is not None:
+                    self.cards_grid.addWidget(card, idx // cols, idx % cols)
+
+        stacked_header = avail_w < 700
+        if stacked_header != self._graph_header_stacked:
+            self._graph_header_stacked = stacked_header
+            self.graph_header_grid.removeWidget(self.graph_title_box)
+            self.graph_header_grid.removeWidget(self.hover_readout)
+            if stacked_header:
+                self.hover_readout.setSizePolicy(
+                    QSizePolicy.Policy.Expanding,
+                    QSizePolicy.Policy.Preferred,
+                )
+                self.graph_header_grid.addWidget(self.graph_title_box, 0, 0)
+                self.graph_header_grid.addWidget(self.hover_readout, 1, 0)
+                self.graph_header_grid.setColumnStretch(0, 1)
+                self.graph_header_grid.setColumnStretch(1, 0)
+            else:
+                self.hover_readout.setSizePolicy(
+                    QSizePolicy.Policy.Preferred,
+                    QSizePolicy.Policy.Preferred,
+                )
+                self.graph_header_grid.addWidget(self.graph_title_box, 0, 0)
+                self.graph_header_grid.addWidget(self.hover_readout, 0, 1)
+                self.graph_header_grid.setColumnStretch(0, 1)
+                self.graph_header_grid.setColumnStretch(1, 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow_layout()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._reflow_layout()
+
     # --------------------------------------------------------
     # DATE FILTERS
     # --------------------------------------------------------
@@ -741,6 +915,9 @@ class ReportsView(QWidget):
             self.start_date.blockSignals(True)
             self.start_date.setDate(self.end_date.date())
             self.start_date.blockSignals(False)
+
+        for button in getattr(self, "preset_buttons", {}).values():
+            button.setChecked(False)
 
         self.load_analytics()
 
@@ -755,6 +932,9 @@ class ReportsView(QWidget):
 
         self.start_date.blockSignals(False)
         self.end_date.blockSignals(False)
+
+        for preset_days, button in getattr(self, "preset_buttons", {}).items():
+            button.setChecked(preset_days == days)
 
         self.load_analytics()
 
@@ -875,12 +1055,24 @@ class ReportsView(QWidget):
             if checkout_in_range or return_in_range:
                 self.filtered_rows.append(row)
 
+        renewal_analytics = self.db.get_renewal_analytics(start_str, end_str)
+        for day, count in (renewal_analytics.get("daily_renewals") or {}).items():
+            self.daily_stats[day]["renewed"] += int(count or 0)
+
+        fine_summary = self.db.get_fines_financial_summary(start_str, end_str)
+
         self.stats_summary = {
             "issued": issued,
             "returned": returned,
+            "renewed": int(renewal_analytics.get("total_renewals", 0)),
+            "renewed_days": int(renewal_analytics.get("total_extended_days", 0)),
+            "unique_renewed": int(renewal_analytics.get("unique_loans_renewed", 0)),
             "active": active,
             "overdue": overdue,
             "fines": fines,
+            "fines_collected": float(fine_summary.get("total_collected", 0.0)),
+            "fines_pending": float(fine_summary.get("pending_fines", 0.0)),
+            "fines_waived": float(fine_summary.get("waived_total", 0.0)),
         }
 
         self._update_cards()
@@ -893,9 +1085,15 @@ class ReportsView(QWidget):
         self.stats_summary = {
             "issued": 0,
             "returned": 0,
+            "renewed": 0,
+            "renewed_days": 0,
+            "unique_renewed": 0,
             "active": 0,
             "overdue": 0,
             "fines": 0.0,
+            "fines_collected": 0.0,
+            "fines_pending": 0.0,
+            "fines_waived": 0.0,
         }
 
         self._update_cards()
@@ -912,6 +1110,13 @@ class ReportsView(QWidget):
             f"{stats['returned']:,}"
         )
 
+        self.card_renewed.value_label.setText(
+            f"{stats['renewed']:,}"
+        )
+        self.card_renewed.subtitle_label.setText(
+            f"+{stats['renewed_days']:,} days across {stats['unique_renewed']:,} loan(s)"
+        )
+
         self.card_active.value_label.setText(
             f"{stats['active']:,}"
         )
@@ -923,6 +1128,10 @@ class ReportsView(QWidget):
 
         self.card_fines.value_label.setText(
             f"₹{stats['fines']:,.2f}"
+        )
+        self.card_fines.subtitle_label.setText(
+            f"Collected ₹{stats['fines_collected']:,.2f} · "
+            f"Pending ₹{stats['fines_pending']:,.2f}"
         )
 
     # --------------------------------------------------------
@@ -944,6 +1153,7 @@ class ReportsView(QWidget):
         if not hasattr(self, "chart_view"):
             return
 
+        accents = getattr(self, "accents", self.ACCENTS)
         metric = self.current_metric
 
         if metric == "ISSUED":
@@ -955,7 +1165,7 @@ class ReportsView(QWidget):
             self.render_bar_chart(
                 "issued",
                 "Books Issued",
-                self.ACCENTS["ISSUED"],
+                accents.get("ISSUED", self.ACCENTS["ISSUED"]),
             )
 
         elif metric == "RETURNED":
@@ -967,7 +1177,21 @@ class ReportsView(QWidget):
             self.render_bar_chart(
                 "returned",
                 "Books Returned",
-                self.ACCENTS["RETURNED"],
+                accents.get("RETURNED", self.ACCENTS["RETURNED"]),
+            )
+
+        elif metric == "RENEWED":
+            stats = self.stats_summary
+            self.graph_title.setText("Daily Loan Renewals")
+            self.graph_subtitle.setText(
+                f"{stats['renewed']:,} renewals totaling +{stats['renewed_days']:,} extension days"
+            )
+
+            self.render_bar_chart(
+                "renewed",
+                "Loan Renewals",
+                accents.get("RENEWED", self.ACCENTS["RENEWED"]),
+                unit_label="renewals",
             )
 
         elif metric == "ACTIVE":
@@ -981,15 +1205,19 @@ class ReportsView(QWidget):
             self.render_status_pie_chart()
 
         elif metric == "FINES":
-            self.graph_title.setText("Daily Fine Collection")
+            stats = self.stats_summary
+            self.graph_title.setText("Daily Fine Recording & Settlements")
             self.graph_subtitle.setText(
-                "Fine amounts recorded for returned books"
+                f"Recorded ₹{stats['fines']:,.2f} · "
+                f"Collected ₹{stats['fines_collected']:,.2f} · "
+                f"Waived ₹{stats['fines_waived']:,.2f} · "
+                f"Pending ₹{stats['fines_pending']:,.2f}"
             )
 
             self.render_bar_chart(
                 "fines",
-                "Fines Collected (₹)",
-                self.ACCENTS["FINES"],
+                "Fines Recorded (₹)",
+                accents.get("FINES", self.ACCENTS["FINES"]),
                 is_currency=True,
             )
 
@@ -1011,7 +1239,7 @@ class ReportsView(QWidget):
             QColor(c["input"])
         )
 
-        chart.setMargins(QMargins(14, 12, 14, 12))
+        chart.setMargins(QMargins(10, 6, 10, 6))
 
         chart.setAnimationOptions(
             QChart.AnimationOption.SeriesAnimations
@@ -1038,6 +1266,7 @@ class ReportsView(QWidget):
         series_label,
         hex_color,
         is_currency=False,
+        unit_label="books",
     ):
         chart = self._create_base_chart()
 
@@ -1061,8 +1290,13 @@ class ReportsView(QWidget):
             return
 
         bar_set = QBarSet(series_label)
-        bar_set.setColor(QColor(hex_color))
-        bar_set.setBorderColor(QColor(hex_color))
+        base_color = QColor(hex_color)
+        grad = QLinearGradient(0, 0, 0, 1)
+        grad.setCoordinateMode(QLinearGradient.CoordinateMode.ObjectBoundingMode)
+        grad.setColorAt(0.0, base_color.lighter(118))
+        grad.setColorAt(1.0, base_color.darker(115))
+        bar_set.setBrush(QBrush(grad))
+        bar_set.setBorderColor(base_color)
 
         categories = []
         maximum = 0.0
@@ -1092,7 +1326,7 @@ class ReportsView(QWidget):
         axis_x = QBarCategoryAxis()
         axis_x.append(categories)
         axis_x.setLabelsColor(
-            QColor(self.colors["muted"])
+            QColor(self.colors["text"])
         )
         axis_x.setGridLineVisible(False)
         axis_x.setLabelsAngle(-25)
@@ -1122,7 +1356,7 @@ class ReportsView(QWidget):
             axis_y.setTickInterval(1)
 
         axis_y.setLabelsColor(
-            QColor(self.colors["muted"])
+            QColor(self.colors["text"])
         )
 
         axis_y.setGridLinePen(
@@ -1147,7 +1381,7 @@ class ReportsView(QWidget):
                 if is_currency:
                     formatted = f"₹{value:,.2f}"
                 else:
-                    formatted = f"{int(value):,} books"
+                    formatted = f"{int(value):,} {unit_label}"
 
                 self.hover_readout.setText(
                     f"{day}  |  {series_label}: {formatted}"
@@ -1170,18 +1404,19 @@ class ReportsView(QWidget):
         chart = self._create_base_chart()
 
         series = QPieSeries()
-        series.setHoleSize(0.48)
-        series.setPieSize(0.78)
+        series.setHoleSize(0.46)
+        series.setPieSize(0.72)
 
         active = self.stats_summary["active"]
         overdue = self.stats_summary["overdue"]
         on_time = max(active - overdue, 0)
 
+        accents = getattr(self, "accents", self.ACCENTS)
         values = [
             (
                 "On-Time Books",
                 on_time,
-                self.ACCENTS["ISSUED"],
+                accents.get("ISSUED", self.ACCENTS["ISSUED"]),
             ),
             (
                 "Overdue Books",
@@ -1213,6 +1448,8 @@ class ReportsView(QWidget):
                 )
 
                 pie_slice.setBrush(QColor(color))
+                pie_slice.setBorderColor(QColor(self.colors["surface"]))
+                pie_slice.setBorderWidth(2)
                 pie_slice.setLabelVisible(True)
                 pie_slice.setLabelColor(
                     QColor(self.colors["text"])
@@ -1317,10 +1554,26 @@ class ReportsView(QWidget):
                     "Return Date",
                     "Fine Amount (INR)",
                     "Status",
+                    "Renewals",
+                    "Fine Status",
                 ])
 
+                log_ids = [r[0] for r in self.filtered_rows if r]
+                renewal_meta = self.db.get_loan_renewal_meta(log_ids)
+                fine_meta = self.db.get_loan_fine_settlement_meta(log_ids)
+
                 for row in self.filtered_rows:
-                    writer.writerow(row)
+                    lid = int(row[0])
+                    r_count = renewal_meta.get(lid, (0, ""))[0]
+                    settled, f_act, _, _ = fine_meta.get(lid, (False, "", "", ""))
+                    f_val = float(row[6] or 0)
+                    if f_val <= 0:
+                        f_status = "No Fine"
+                    elif settled:
+                        f_status = "Waived" if str(f_act).upper() == "WAIVED" else "Paid"
+                    else:
+                        f_status = "Pending"
+                    writer.writerow(list(row) + [r_count, f_status])
 
                 writer.writerow([])
                 writer.writerow(["REPORT SUMMARY"])
@@ -1336,6 +1589,16 @@ class ReportsView(QWidget):
                 ])
 
                 writer.writerow([
+                    "Loan Renewals",
+                    self.stats_summary["renewed"],
+                ])
+
+                writer.writerow([
+                    "Total Extended Days",
+                    self.stats_summary["renewed_days"],
+                ])
+
+                writer.writerow([
                     "Issued Books",
                     self.stats_summary["active"],
                 ])
@@ -1348,6 +1611,21 @@ class ReportsView(QWidget):
                 writer.writerow([
                     "Fines Recorded",
                     f"{self.stats_summary['fines']:.2f}",
+                ])
+
+                writer.writerow([
+                    "Fines Collected (Payments)",
+                    f"{self.stats_summary['fines_collected']:.2f}",
+                ])
+
+                writer.writerow([
+                    "Fines Waived",
+                    f"{self.stats_summary['fines_waived']:.2f}",
+                ])
+
+                writer.writerow([
+                    "Pending Unpaid Fines",
+                    f"{self.stats_summary['fines_pending']:.2f}",
                 ])
 
             QMessageBox.information(

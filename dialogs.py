@@ -1,3 +1,5 @@
+import csv
+import datetime
 import io
 import os
 import secrets
@@ -12,7 +14,8 @@ from PyQt6.QtWidgets import (
     QComboBox, QLabel, QSpinBox, QFileDialog, QHBoxLayout,
     QCheckBox, QFrame, QTableWidget, QWidget, QSizePolicy,
     QHeaderView, QFormLayout, QTableWidgetItem, QAbstractItemView,
-    QDialogButtonBox, QGridLayout, QGroupBox, QPlainTextEdit,
+    QDialogButtonBox, QGridLayout, QGroupBox, QPlainTextEdit, QScrollArea,
+    QSplitter,
 )
 
 from PyQt6.QtCore import (
@@ -29,6 +32,17 @@ from utils import (
     is_valid_book_id,
     is_valid_phone_number,
     is_valid_user_id,
+    normalize_department_for_role,
+    normalize_user_role,
+)
+from ui_responsive import (
+    FlowLayout,
+    clamp_widget_to_screen,
+    configure_inspector_button,
+    configure_inspector_form,
+    configure_wrapped_label,
+    sync_responsive_splitter,
+    wrap_in_scroll_area,
 )
 
 
@@ -36,13 +50,23 @@ from utils import (
 # SHARED HELPERS
 # ============================================================
 
-def configure_dialog(dialog, title, width=None, height=None):
+def configure_dialog(
+    dialog,
+    title,
+    width=None,
+    height=None,
+    min_width=None,
+    min_height=None,
+):
     """Apply common dialog configuration without overriding ThemeManager."""
     dialog.setWindowTitle(title)
-
-    if width and height:
-        dialog.resize(width, height)
-
+    clamp_widget_to_screen(
+        dialog,
+        target_width=width,
+        target_height=height,
+        min_width=min_width,
+        min_height=min_height,
+    )
     dialog.setModal(True)
 
 
@@ -70,15 +94,95 @@ def create_heading(text):
     return label
 
 
-def create_button(text, callback=None, enabled=True):
+def create_button(text, callback=None, enabled=True, variant=None):
     button = QPushButton(text)
     button.setCursor(Qt.CursorShape.PointingHandCursor)
     button.setEnabled(enabled)
+    if variant:
+        button.setObjectName(variant)
 
     if callback:
         button.clicked.connect(callback)
 
     return button
+
+
+def get_dialog_colors(widget=None):
+    """Return active ThemeManager tokens, falling back by palette lightness."""
+    app = QApplication.instance()
+    tm = app.property("theme_manager") if app is not None else None
+    if tm is not None and hasattr(tm, "COLORS"):
+        try:
+            active = (
+                tm.get_active_theme()
+                if hasattr(tm, "get_active_theme")
+                else "Dark"
+            )
+            if active in tm.COLORS:
+                return tm.COLORS[active]
+        except Exception:
+            pass
+    is_dark = True
+    try:
+        pal = (
+            widget.palette()
+            if widget is not None
+            else (app.palette() if app is not None else None)
+        )
+        if pal is not None:
+            is_dark = pal.window().color().lightness() < 128
+    except Exception:
+        pass
+    if is_dark:
+        return {
+            "window": "#090E1A",
+            "surface": "#111A2E",
+            "surface_alt": "#182542",
+            "border": "#28385C",
+            "border_bright": "#384F82",
+            "text": "#F8FAFC",
+            "muted": "#9BB0CE",
+            "primary": "#3B82F6",
+            "primary_soft": "rgba(59, 130, 246, 0.16)",
+            "indigo": "#818CF8",
+            "indigo_soft": "rgba(129, 140, 248, 0.16)",
+            "cyan": "#22D3EE",
+            "cyan_soft": "rgba(34, 211, 238, 0.16)",
+            "purple": "#A78BFA",
+            "purple_soft": "rgba(167, 139, 250, 0.16)",
+            "success": "#10B981",
+            "success_soft": "rgba(16, 185, 129, 0.16)",
+            "warning": "#F59E0B",
+            "warning_soft": "rgba(245, 158, 11, 0.16)",
+            "danger": "#F43F5E",
+            "danger_soft": "rgba(244, 63, 94, 0.16)",
+            "amber_tint": "#2B2112",
+        }
+    return {
+        "window": "#D2DFEF",
+        "surface": "#E3ECF9",
+        "surface_alt": "#CFDDF3",
+        "surface_elevated": "#BED0EC",
+        "border": "#88A4CE",
+        "border_bright": "#5A7CB2",
+        "text": "#0A1628",
+        "muted": "#283D5E",
+        "primary": "#1D4ED8",
+        "primary_soft": "rgba(29, 78, 216, 0.20)",
+        "indigo": "#4338CA",
+        "indigo_soft": "rgba(67, 56, 202, 0.20)",
+        "cyan": "#0369A1",
+        "cyan_soft": "rgba(3, 105, 161, 0.20)",
+        "purple": "#6D28D9",
+        "purple_soft": "rgba(109, 40, 217, 0.20)",
+        "success": "#047857",
+        "success_soft": "rgba(4, 120, 87, 0.20)",
+        "warning": "#B45309",
+        "warning_soft": "rgba(180, 83, 9, 0.22)",
+        "danger": "#BE123C",
+        "danger_soft": "rgba(190, 18, 60, 0.20)",
+        "amber_tint": "#FCE0A2",
+    }
 
 
 def show_error(parent, title, message):
@@ -130,12 +234,14 @@ class BookDialog(QDialog):
             self,
             "New Book" if book_id is None else "Edit Book",
             460,
-            470
+            470,
+            min_width=360,
+            min_height=340,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 24, 26, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
 
         heading = create_heading(
             "📚 Add New Book" if book_id is None
@@ -143,8 +249,11 @@ class BookDialog(QDialog):
         )
         layout.addWidget(heading)
 
+        form_host = QWidget()
+        form_layout = QVBoxLayout(form_host)
+        form_layout.setContentsMargins(0, 0, 4, 0)
         form = QFormLayout()
-        form.setSpacing(13)
+        configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=11)
 
         self.input_id = QLineEdit()
         self.input_id.setPlaceholderText("5-digit book ID")
@@ -198,16 +307,18 @@ class BookDialog(QDialog):
         form.addRow("Total Copies:", self.input_total)
         form.addRow("Available Copies:", self.input_available)
 
-        layout.addLayout(form)
-        layout.addStretch()
+        form_layout.addLayout(form)
+        form_layout.addStretch()
+        layout.addWidget(wrap_in_scroll_area(form_host, object_name="BookDialogScroll"), 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
 
-        cancel = create_button("Cancel", self.reject)
+        cancel = create_button("Cancel", self.reject, variant="SecondaryButton")
         save = create_button(
             "💾 Save Book" if book_id is None else "💾 Update Book",
-            self.save_book
+            self.save_book,
+            variant="PrimaryButton",
         )
 
         buttons.addWidget(cancel)
@@ -337,15 +448,31 @@ class ComplaintDialog(QDialog):
         super().__init__(parent)
         self.db = db
 
-        configure_dialog(self, "Record Library Complaint", 560, 480)
+        configure_dialog(
+            self,
+            "Record Library Complaint",
+            560,
+            480,
+            min_width=400,
+            min_height=340,
+        )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(12)
         layout.addWidget(create_heading("New library complaint"))
 
+        form_host = QWidget()
+        form_host_layout = QVBoxLayout(form_host)
+        form_host_layout.setContentsMargins(0, 0, 4, 0)
         form = QFormLayout()
+        configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=10)
+
         self.user_combo = QComboBox()
+        self.user_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.user_combo.setMinimumContentsLength(16)
         self.user_combo.addItem("General / anonymous", "")
 
         success, users = self.db.get_users()
@@ -365,18 +492,19 @@ class ComplaintDialog(QDialog):
         self.body_input.setPlaceholderText(
             "Describe the issue, suggestion, or complaint..."
         )
-        self.body_input.setMinimumHeight(170)
+        self.body_input.setMinimumHeight(120)
 
         form.addRow("User:", self.user_combo)
         form.addRow("Subject:", self.subject_input)
         form.addRow("Details:", self.body_input)
-        layout.addLayout(form)
+        form_host_layout.addLayout(form)
+        layout.addWidget(wrap_in_scroll_area(form_host, object_name="ComplaintDialogScroll"), 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
-        buttons.addWidget(create_button("Cancel", self.reject))
+        buttons.addWidget(create_button("Cancel", self.reject, variant="SecondaryButton"))
         buttons.addWidget(
-            create_button("Submit Complaint", self.submit_complaint)
+            create_button("Submit Complaint", self.submit_complaint, variant="PrimaryButton")
         )
         layout.addLayout(buttons)
 
@@ -433,11 +561,18 @@ class ComplaintManagementDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.complaints = []
-        configure_dialog(self, "Library Complaints", 900, 600)
+        configure_dialog(
+            self,
+            "Library Complaints",
+            900,
+            600,
+            min_width=460,
+            min_height=360,
+        )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 22, 22, 22)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(10)
         layout.addWidget(create_heading("Complaint inbox"))
 
         self.table = QTableWidget()
@@ -446,12 +581,13 @@ class ComplaintManagementDialog(QDialog):
             "ID", "User", "Subject", "Status", "Received",
         ])
         configure_table(self.table)
+        self.table.setMinimumHeight(140)
         self.table.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        c_header = self.table.horizontalHeader()
+        c_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        c_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(
             self.show_selected_complaint
         )
@@ -462,7 +598,8 @@ class ComplaintManagementDialog(QDialog):
         self.body_view.setMaximumHeight(110)
         layout.addWidget(self.body_view)
 
-        actions = QHBoxLayout()
+        actions_host = QWidget()
+        actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
         self.status_combo = QComboBox()
         self.status_combo.addItem("Open", "OPEN")
         self.status_combo.addItem("In Progress", "IN_PROGRESS")
@@ -470,13 +607,13 @@ class ComplaintManagementDialog(QDialog):
         self.update_status_button = create_button(
             "Update Status",
             self.update_status,
+            variant="PrimaryButton",
         )
-        close_button = create_button("Close", self.accept)
+        close_button = create_button("Close", self.accept, variant="SecondaryButton")
         actions.addWidget(self.status_combo)
         actions.addWidget(self.update_status_button)
-        actions.addStretch()
         actions.addWidget(close_button)
-        layout.addLayout(actions)
+        layout.addWidget(actions_host)
         self.load_complaints()
 
     def load_complaints(self):
@@ -486,6 +623,7 @@ class ComplaintManagementDialog(QDialog):
             show_error(self, "Complaint Loading Error", error)
             return
 
+        c = get_dialog_colors(self)
         self.table.setRowCount(len(self.complaints))
         for row_index, complaint in enumerate(self.complaints):
             user_label = (
@@ -493,6 +631,7 @@ class ComplaintManagementDialog(QDialog):
                 if complaint[1]
                 else "General / anonymous"
             )
+            raw_status = str(complaint[6] or "").upper()
             values = (
                 complaint[0],
                 user_label,
@@ -506,6 +645,23 @@ class ComplaintManagementDialog(QDialog):
                     Qt.ItemDataRole.UserRole,
                     int(complaint[0]),
                 )
+                if column == 0:
+                    item.setForeground(QColor(c["primary"]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                elif column == 3:
+                    color_key = (
+                        "success"
+                        if raw_status == "RESOLVED"
+                        else "cyan"
+                        if raw_status == "IN_PROGRESS"
+                        else "warning"
+                    )
+                    item.setForeground(QColor(c[color_key]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
                 self.table.setItem(row_index, column, item)
 
         if self.complaints:
@@ -574,18 +730,28 @@ class EmailQueueManagementDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.email_items = []
-        configure_dialog(self, "Email Queue Manager", 1100, 680)
+        configure_dialog(
+            self,
+            "Email Queue Manager",
+            1100,
+            680,
+            min_width=500,
+            min_height=380,
+        )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 22, 22, 22)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(10)
         layout.addWidget(create_heading("Email queue"))
-        layout.addWidget(QLabel(
+        intro_label = QLabel(
             "Review messages without sending them. Delete selected messages, "
             "including sent history, or clear all pending and failed messages."
-        ))
+        )
+        intro_label.setWordWrap(True)
+        layout.addWidget(intro_label)
 
-        filters = QHBoxLayout()
+        filters_host = QWidget()
+        filters = FlowLayout(filters_host, margin=0, h_spacing=8, v_spacing=6)
         filters.addWidget(QLabel("Show:"))
         self.status_filter = QComboBox()
         self.status_filter.addItem("All", None)
@@ -594,10 +760,10 @@ class EmailQueueManagementDialog(QDialog):
         self.status_filter.addItem("Sent", "SENT")
         self.status_filter.currentIndexChanged.connect(self.load_items)
         self.count_label = QLabel()
+        self.count_label.setWordWrap(True)
         filters.addWidget(self.status_filter)
-        filters.addStretch()
         filters.addWidget(self.count_label)
-        layout.addLayout(filters)
+        layout.addWidget(filters_host)
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(
@@ -617,6 +783,7 @@ class EmailQueueManagementDialog(QDialog):
             "Attempts", "Created",
         ])
         configure_table(self.table)
+        self.table.setMinimumHeight(140)
         self.table.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
@@ -635,26 +802,28 @@ class EmailQueueManagementDialog(QDialog):
         self.body_view.setPlaceholderText(
             "Select a message to preview its body."
         )
-        self.body_view.setMaximumHeight(120)
+        self.body_view.setMaximumHeight(110)
         layout.addWidget(self.body_view)
 
-        actions = QHBoxLayout()
-        refresh_button = create_button("Refresh", self.load_items)
+        actions_host = QWidget()
+        actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
+        refresh_button = create_button("↻ Refresh", self.load_items, variant="InfoButton")
         self.delete_selected_button = create_button(
             "Delete Selected",
             self.delete_selected,
+            variant="DangerButton",
         )
         self.delete_all_button = create_button(
             "Delete All Pending / Failed",
             self.delete_all_unsent,
+            variant="DangerButton",
         )
-        close_button = create_button("Close", self.accept)
+        close_button = create_button("Close", self.accept, variant="SecondaryButton")
         actions.addWidget(refresh_button)
         actions.addWidget(self.delete_selected_button)
         actions.addWidget(self.delete_all_button)
-        actions.addStretch()
         actions.addWidget(close_button)
-        layout.addLayout(actions)
+        layout.addWidget(actions_host)
         self.load_items()
 
     def load_items(self):
@@ -671,9 +840,15 @@ class EmailQueueManagementDialog(QDialog):
             show_error(self, "Email Queue Error", error)
             return
 
+        c = get_dialog_colors(self)
         self.count_label.setText(
             f"{counts['pending']} pending · {counts['failed']} failed · "
             f"{counts['sent']} sent"
+        )
+        self.count_label.setStyleSheet(
+            f"background: {c['primary_soft']}; color: {c['primary']}; "
+            f"border: 1px solid {c['primary']}; border-radius: 10px; "
+            "padding: 4px 10px; font-weight: 700; font-size: 11px;"
         )
         self.delivery_warning.setText(
             "Queued delivery is enabled. Disable it in Settings before "
@@ -681,6 +856,12 @@ class EmailQueueManagementDialog(QDialog):
             if delivery_enabled
             else "Queued delivery is disabled. Messages will stay queued "
             "until you explicitly enable delivery in Settings."
+        )
+        warn_key = "warning" if delivery_enabled else "cyan"
+        self.delivery_warning.setStyleSheet(
+            f"background: {c[warn_key + '_soft']}; color: {c['text']}; "
+            f"border: 1px solid {c[warn_key]}; border-left: 4px solid {c[warn_key]}; "
+            "border-radius: 7px; padding: 7px 10px; font-weight: 600;"
         )
 
         self.filter_items()
@@ -696,12 +877,14 @@ class EmailQueueManagementDialog(QDialog):
                 for value in (email[1], email[2], email[8])
             )
         ]
+        c = get_dialog_colors(self)
         self.table.setRowCount(len(visible_items))
         for row_index, email in enumerate(visible_items):
             (
                 email_id, recipient, subject, trigger, status,
                 retry_count, created_at, _sent_at, _body,
             ) = email
+            raw_status = str(status or "").upper()
             values = (
                 email_id,
                 recipient,
@@ -714,6 +897,23 @@ class EmailQueueManagementDialog(QDialog):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value or ""))
                 item.setData(Qt.ItemDataRole.UserRole, int(email_id))
+                if column == 0:
+                    item.setForeground(QColor(c["primary"]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                elif column == 4:
+                    color_key = (
+                        "success"
+                        if raw_status == "SENT"
+                        else "danger"
+                        if raw_status == "FAILED"
+                        else "warning"
+                    )
+                    item.setForeground(QColor(c[color_key]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
                 self.table.setItem(row_index, column, item)
 
         self.body_view.clear()
@@ -860,16 +1060,25 @@ class VersionManagerDialog(QDialog):
         self.current_version = current_version
         self.can_install = can_install
         self.selected_release = None
-        configure_dialog(self, "Application Version Manager", 980, 620)
+        configure_dialog(
+            self,
+            "Application Version Manager",
+            980,
+            620,
+            min_width=460,
+            min_height=360,
+        )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 22, 22, 22)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(10)
         layout.addWidget(create_heading("Published application versions"))
-        layout.addWidget(QLabel(
+        version_intro = QLabel(
             f"Installed version: {current_version}. Select a published "
             "release to install it or roll back to it."
-        ))
+        )
+        version_intro.setWordWrap(True)
+        layout.addWidget(version_intro)
 
         self.table = QTableWidget()
         self.table.setColumnCount(4)
@@ -877,6 +1086,7 @@ class VersionManagerDialog(QDialog):
             "Version", "Published", "Package", "Availability",
         ])
         configure_table(self.table)
+        self.table.setMinimumHeight(140)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
@@ -892,45 +1102,50 @@ class VersionManagerDialog(QDialog):
 
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
-        self.details.setMaximumHeight(150)
+        self.details.setMaximumHeight(140)
         layout.addWidget(self.details)
 
         self.install_button = create_button(
             "Install / Roll Back to Selected",
             self.install_selected,
             enabled=False,
+            variant="PrimaryButton",
         )
         if not can_install:
             self.install_button.setText(
                 "Install Requires Packaged Windows App"
             )
-        actions = QHBoxLayout()
         refresh_note = QLabel(
             "Only stable releases with a verified Library-Windows.zip can "
             "be installed."
         )
         refresh_note.setWordWrap(True)
-        close_button = create_button("Close", self.reject)
-        actions.addWidget(refresh_note, 1)
+        close_button = create_button("Close", self.reject, variant="SecondaryButton")
+        layout.addWidget(refresh_note)
+        actions_host = QWidget()
+        actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
         actions.addWidget(self.install_button)
         actions.addWidget(close_button)
-        layout.addLayout(actions)
+        layout.addWidget(actions_host)
         self._populate()
 
     def _populate(self):
+        c = get_dialog_colors(self)
         self.table.setRowCount(len(self.releases))
         for row, release in enumerate(self.releases):
+            installable = bool(release.get("installable"))
+            is_current = bool(release.get("current"))
             package_text = (
                 "Verified"
-                if release.get("installable")
+                if installable
                 else "Unavailable"
             )
             availability = (
                 "Installed version"
-                if release.get("current")
+                if is_current
                 else (
                     "Ready to install"
-                    if release.get("installable")
+                    if installable
                     else release.get("reason", "Package unavailable")
                 )
             )
@@ -943,6 +1158,25 @@ class VersionManagerDialog(QDialog):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setData(Qt.ItemDataRole.UserRole, row)
+                if column == 0:
+                    item.setForeground(QColor(c["primary"]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                elif column == 2:
+                    item.setForeground(QColor(c["success"] if installable else c["muted"]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                elif column == 3:
+                    color_key = (
+                        "cyan"
+                        if is_current
+                        else "primary"
+                        if installable
+                        else "warning"
+                    )
+                    item.setForeground(QColor(c[color_key]))
                 self.table.setItem(row, column, item)
         if self.releases:
             self.table.selectRow(0)
@@ -1016,12 +1250,14 @@ class UserDialog(QDialog):
             self,
             "Register User" if user_id is None else "Edit User",
             460,
-            520
+            520,
+            min_width=360,
+            min_height=340,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 24, 26, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
 
         layout.addWidget(
             create_heading(
@@ -1030,8 +1266,11 @@ class UserDialog(QDialog):
             )
         )
 
+        form_host = QWidget()
+        form_host_layout = QVBoxLayout(form_host)
+        form_host_layout.setContentsMargins(0, 0, 4, 0)
         form = QFormLayout()
-        form.setSpacing(13)
+        configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=11)
 
         self.combo_role = QComboBox()
         self.combo_role.addItems([
@@ -1045,6 +1284,10 @@ class UserDialog(QDialog):
 
         self.lbl_department = QLabel("Department:")
         self.combo_department = QComboBox()
+        self.combo_department.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.combo_department.setMinimumContentsLength(14)
 
         self.input_id = QLineEdit()
         self.input_id.setPlaceholderText("Select a role first")
@@ -1079,8 +1322,9 @@ class UserDialog(QDialog):
         form.addRow("Phone:", self.input_phoneno)
         form.addRow("Email:", self.input_email)
 
-        layout.addLayout(form)
-        layout.addStretch()
+        form_host_layout.addLayout(form)
+        form_host_layout.addStretch()
+        layout.addWidget(wrap_in_scroll_area(form_host, object_name="UserDialogScroll"), 1)
 
         self.combo_role.currentTextChanged.connect(
             self.on_role_changed
@@ -1092,11 +1336,12 @@ class UserDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.addStretch()
 
-        buttons.addWidget(create_button("Cancel", self.reject))
+        buttons.addWidget(create_button("Cancel", self.reject, variant="SecondaryButton"))
         buttons.addWidget(
             create_button(
                 "💾 Save User",
-                self.save_user
+                self.save_user,
+                variant="PrimaryButton",
             )
         )
 
@@ -1124,13 +1369,19 @@ class UserDialog(QDialog):
                 str(row[6] or "") if len(row) > 6 else ""
             )
 
-            role = str(row[3] or "")
+            role = normalize_user_role(row[3]) or str(row[3] or "")
             department = str(row[4] or "")
 
             self.combo_role.setCurrentText(role)
             self.on_role_changed(role)
 
-            index = self.combo_department.findText(department)
+            canonical_department = (
+                normalize_department_for_role(department, role) or department
+            )
+            index = self.combo_department.findText(
+                canonical_department,
+                Qt.MatchFlag.MatchFixedString,
+            )
 
             if index >= 0:
                 self.combo_department.setCurrentIndex(index)
@@ -1156,7 +1407,7 @@ class UserDialog(QDialog):
         elif role in ("Faculty", "Guest Lecturer"):
             self.lbl_department.show()
             self.combo_department.show()
-            self.lbl_department.setText("Teaching Department:")
+            self.lbl_department.setText("Branch / Department:")
 
             for department in self.db.get_departments("FACULTY") or []:
                 self.combo_department.addItem(str(department))
@@ -1178,8 +1429,8 @@ class UserDialog(QDialog):
             "Admin",
             "Librarian"
         ):
-            regex = QRegularExpression(r"^[A-Za-z]{2}[0-9]{6}$")
-            placeholder = "Branch code + 6 digits (e.g. CS000001)"
+            regex = QRegularExpression(r"^[0-9]{6}$")
+            placeholder = "6-digit ID (e.g. 123456)"
 
         else:
             regex = QRegularExpression(r"^$")
@@ -1249,8 +1500,8 @@ class UserDialog(QDialog):
                 self,
                 "Invalid User ID",
                 "Students must use 5 digits, a 2-letter branch, and 3 digits "
-                "(for example, 24001-CS-097). Employee IDs must use a "
-                "2-letter branch code followed by 6 digits.",
+                "(for example, 24001-CS-097). Other user roles must use "
+                "exactly 6 digits (for example, 123456).",
             )
             return
 
@@ -1313,27 +1564,32 @@ class ViewBooksDialog(QDialog):
         self.db = db
         self.user_id = user_id
         self.books_data = []
+        self._splitter_vertical = None
+        self._compact_table_mode = None
 
         configure_dialog(
             self,
             f"Circulation History — {user_id}",
             1050,
-            620
+            620,
+            min_width=480,
+            min_height=360,
         )
 
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(22, 22, 22, 22)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(12)
 
         main_layout.addWidget(
             create_heading(f"📋 Circulation History — User {user_id}")
         )
 
-        content = QHBoxLayout()
-        content.setSpacing(16)
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.setHandleWidth(6)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels([
             "Book ID",
             "Title",
@@ -1341,33 +1597,89 @@ class ViewBooksDialog(QDialog):
             "Status",
             "Issue Date",
             "Due Date",
+            "Renewals",
             "Fine"
         ])
 
         configure_table(self.table)
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
+        self.table.setMinimumHeight(160)
+        self.table.setHorizontalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
         )
+        self._apply_table_column_modes()
 
         self.detail_container = QFrame()
-        self.detail_container.setMinimumWidth(280)
-        self.detail_container.setMaximumWidth(310)
+        self.detail_container.setObjectName("DialogInspector")
+        c_panel = get_dialog_colors(self)
+        self.detail_container.setStyleSheet(
+            f"#DialogInspector {{ background-color: {c_panel['surface']}; "
+            f"border: 1px solid {c_panel['border']}; border-radius: 12px; }}"
+        )
 
-        self.detail_layout = QVBoxLayout(self.detail_container)
-        self.detail_layout.setContentsMargins(16, 16, 16, 16)
-        self.detail_layout.setSpacing(12)
+        detail_outer = QVBoxLayout(self.detail_container)
+        detail_outer.setContentsMargins(10, 10, 10, 10)
+        detail_outer.setSpacing(0)
+
+        self.detail_content = QWidget()
+        self.detail_content.setObjectName("LoanInspectorContent")
+        self.detail_layout = QVBoxLayout(self.detail_content)
+        self.detail_layout.setContentsMargins(4, 4, 6, 4)
+        self.detail_layout.setSpacing(10)
+
+        self.detail_scroll = wrap_in_scroll_area(
+            self.detail_content,
+            object_name="LoanInspectorScroll",
+        )
+        detail_outer.addWidget(self.detail_scroll)
 
         self.table.selectionModel().selectionChanged.connect(
             self.on_selection_changed
         )
 
-        content.addWidget(self.table, 3)
-        content.addWidget(self.detail_container, 1)
+        self.content_splitter.addWidget(self.table)
+        self.content_splitter.addWidget(self.detail_container)
+        self._sync_responsive_layout()
 
-        main_layout.addLayout(content)
+        main_layout.addWidget(self.content_splitter, 1)
 
         self.show_default_inspector()
         self.load_user_books()
+
+    def _apply_table_column_modes(self):
+        compact = self.width() < 860
+        if compact == self._compact_table_mode:
+            return
+        self._compact_table_mode = compact
+        header = self.table.horizontalHeader()
+        header.setMinimumSectionSize(55)
+        for col in (0, 3, 4, 5, 6, 7):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        if compact:
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(1, 180)
+            self.table.setColumnWidth(2, 130)
+        else:
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+
+    def _sync_responsive_layout(self):
+        self._splitter_vertical = sync_responsive_splitter(
+            self.content_splitter,
+            self.detail_container,
+            self.width() - 36,
+            breakpoint=820,
+            max_panel_width=340,
+            min_panel_width=240,
+            min_panel_height=190,
+            current_vertical=self._splitter_vertical,
+        )
+        self._apply_table_column_modes()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "content_splitter"):
+            self._sync_responsive_layout()
 
     def show_default_inspector(self):
         clear_layout(self.detail_layout)
@@ -1389,6 +1701,19 @@ class ViewBooksDialog(QDialog):
             self.books_data = self.db.get_user_books_status(
                 self.user_id
             ) or []
+            self._loan_extras = self.db.conn.execute("""
+                SELECT c.id,
+                       COALESCE(c.renewal_count, 0),
+                       COALESCE(c.last_renewed_at, ''),
+                       COALESCE(c.fine_settled, 0),
+                       COALESCE(c.fine_settlement_action, '')
+                FROM circulation_logs c
+                JOIN books b ON c.book_id = b.id
+                WHERE c.user_id = ?
+                ORDER BY c.id DESC
+            """, (str(self.user_id).strip(),)).fetchall()
+            self._max_renewals = self.db.get_max_renewals()
+            today_str = datetime.date.today().isoformat()
 
             self.table.blockSignals(True)
             self.table.setRowCount(0)
@@ -1408,7 +1733,37 @@ class ViewBooksDialog(QDialog):
                     fine
                 ) = book
 
-                status_text = str(status).upper()
+                extras = (
+                    self._loan_extras[row_index]
+                    if row_index < len(self._loan_extras)
+                    else (None, 0, "", 0, "")
+                )
+                ren_count = int(extras[1] or 0)
+                fine_settled = int(extras[3] or 0) == 1 or str(status).upper() == "PAID"
+                fine_action = str(extras[4] or "").upper()
+                try:
+                    fine_val = float(fine or 0.0)
+                except (TypeError, ValueError):
+                    fine_val = 0.0
+
+                raw_status = str(status).upper()
+                due_text = safe_text(due)
+                if raw_status == "ISSUED" and due_text and due_text[:10] < today_str:
+                    status_text = "OVERDUE"
+                elif raw_status == "ISSUED" and due_text and due_text[:10] == today_str:
+                    status_text = "DUE TODAY"
+                else:
+                    status_text = raw_status
+
+                ren_text = (
+                    f"{ren_count}/{self._max_renewals}"
+                    if self._max_renewals > 0
+                    else str(ren_count)
+                ) if ren_count > 0 else "0"
+                fine_text = money(fine_val)
+                if fine_val > 0 and fine_settled:
+                    badge = "Waived" if fine_action == "WAIVED" else "Paid"
+                    fine_text = f"{fine_text} ({badge})"
 
                 values = [
                     safe_text(book_id),
@@ -1416,19 +1771,42 @@ class ViewBooksDialog(QDialog):
                     safe_text(author),
                     status_text,
                     safe_text(checkout),
-                    safe_text(due),
-                    money(fine)
+                    due_text,
+                    ren_text,
+                    fine_text,
                 ]
 
+                c = get_dialog_colors(self)
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(value)
 
-                    if column == 3:
-                        item.setForeground(
-                            QColor("#f59e0b")
-                            if status_text == "ISSUED"
-                            else QColor("#10b981")
-                        )
+                    if column == 0:
+                        item.setForeground(QColor(c["primary"]))
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
+                    elif column == 3:
+                        if status_text == "OVERDUE":
+                            item.setForeground(QColor(c["danger"]))
+                        elif status_text == "DUE TODAY":
+                            item.setForeground(QColor(c["warning"]))
+                        elif status_text == "ISSUED":
+                            item.setForeground(QColor(c["primary"]))
+                        else:
+                            item.setForeground(QColor(c["success"]))
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
+                    elif column == 6 and ren_count > 0:
+                        item.setForeground(QColor(c["cyan"]))
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
+                    elif column == 7 and fine_val > 0 and not fine_settled:
+                        item.setForeground(QColor(c["danger"]))
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
 
                     self.table.setItem(row_index, column, item)
 
@@ -1436,7 +1814,7 @@ class ViewBooksDialog(QDialog):
 
             if self.books_data:
                 self.table.selectRow(0)
-                self.display_record_details(self.books_data[0])
+                self.display_record_details(0)
             else:
                 self.show_default_inspector()
 
@@ -1454,9 +1832,19 @@ class ViewBooksDialog(QDialog):
         row = selected[0].row()
 
         if 0 <= row < len(self.books_data):
-            self.display_record_details(self.books_data[row])
+            self.display_record_details(row)
 
-    def display_record_details(self, book):
+    def display_record_details(self, row_or_book):
+        if isinstance(row_or_book, int):
+            row_index = row_or_book
+            book = self.books_data[row_index]
+        else:
+            book = row_or_book
+            try:
+                row_index = self.books_data.index(book)
+            except ValueError:
+                row_index = -1
+
         (
             book_id,
             title,
@@ -1469,15 +1857,32 @@ class ViewBooksDialog(QDialog):
             fine
         ) = book
 
+        extras = (
+            self._loan_extras[row_index]
+            if 0 <= row_index < len(getattr(self, "_loan_extras", []))
+            else (None, 0, "", 0, "")
+        )
+        loan_id, ren_count, last_renewed, fine_settled_flag, fine_action = extras
+        try:
+            fine_val = float(fine or 0.0)
+        except (TypeError, ValueError):
+            fine_val = 0.0
+        fine_settled = bool(int(fine_settled_flag or 0) == 1 or str(status).upper() == "PAID")
+
         clear_layout(self.detail_layout)
 
-        is_issued = str(status).upper() == "ISSUED"
+        raw_status = str(status).upper()
+        is_issued = raw_status == "ISSUED"
+        today_str = datetime.date.today().isoformat()
+        is_overdue = bool(is_issued and safe_text(due) and safe_text(due)[:10] < today_str)
 
         self.detail_layout.addWidget(
             create_heading("Loan Control Center")
         )
 
         banner = QLabel(
+            "🔴 Overdue Book"
+            if is_overdue else
             "🟠 Issued Book"
             if is_issued else
             "🟢 Returned Record"
@@ -1485,13 +1890,22 @@ class ViewBooksDialog(QDialog):
         banner.setWordWrap(True)
         set_status_property(
             banner,
-            "issued" if is_issued else "returned"
+            "overdue" if is_overdue else "issued" if is_issued else "returned"
         )
 
         self.detail_layout.addWidget(banner)
 
         form = QFormLayout()
-        form.setSpacing(9)
+        configure_inspector_form(form, horizontal_spacing=10, vertical_spacing=7)
+
+        max_r = getattr(self, "_max_renewals", 0)
+        ren_display = f"{ren_count} / {max_r}" if max_r > 0 else f"{ren_count} (Unlimited)"
+        if fine_val <= 0:
+            fine_status = "No Fine"
+        elif fine_settled:
+            fine_status = "Waived" if str(fine_action).upper() == "WAIVED" else "Paid"
+        else:
+            fine_status = "Unpaid Balance"
 
         details = [
             ("Book ID:", book_id),
@@ -1500,25 +1914,101 @@ class ViewBooksDialog(QDialog):
             ("Publisher:", publisher),
             ("Issue Date:", checkout),
             ("Due Date:", due),
+            ("Renewals:", ren_display),
+            ("Last Renewed:", last_renewed or "—"),
             ("Returned:", returned or "Not yet returned"),
-            ("Fine:", money(fine))
+            ("Fine:", f"{money(fine_val)} ({fine_status})"),
         ]
 
         for label, value in details:
+            key_label = QLabel(label)
+            key_label.setMinimumWidth(0)
+            key_label.setWordWrap(True)
             value_label = QLabel(safe_text(value))
-            value_label.setWordWrap(True)
-            form.addRow(label, value_label)
+            configure_wrapped_label(value_label)
+            form.addRow(key_label, value_label)
 
         self.detail_layout.addLayout(form)
 
         if is_issued:
-            button = create_button(
-                "↩ Return Book",
-                lambda: self.handle_return_action(book_id)
+            renew_btn = configure_inspector_button(
+                create_button(
+                    "🔄 Renew Loan",
+                    lambda: self.handle_renew_action(book_id, loan_id),
+                    variant="InfoButton",
+                )
+            )
+            self.detail_layout.addWidget(renew_btn)
+
+            button = configure_inspector_button(
+                create_button(
+                    "↩ Return Book",
+                    lambda: self.handle_return_action(book_id),
+                    variant="SuccessButton",
+                )
             )
             self.detail_layout.addWidget(button)
 
+        if fine_val > 0 and not fine_settled and loan_id is not None:
+            self.detail_layout.addWidget(
+                configure_inspector_button(
+                    create_button(
+                        "💳 Mark Fine Paid",
+                        lambda: self.handle_settle_fine(loan_id, "PAID"),
+                        variant="SuccessButton",
+                    )
+                )
+            )
+            self.detail_layout.addWidget(
+                configure_inspector_button(
+                    create_button(
+                        "Waive Fine",
+                        lambda: self.handle_settle_fine(loan_id, "WAIVED"),
+                        variant="WarningButton",
+                    )
+                )
+            )
+
         self.detail_layout.addStretch()
+
+    def handle_renew_action(self, book_id, loan_id=None):
+        if loan_id is None:
+            loan_id = self.db.get_active_loan_id(book_id, self.user_id)
+        if loan_id is None:
+            show_warning(
+                self,
+                "Active Loan Not Found",
+                f"No active loan found for Book {book_id} and User {self.user_id}."
+            )
+            return
+
+        dialog = RenewLoanDialog(self.db, loan_id, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.data_updated.emit()
+            show_success(
+                self,
+                "Loan Renewed",
+                dialog.result_message or "Loan renewed successfully."
+            )
+            self.load_user_books()
+
+    def handle_settle_fine(self, loan_id, action):
+        verb = "mark this fine as PAID" if action == "PAID" else "WAIVE this fine"
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Fine Settlement",
+            f"Do you want to {verb} for transaction #{loan_id}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        success, message = self.db.settle_loan_fine(loan_id, action=action)
+        if success:
+            self.data_updated.emit()
+            show_success(self, "Fine Updated", message)
+            self.load_user_books()
+        else:
+            show_warning(self, "Fine Settlement Failed", message)
 
     def handle_return_action(self, book_id):
         confirm = QMessageBox.question(
@@ -1580,14 +2070,21 @@ class BarcodeGeneratorDialog(QDialog):
             self,
             "Barcode Generator",
             460,
-            660
+            660,
+            min_width=360,
+            min_height=380,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(10)
 
         layout.addWidget(create_heading("🏷️ Book Barcode Generator"))
+
+        body_host = QWidget()
+        body_layout = QVBoxLayout(body_host)
+        body_layout.setContentsMargins(0, 0, 4, 0)
+        body_layout.setSpacing(10)
 
         self.input_book_id = QLineEdit(str(book_id))
         self.input_book_id.setPlaceholderText("Book ID")
@@ -1602,20 +2099,20 @@ class BarcodeGeneratorDialog(QDialog):
         self.input_book_publisher.setPlaceholderText("Publisher")
 
         form = QFormLayout()
-        form.setSpacing(10)
+        configure_inspector_form(form, horizontal_spacing=10, vertical_spacing=9)
 
         form.addRow("Book ID:", self.input_book_id)
         form.addRow("Title:", self.input_book_title)
         form.addRow("Author:", self.input_book_author)
         form.addRow("Publisher:", self.input_book_publisher)
 
-        layout.addLayout(form)
+        body_layout.addLayout(form)
 
         self.lbl_preview = QLabel("Barcode Preview")
         self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_preview.setMinimumHeight(180)
+        self.lbl_preview.setMinimumHeight(140)
         self.lbl_preview.setProperty("class", "barcode-preview")
-        layout.addWidget(self.lbl_preview)
+        body_layout.addWidget(self.lbl_preview)
 
         self.chk_box_db = QCheckBox("Save book to database")
 
@@ -1624,17 +2121,22 @@ class BarcodeGeneratorDialog(QDialog):
         else:
             self.chk_box_db.setChecked(True)
 
-        layout.addWidget(self.chk_box_db)
+        body_layout.addWidget(self.chk_box_db)
+        body_layout.addStretch()
+
+        layout.addWidget(wrap_in_scroll_area(body_host, object_name="BarcodeDialogScroll"), 1)
 
         self.btn_generate = create_button(
             "⚙ Generate Barcode",
-            self.generate_barcode
+            self.generate_barcode,
+            variant="PrimaryButton",
         )
 
         self.btn_save = create_button(
             "💾 Export PNG",
             self.save_png,
-            enabled=False
+            enabled=False,
+            variant="SuccessButton",
         )
 
         layout.addWidget(self.btn_generate)
@@ -1719,10 +2221,12 @@ class BarcodeGeneratorDialog(QDialog):
             pixmap = QPixmap()
             pixmap.loadFromData(raw, "PNG")
 
+            target_w = max(160, self.lbl_preview.width() - 20)
+            target_h = max(100, self.lbl_preview.height() - 20)
             self.lbl_preview.setPixmap(
                 pixmap.scaled(
-                    self.lbl_preview.width() - 20,
-                    self.lbl_preview.height() - 20,
+                    target_w,
+                    target_h,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 )
@@ -1785,30 +2289,38 @@ class QuickScanDialog(QDialog):
         self.book_id = None
         self.cap = None
         self.barcode_detector = None
+        self._user_edited_days = False
 
         configure_dialog(
             self,
             "Quick Barcode Scanner",
-            440,
-            650
+            480,
+            680,
+            min_width=380,
+            min_height=380,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 22, 22, 22)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(10)
 
         layout.addWidget(create_heading("📷 Quick Barcode Scanner"))
+
+        scan_host = QWidget()
+        scan_layout = QVBoxLayout(scan_host)
+        scan_layout.setContentsMargins(0, 0, 4, 0)
+        scan_layout.setSpacing(10)
 
         self.lbl_capture = QLabel(
             "Initializing camera..."
         )
         self.lbl_capture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_capture.setMinimumHeight(190)
+        self.lbl_capture.setMinimumHeight(140)
         self.lbl_capture.setProperty("class", "camera-preview")
 
-        layout.addWidget(self.lbl_capture)
+        scan_layout.addWidget(self.lbl_capture)
 
-        layout.addWidget(QLabel("Book ID — USB Scanner or Manual"))
+        scan_layout.addWidget(QLabel("Book ID — USB Scanner or Manual"))
 
         self.input_book_id = QLineEdit()
         self.input_book_id.setPlaceholderText(
@@ -1821,19 +2333,31 @@ class QuickScanDialog(QDialog):
             self.on_manual_text_change
         )
 
-        layout.addWidget(self.input_book_id)
+        scan_layout.addWidget(self.input_book_id)
 
+        c_scan = get_dialog_colors(self)
         self.lbl_status = QLabel("Waiting for barcode...")
         self.lbl_status.setWordWrap(True)
-        layout.addWidget(self.lbl_status)
+        self.lbl_status.setStyleSheet(
+            f"color: {c_scan['muted']}; font-weight: 600;"
+        )
+        scan_layout.addWidget(self.lbl_status)
 
-        layout.addWidget(QLabel("User ID / PIN"))
+        scan_layout.addWidget(QLabel("User ID / PIN"))
 
         self.input_user_id = QLineEdit()
         self.input_user_id.setPlaceholderText("Enter User ID")
-        layout.addWidget(self.input_user_id)
+        self.input_user_id.textChanged.connect(self._update_scan_context)
+        scan_layout.addWidget(self.input_user_id)
 
-        layout.addWidget(QLabel("Loan Duration"))
+        self.lbl_user_policy = QLabel("")
+        self.lbl_user_policy.setWordWrap(True)
+        self.lbl_user_policy.setStyleSheet(
+            f"color: {c_scan['cyan']}; font-weight: 600;"
+        )
+        scan_layout.addWidget(self.lbl_user_policy)
+
+        scan_layout.addWidget(QLabel("Loan Duration"))
 
         try:
             days = int(self.db.get_setting("default_days", 14))
@@ -1844,27 +2368,42 @@ class QuickScanDialog(QDialog):
         self.spin_days.setRange(1, 365)
         self.spin_days.setValue(max(1, min(days, 365)))
         self.spin_days.setSuffix(" days")
+        self.spin_days.valueChanged.connect(self._on_spin_days_edited)
 
-        layout.addWidget(self.spin_days)
+        scan_layout.addWidget(self.spin_days)
+        scan_layout.addStretch()
 
-        buttons = QHBoxLayout()
+        layout.addWidget(wrap_in_scroll_area(scan_host, object_name="QuickScanDialogScroll"), 1)
+
+        buttons_host = QWidget()
+        buttons = FlowLayout(buttons_host, margin=0, h_spacing=8, v_spacing=6)
 
         self.issue_btn = create_button(
             "📤 Issue Book",
             lambda: self.process_circulation("issue"),
-            False
+            False,
+            variant="PrimaryButton",
+        )
+
+        self.renew_btn = create_button(
+            "🔄 Renew Book",
+            lambda: self.process_circulation("renew"),
+            False,
+            variant="InfoButton",
         )
 
         self.return_btn = create_button(
             "📥 Return Book",
             lambda: self.process_circulation("return"),
-            False
+            False,
+            variant="SuccessButton",
         )
 
         buttons.addWidget(self.issue_btn)
+        buttons.addWidget(self.renew_btn)
         buttons.addWidget(self.return_btn)
 
-        layout.addLayout(buttons)
+        layout.addWidget(buttons_host)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
@@ -1907,19 +2446,91 @@ class QuickScanDialog(QDialog):
 
             self.cap = None
 
+    def _on_spin_days_edited(self):
+        if not self.spin_days.signalsBlocked():
+            self._user_edited_days = True
+
+    def _update_scan_context(self, *_):
+        c = get_dialog_colors(self)
+        code = self.input_book_id.text().strip()
+        user_id = self.input_user_id.text().strip()
+        self.book_id = code or None
+
+        has_book = bool(code)
+        self.issue_btn.setEnabled(has_book)
+        self.return_btn.setEnabled(has_book)
+        self.renew_btn.setEnabled(has_book and bool(user_id))
+
+        if user_id:
+            ok, user = self.db.get_user_details(user_id)
+            if ok and user:
+                role = user[3]
+                policy = self.db.get_loan_policy(role)
+                if not self._user_edited_days:
+                    self.spin_days.blockSignals(True)
+                    self.spin_days.setValue(max(1, min(int(policy.get("default_days", 14)), 365)))
+                    self.spin_days.blockSignals(False)
+                active_loan_id = (
+                    self.db.get_active_loan_id(code, user_id)
+                    if has_book
+                    else None
+                )
+                if active_loan_id:
+                    self.lbl_user_policy.setText(
+                        f"{user[1]} ({role}) · Active loan #{active_loan_id} detected for {code}"
+                    )
+                    self.lbl_user_policy.setStyleSheet(
+                        f"background: {c['cyan_soft']}; color: {c['cyan']}; "
+                        f"border: 1px solid {c['cyan']}; border-radius: 6px; "
+                        "padding: 5px 8px; font-weight: 700;"
+                    )
+                else:
+                    self.lbl_user_policy.setText(
+                        f"{user[1]} ({role}) · Policy: {policy.get('default_days', 14)} days, "
+                        f"Max {policy.get('max_books', 3)} books, ₹{policy.get('fine_rate', 2.0):.2f}/day"
+                    )
+                    self.lbl_user_policy.setStyleSheet(
+                        f"background: {c['primary_soft']}; color: {c['primary']}; "
+                        f"border: 1px solid {c['primary']}; border-radius: 6px; "
+                        "padding: 5px 8px; font-weight: 600;"
+                    )
+            else:
+                self.lbl_user_policy.setText("Member ID not found.")
+                self.lbl_user_policy.setStyleSheet(
+                    f"color: {c['danger']}; font-weight: 600;"
+                )
+        else:
+            self.lbl_user_policy.setText("")
+            self.lbl_user_policy.setStyleSheet("")
+
     def on_manual_text_change(self, text):
+        c = get_dialog_colors(self)
         code = text.strip()
         self.book_id = code or None
 
-        self.issue_btn.setEnabled(bool(code))
-        self.return_btn.setEnabled(bool(code))
-
         if code:
-            self.lbl_status.setText(
-                f"Book detected: {code}"
-            )
+            ok, book = self.db.get_book_details(code)
+            if ok and book:
+                self.lbl_status.setText(
+                    f"Book: {book[1]} ({int(book[5] or 0)}/{int(book[4] or 0)} available)"
+                )
+                self.lbl_status.setStyleSheet(
+                    f"background: {c['success_soft']}; color: {c['success']}; "
+                    f"border: 1px solid {c['success']}; border-radius: 6px; "
+                    "padding: 5px 8px; font-weight: 700;"
+                )
+            else:
+                self.lbl_status.setText(f"Book detected: {code}")
+                self.lbl_status.setStyleSheet(
+                    f"color: {c['primary']}; font-weight: 600;"
+                )
         else:
             self.lbl_status.setText("Waiting for barcode...")
+            self.lbl_status.setStyleSheet(
+                f"color: {c['muted']}; font-weight: 600;"
+            )
+
+        self._update_scan_context()
 
     def on_physical_scan(self):
         code = self.input_book_id.text().strip()
@@ -1977,10 +2588,12 @@ class QuickScanDialog(QDialog):
 
             pixmap = QPixmap.fromImage(image)
 
+            cap_w = max(120, self.lbl_capture.width())
+            cap_h = max(100, self.lbl_capture.height())
             self.lbl_capture.setPixmap(
                 pixmap.scaled(
-                    self.lbl_capture.width(),
-                    self.lbl_capture.height(),
+                    cap_w,
+                    cap_h,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 )
@@ -2003,8 +2616,7 @@ class QuickScanDialog(QDialog):
             f"Detected using {source}: {code}"
         )
 
-        self.issue_btn.setEnabled(True)
-        self.return_btn.setEnabled(True)
+        self._update_scan_context()
 
         if self.timer.isActive():
             self.timer.stop()
@@ -2018,6 +2630,27 @@ class QuickScanDialog(QDialog):
                 "Missing Information",
                 "Both Book ID and User ID are required."
             )
+            return
+
+        if action == "renew":
+            loan_id = self.db.get_active_loan_id(self.book_id, user_id)
+            if loan_id is None:
+                show_warning(
+                    self,
+                    "Active Loan Not Found",
+                    f"No active loan found matching Book ID '{self.book_id}' and User ID '{user_id}'."
+                )
+                return
+            dialog = RenewLoanDialog(self.db, loan_id, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.data_updated.emit()
+                show_success(
+                    self,
+                    "Loan Renewed",
+                    dialog.result_message or "Loan renewed successfully."
+                )
+                self._release_camera()
+                self.accept()
             return
 
         try:
@@ -2064,6 +2697,7 @@ class QuickScanDialog(QDialog):
         self.input_book_id.clear()
 
         self.issue_btn.setEnabled(False)
+        self.renew_btn.setEnabled(False)
         self.return_btn.setEnabled(False)
 
         if self.cap and self.cap.isOpened() and not self.timer.isActive():
@@ -2094,12 +2728,14 @@ class LoginDialog(QDialog):
             self,
             "Library System Security",
             390,
-            320
+            320,
+            min_width=320,
+            min_height=250,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 24, 26, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
 
         layout.addWidget(
             create_heading("🔒 Administrator Login")
@@ -2123,7 +2759,8 @@ class LoginDialog(QDialog):
 
         self.btn_login = create_button(
             "Verify Password →",
-            self.verify_password
+            self.verify_password,
+            variant="PrimaryButton",
         )
 
         self.btn_login.setDefault(False)
@@ -2133,6 +2770,7 @@ class LoginDialog(QDialog):
         self.btn_forgot_password = create_button(
             "Forgot password?",
             self.open_password_recovery,
+            variant="SecondaryButton",
         )
         self.btn_forgot_password.setDefault(False)
         self.btn_forgot_password.setAutoDefault(False)
@@ -2228,11 +2866,18 @@ class RecoveryCodeSetupDialog(QDialog):
             self,
             "Save Administrator Recovery Code",
             500,
-            280,
+            330,
+            min_width=340,
+            min_height=260,
         )
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 22)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 18, 20, 18)
+        outer.setSpacing(12)
+
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 4, 0)
         layout.setSpacing(12)
 
         layout.addWidget(
@@ -2243,14 +2888,18 @@ class RecoveryCodeSetupDialog(QDialog):
             "computer. It is shown only once and is required to reset "
             "the administrator password."
         )
-        description.setWordWrap(True)
+        configure_wrapped_label(description)
         layout.addWidget(description)
 
+        c = get_dialog_colors(self)
         self.code_input = QLineEdit(self.recovery_code)
         self.code_input.setReadOnly(True)
+        self.code_input.setMinimumWidth(0)
         self.code_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.code_input.setStyleSheet(
-            "font-size: 15px; font-weight: 700; letter-spacing: 1px;"
+            f"background: {c['primary_soft']}; color: {c['primary']}; "
+            f"border: 1.5px solid {c['primary']}; border-radius: 8px; "
+            "font-size: 14px; font-weight: 700; letter-spacing: 1px;"
         )
         self.code_input.setMinimumHeight(42)
         layout.addWidget(self.code_input)
@@ -2258,6 +2907,7 @@ class RecoveryCodeSetupDialog(QDialog):
         copy_button = create_button(
             "Copy Recovery Code",
             lambda: QApplication.clipboard().setText(self.recovery_code),
+            variant="InfoButton",
         )
         layout.addWidget(copy_button)
 
@@ -2265,20 +2915,24 @@ class RecoveryCodeSetupDialog(QDialog):
             "I have saved this code somewhere secure."
         )
         layout.addWidget(self.saved_checkbox)
+        layout.addStretch()
+
+        outer.addWidget(wrap_in_scroll_area(body, object_name="RecoverySetupScroll"), 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
 
-        cancel_button = create_button("Cancel", self.reject)
+        cancel_button = create_button("Cancel", self.reject, variant="SecondaryButton")
         buttons.addWidget(cancel_button)
 
         self.confirm_button = create_button(
             "Continue",
             self.accept,
             enabled=False,
+            variant="PrimaryButton",
         )
         buttons.addWidget(self.confirm_button)
-        layout.addLayout(buttons)
+        outer.addLayout(buttons)
 
         self.saved_checkbox.toggled.connect(
             self.confirm_button.setEnabled
@@ -2296,7 +2950,9 @@ class AdminPasswordRecoveryDialog(QDialog):
             self,
             "Reset Administrator Password",
             450,
-            310,
+            320,
+            min_width=320,
+            min_height=250,
         )
 
         layout = QVBoxLayout(self)
@@ -2336,11 +2992,12 @@ class AdminPasswordRecoveryDialog(QDialog):
 
         buttons = QHBoxLayout()
         buttons.addStretch()
-        cancel_button = create_button("Cancel", self.reject)
+        cancel_button = create_button("Cancel", self.reject, variant="SecondaryButton")
         buttons.addWidget(cancel_button)
         reset_button = create_button(
             "Reset Password",
             self.reset_password,
+            variant="WarningButton",
         )
         buttons.addWidget(reset_button)
         layout.addLayout(buttons)
@@ -2432,7 +3089,13 @@ class CustomSplashScreen(QDialog):
             Qt.WindowType.WindowStaysOnTopHint
         )
 
-        self.setFixedSize(440, 390)
+        clamp_widget_to_screen(
+            self,
+            440,
+            390,
+            max_width_ratio=0.90,
+            max_height_ratio=0.88,
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 30, 30, 30)
@@ -2495,17 +3158,21 @@ class BookHistoryDialog(QDialog):
         self.book_id = book_id
         self.book_title = book_title
         self.history_data = []
+        self._splitter_vertical = None
+        self._compact_table_mode = None
 
         configure_dialog(
             self,
             f"Book History — {book_title}",
             1050,
-            620
+            620,
+            min_width=480,
+            min_height=360,
         )
 
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(22, 22, 22, 22)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(12)
 
         main_layout.addWidget(
             create_heading(
@@ -2513,46 +3180,100 @@ class BookHistoryDialog(QDialog):
             )
         )
 
-        content = QHBoxLayout()
-        content.setSpacing(16)
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.setHandleWidth(6)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
+        self.table.setColumnCount(8)
 
         self.table.setHorizontalHeaderLabels([
+            "Log ID",
             "Borrower ID",
             "Status",
             "Issue Date",
             "Due Date",
             "Return Date",
+            "Renewals",
             "Fine"
         ])
 
         configure_table(self.table)
-
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
+        self.table.setMinimumHeight(160)
+        self.table.setHorizontalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
         )
+        self._apply_table_column_modes()
 
         self.detail_container = QFrame()
-        self.detail_container.setMinimumWidth(280)
-        self.detail_container.setMaximumWidth(310)
+        self.detail_container.setObjectName("DialogInspector")
+        c_panel = get_dialog_colors(self)
+        self.detail_container.setStyleSheet(
+            f"#DialogInspector {{ background-color: {c_panel['surface']}; "
+            f"border: 1px solid {c_panel['border']}; border-radius: 12px; }}"
+        )
 
-        self.detail_layout = QVBoxLayout(self.detail_container)
-        self.detail_layout.setContentsMargins(16, 16, 16, 16)
-        self.detail_layout.setSpacing(12)
+        detail_outer = QVBoxLayout(self.detail_container)
+        detail_outer.setContentsMargins(10, 10, 10, 10)
+        detail_outer.setSpacing(0)
+
+        self.detail_content = QWidget()
+        self.detail_content.setObjectName("AuditInspectorContent")
+        self.detail_layout = QVBoxLayout(self.detail_content)
+        self.detail_layout.setContentsMargins(4, 4, 6, 4)
+        self.detail_layout.setSpacing(10)
+
+        self.detail_scroll = wrap_in_scroll_area(
+            self.detail_content,
+            object_name="AuditInspectorScroll",
+        )
+        detail_outer.addWidget(self.detail_scroll)
 
         self.table.selectionModel().selectionChanged.connect(
             self.on_selection_changed
         )
 
-        content.addWidget(self.table, 3)
-        content.addWidget(self.detail_container, 1)
+        self.content_splitter.addWidget(self.table)
+        self.content_splitter.addWidget(self.detail_container)
+        self._sync_responsive_layout()
 
-        main_layout.addLayout(content)
+        main_layout.addWidget(self.content_splitter, 1)
 
         self.show_default_inspector()
         self.load_history()
+
+    def _apply_table_column_modes(self):
+        compact = self.width() < 860
+        if compact == self._compact_table_mode:
+            return
+        self._compact_table_mode = compact
+        header = self.table.horizontalHeader()
+        header.setMinimumSectionSize(55)
+        for col in (0, 2, 3, 4, 5, 6, 7):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        if compact:
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(1, 140)
+        else:
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+
+    def _sync_responsive_layout(self):
+        self._splitter_vertical = sync_responsive_splitter(
+            self.content_splitter,
+            self.detail_container,
+            self.width() - 36,
+            breakpoint=820,
+            max_panel_width=340,
+            min_panel_width=240,
+            min_panel_height=190,
+            current_vertical=self._splitter_vertical,
+        )
+        self._apply_table_column_modes()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "content_splitter"):
+            self._sync_responsive_layout()
 
     def show_default_inspector(self):
         clear_layout(self.detail_layout)
@@ -2577,12 +3298,17 @@ class BookHistoryDialog(QDialog):
             cursor.execute(
                 """
                 SELECT
+                    id,
                     user_id,
                     checkout_date,
                     due_date,
                     return_date,
                     fine_amount,
-                    status
+                    status,
+                    COALESCE(renewal_count, 0),
+                    COALESCE(last_renewed_at, ''),
+                    COALESCE(fine_settled, 0),
+                    COALESCE(fine_settlement_action, '')
                 FROM circulation_logs
                 WHERE book_id = ?
                 ORDER BY id DESC
@@ -2591,33 +3317,84 @@ class BookHistoryDialog(QDialog):
             )
 
             self.history_data = cursor.fetchall()
+            self._max_renewals = self.db.get_max_renewals()
+            today_str = datetime.date.today().isoformat()
 
             self.table.blockSignals(True)
             self.table.setRowCount(len(self.history_data))
 
             for row_index, record in enumerate(self.history_data):
-                user_id, checkout, due, returned, fine, status = record
+                (
+                    log_id, user_id, checkout, due, returned, fine,
+                    status, ren_count, _last_renewed, fine_settled, fine_action
+                ) = record
 
-                status_text = str(status).upper()
+                raw_status = str(status).upper()
+                due_text = safe_text(due)
+                if raw_status == "ISSUED" and due_text and due_text[:10] < today_str:
+                    status_text = "OVERDUE"
+                elif raw_status == "ISSUED" and due_text and due_text[:10] == today_str:
+                    status_text = "DUE TODAY"
+                else:
+                    status_text = raw_status
+
+                try:
+                    fine_val = float(fine or 0.0)
+                except (TypeError, ValueError):
+                    fine_val = 0.0
+                is_settled = bool(int(fine_settled or 0) == 1 or raw_status == "PAID")
+                fine_text = money(fine_val)
+                if fine_val > 0 and is_settled:
+                    fine_text += f" ({'Waived' if str(fine_action).upper() == 'WAIVED' else 'Paid'})"
+
+                ren_text = (
+                    f"{int(ren_count)}/{self._max_renewals}"
+                    if self._max_renewals > 0
+                    else str(int(ren_count))
+                )
 
                 values = [
+                    safe_text(log_id),
                     safe_text(user_id),
                     status_text,
                     safe_text(checkout),
-                    safe_text(due),
-                    safe_text(returned),
-                    money(fine)
+                    due_text,
+                    safe_text(returned) or "—",
+                    ren_text,
+                    fine_text,
                 ]
 
+                c = get_dialog_colors(self)
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(value)
 
-                    if column == 1:
-                        item.setForeground(
-                            QColor("#f59e0b")
-                            if status_text == "ISSUED"
-                            else QColor("#10b981")
-                        )
+                    if column == 0:
+                        item.setForeground(QColor(c["primary"]))
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
+                    elif column == 2:
+                        if status_text == "OVERDUE":
+                            item.setForeground(QColor(c["danger"]))
+                        elif status_text == "DUE TODAY":
+                            item.setForeground(QColor(c["warning"]))
+                        elif status_text == "ISSUED":
+                            item.setForeground(QColor(c["primary"]))
+                        else:
+                            item.setForeground(QColor(c["success"]))
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
+                    elif column == 6 and int(ren_count or 0) > 0:
+                        item.setForeground(QColor(c["cyan"]))
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
+                    elif column == 7 and fine_val > 0 and not is_settled:
+                        item.setForeground(QColor(c["danger"]))
+                        f = item.font()
+                        f.setBold(True)
+                        item.setFont(f)
 
                     self.table.setItem(row_index, column, item)
 
@@ -2648,17 +3425,30 @@ class BookHistoryDialog(QDialog):
             )
 
     def display_record_details(self, record):
-        user_id, checkout, due, returned, fine, status = record
+        (
+            log_id, user_id, checkout, due, returned, fine,
+            status, ren_count, last_renewed, fine_settled_flag, fine_action
+        ) = record
 
         clear_layout(self.detail_layout)
 
-        is_issued = str(status).upper() == "ISSUED"
+        raw_status = str(status).upper()
+        is_issued = raw_status == "ISSUED"
+        today_str = datetime.date.today().isoformat()
+        is_overdue = bool(is_issued and safe_text(due) and safe_text(due)[:10] < today_str)
+        try:
+            fine_val = float(fine or 0.0)
+        except (TypeError, ValueError):
+            fine_val = 0.0
+        fine_settled = bool(int(fine_settled_flag or 0) == 1 or raw_status == "PAID")
 
         self.detail_layout.addWidget(
             create_heading("Audit Control Center")
         )
 
         banner = QLabel(
+            "🔴 Overdue Loan"
+            if is_overdue else
             "🟠 Issued Book"
             if is_issued else
             "🟢 Completed Loan"
@@ -2668,40 +3458,116 @@ class BookHistoryDialog(QDialog):
 
         set_status_property(
             banner,
-            "issued" if is_issued else "returned"
+            "overdue" if is_overdue else "issued" if is_issued else "returned"
         )
 
         self.detail_layout.addWidget(banner)
 
         form = QFormLayout()
-        form.setSpacing(9)
+        configure_inspector_form(form, horizontal_spacing=10, vertical_spacing=7)
+
+        max_r = getattr(self, "_max_renewals", 0)
+        ren_display = f"{ren_count} / {max_r}" if max_r > 0 else f"{ren_count} (Unlimited)"
+        if fine_val <= 0:
+            fine_status = "No Fine"
+        elif fine_settled:
+            fine_status = "Waived" if str(fine_action).upper() == "WAIVED" else "Paid"
+        else:
+            fine_status = "Unpaid Balance"
 
         details = [
+            ("Log ID:", f"#{log_id}"),
             ("Book ID:", self.book_id),
             ("Borrower ID:", user_id),
-            ("Status:", status),
+            ("Status:", "OVERDUE" if is_overdue else status),
             ("Issue Date:", checkout),
             ("Due Date:", due),
+            ("Renewals:", ren_display),
+            ("Last Renewed:", last_renewed or "—"),
             ("Returned:", returned or "Not yet returned"),
-            ("Fine:", money(fine))
+            ("Fine:", f"{money(fine_val)} ({fine_status})")
         ]
 
         for label, value in details:
+            key_label = QLabel(label)
+            key_label.setMinimumWidth(0)
+            key_label.setWordWrap(True)
             value_label = QLabel(safe_text(value))
-            value_label.setWordWrap(True)
-            form.addRow(label, value_label)
+            configure_wrapped_label(value_label)
+            form.addRow(key_label, value_label)
 
         self.detail_layout.addLayout(form)
 
         if is_issued:
             self.detail_layout.addWidget(
-                create_button(
-                    "↩ Return Book",
-                    lambda: self.handle_return_action(user_id)
+                configure_inspector_button(
+                    create_button(
+                        "🔄 Renew Loan",
+                        lambda: self.handle_renew_action(log_id),
+                        variant="InfoButton",
+                    )
+                )
+            )
+            self.detail_layout.addWidget(
+                configure_inspector_button(
+                    create_button(
+                        "↩ Return Book",
+                        lambda: self.handle_return_action(user_id),
+                        variant="SuccessButton",
+                    )
+                )
+            )
+
+        if fine_val > 0 and not fine_settled:
+            self.detail_layout.addWidget(
+                configure_inspector_button(
+                    create_button(
+                        "💳 Mark Fine Paid",
+                        lambda: self.handle_settle_fine(log_id, "PAID"),
+                        variant="SuccessButton",
+                    )
+                )
+            )
+            self.detail_layout.addWidget(
+                configure_inspector_button(
+                    create_button(
+                        "Waive Fine",
+                        lambda: self.handle_settle_fine(log_id, "WAIVED"),
+                        variant="WarningButton",
+                    )
                 )
             )
 
         self.detail_layout.addStretch()
+
+    def handle_renew_action(self, log_id):
+        dialog = RenewLoanDialog(self.db, log_id, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.data_updated.emit()
+            show_success(
+                self,
+                "Loan Renewed",
+                dialog.result_message or "Loan renewed successfully."
+            )
+            self.load_history()
+
+    def handle_settle_fine(self, log_id, action):
+        verb = "mark this fine as PAID" if action == "PAID" else "WAIVE this fine"
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Fine Settlement",
+            f"Do you want to {verb} for transaction #{log_id}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        success, message = self.db.settle_loan_fine(log_id, action=action)
+        if success:
+            self.data_updated.emit()
+            show_success(self, "Fine Updated", message)
+            self.load_history()
+        else:
+            show_warning(self, "Fine Settlement Failed", message)
 
     def handle_return_action(self, user_id):
         confirm = QMessageBox.question(
@@ -2744,16 +3610,16 @@ class BookHistoryDialog(QDialog):
 # ============================================================
 
 class EditDepartmentDialog(QDialog):
-    """Dialog for editing a department or student branch."""
+    """Dialog for updating the course duration of a fixed college branch."""
 
     def __init__(self, name, category, duration, parent=None):
         super().__init__(parent)
 
         configure_dialog(
             self,
-            "Edit Department",
-            430,
-            320
+            "Edit Course Duration",
+            450,
+            300
         )
 
         layout = QVBoxLayout(self)
@@ -2761,18 +3627,19 @@ class EditDepartmentDialog(QDialog):
         layout.setSpacing(16)
 
         layout.addWidget(
-            create_heading("✏️ Edit Department Details")
+            create_heading("✏️ Edit Branch Course Duration")
         )
 
         self.form_layout = QFormLayout()
-        self.form_layout.setSpacing(13)
+        configure_inspector_form(self.form_layout, horizontal_spacing=12, vertical_spacing=11)
 
         self.input_name = QLineEdit(str(name))
-        self.input_name.setMaxLength(100)
+        self.input_name.setReadOnly(True)
 
         self.combo_cat = QComboBox()
         self.combo_cat.addItems(["STUDENT", "FACULTY"])
         self.combo_cat.setCurrentText(str(category).upper())
+        self.combo_cat.setEnabled(False)
 
         self.combo_duration = QComboBox()
         self.combo_duration.addItems([
@@ -2797,7 +3664,7 @@ class EditDepartmentDialog(QDialog):
 
         self.duration_label = QLabel("Duration:")
 
-        self.form_layout.addRow("Department Name:", self.input_name)
+        self.form_layout.addRow("Branch / Department:", self.input_name)
         self.form_layout.addRow("Category:", self.combo_cat)
         self.form_layout.addRow(
             self.duration_label,
@@ -2807,19 +3674,15 @@ class EditDepartmentDialog(QDialog):
         layout.addLayout(self.form_layout)
         layout.addStretch()
 
-        self.combo_cat.currentIndexChanged.connect(
-            self.on_category_changed
-        )
-
         buttons = QHBoxLayout()
         buttons.addStretch()
 
         buttons.addWidget(
-            create_button("Cancel", self.reject)
+            create_button("Cancel", self.reject, variant="SecondaryButton")
         )
 
         buttons.addWidget(
-            create_button("Save Changes", self.validate_and_accept)
+            create_button("Save Changes", self.validate_and_accept, variant="PrimaryButton")
         )
 
         layout.addLayout(buttons)
@@ -2835,14 +3698,6 @@ class EditDepartmentDialog(QDialog):
         self.combo_duration.setVisible(is_student)
 
     def validate_and_accept(self):
-        if not self.input_name.text().strip():
-            show_warning(
-                self,
-                "Validation Error",
-                "Department name cannot be empty."
-            )
-            return
-
         self.accept()
 
     def get_data(self):
@@ -2872,29 +3727,40 @@ class DepartmentManagerDialog(QDialog):
 
         configure_dialog(
             self,
-            "Department Management",
-            720,
-            610
+            "College Branches & Faculty Departments",
+            740,
+            560,
+            min_width=460,
+            min_height=340,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(15)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
 
         layout.addWidget(
-            create_heading("🏛️ Branch & Department Management")
+            create_heading("🏛️ College Branches & Faculty Departments")
         )
+
+        info_label = QLabel(
+            "College branches are fixed and shared by Students and Faculty. "
+            "Sciences & Humanities Department and General Administration are "
+            "available only to Faculty and Staff."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
 
         self.table = QTableWidget()
         self.table.setColumnCount(3)
 
         self.table.setHorizontalHeaderLabels([
-            "Department / Branch",
-            "Category",
+            "Branch / Department",
+            "Available To",
             "Duration"
         ])
 
         configure_table(self.table)
+        self.table.setMinimumHeight(140)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(
@@ -2910,71 +3776,25 @@ class DepartmentManagerDialog(QDialog):
             QHeaderView.ResizeMode.ResizeToContents
         )
 
-        layout.addWidget(self.table)
+        layout.addWidget(self.table, 1)
 
-        layout.addWidget(QLabel("Add New Department"))
-
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
-
-        self.input_new_dept = QLineEdit()
-        self.input_new_dept.setPlaceholderText(
-            "Enter department or branch name"
-        )
-        self.input_new_dept.setMaxLength(100)
-
-        self.combo_cat = QComboBox()
-        self.combo_cat.addItems(["STUDENT", "FACULTY"])
-
-        self.combo_duration = QComboBox()
-        self.combo_duration.addItems([
-            "2 Years",
-            "3 Years",
-            "4 Years",
-            "5 Years"
-        ])
-        self.combo_duration.setCurrentIndex(1)
-
-        self.btn_add = create_button(
-            "＋ Add",
-            self.handle_add_department
-        )
-
-        input_row.addWidget(self.input_new_dept, 3)
-        input_row.addWidget(self.combo_cat)
-        input_row.addWidget(self.combo_duration)
-        input_row.addWidget(self.btn_add)
-
-        layout.addLayout(input_row)
-
-        self.combo_cat.currentIndexChanged.connect(
-            self.on_category_changed
-        )
-
-        actions = QHBoxLayout()
+        actions_host = QWidget()
+        actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
 
         actions.addWidget(
             create_button(
-                "✏️ Edit Selected",
-                self.handle_edit_department
+                "✏️ Edit Course Duration",
+                self.handle_edit_department,
+                variant="PrimaryButton",
             )
         )
-
         actions.addWidget(
-            create_button(
-                "🗑 Remove Selected",
-                self.handle_delete_department
-            )
+            create_button("Close", self.accept, variant="SecondaryButton")
         )
 
-        layout.addLayout(actions)
+        layout.addWidget(actions_host)
 
         self.load_data()
-
-    def on_category_changed(self, *args):
-        self.combo_duration.setVisible(
-            self.combo_cat.currentText() == "STUDENT"
-        )
 
     def load_data(self):
         try:
@@ -2984,32 +3804,57 @@ class DepartmentManagerDialog(QDialog):
                 """
                 SELECT id, name, category, duration_years
                 FROM departments
-                ORDER BY name ASC
+                ORDER BY
+                    CASE WHEN UPPER(category) = 'STUDENT' THEN 0 ELSE 1 END,
+                    name COLLATE NOCASE ASC
                 """
             )
 
             rows = cursor.fetchall()
+            c = get_dialog_colors(self)
 
             self.table.setRowCount(len(rows))
 
             for row_index, row in enumerate(rows):
                 dept_id, name, category, duration = row
+                raw_category = str(category or "").upper()
 
                 name_item = QTableWidgetItem(str(name))
                 name_item.setData(
                     Qt.ItemDataRole.UserRole,
                     dept_id
                 )
+                f_name = name_item.font()
+                f_name.setBold(True)
+                name_item.setFont(f_name)
 
-                category_item = QTableWidgetItem(str(category))
+                available_label = (
+                    "Students & Faculty"
+                    if raw_category == "STUDENT"
+                    else "Faculty & Staff Only"
+                )
+                category_item = QTableWidgetItem(available_label)
+                category_item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    raw_category
+                )
+                category_item.setForeground(
+                    QColor(c["success"] if raw_category == "STUDENT" else c["purple"])
+                )
+                f_cat = category_item.font()
+                f_cat.setBold(True)
+                category_item.setFont(f_cat)
 
                 duration_text = (
                     f"{duration} Years"
-                    if str(category).upper() == "STUDENT"
+                    if raw_category == "STUDENT"
                     else "N/A"
                 )
 
                 duration_item = QTableWidgetItem(duration_text)
+                duration_item.setForeground(
+                    QColor(c["cyan"] if raw_category == "STUDENT" else c["muted"])
+                )
 
                 self.table.setItem(row_index, 0, name_item)
                 self.table.setItem(row_index, 1, category_item)
@@ -3018,42 +3863,6 @@ class DepartmentManagerDialog(QDialog):
         except Exception as error:
             show_error(self, "Department Loading Error", error)
 
-    def handle_add_department(self):
-        name = self.input_new_dept.text().strip()
-        category = self.combo_cat.currentText()
-
-        if not name:
-            show_warning(
-                self,
-                "Validation Error",
-                "Enter a department name."
-            )
-            return
-
-        duration = (
-            int(self.combo_duration.currentText().split()[0])
-            if category == "STUDENT"
-            else 3
-        )
-
-        try:
-            success, message = self.db.add_department(
-                name,
-                category,
-                duration
-            )
-
-            if success:
-                self.input_new_dept.clear()
-                self.combo_duration.setCurrentIndex(1)
-                self.load_data()
-                show_success(self, "Department Added", message)
-            else:
-                show_warning(self, "Unable to Add", message)
-
-        except Exception as error:
-            show_error(self, "Database Error", error)
-
     def handle_edit_department(self):
         selected = self.table.currentRow()
 
@@ -3061,7 +3870,7 @@ class DepartmentManagerDialog(QDialog):
             show_warning(
                 self,
                 "Selection Required",
-                "Select a department to edit."
+                "Select a college branch to update its course duration."
             )
             return
 
@@ -3076,9 +3885,16 @@ class DepartmentManagerDialog(QDialog):
         current_name = name_item.text()
 
         current_category = (
-            category_item.text()
+            category_item.data(Qt.ItemDataRole.UserRole)
             if category_item else "STUDENT"
         )
+        if current_category != "STUDENT":
+            show_warning(
+                self,
+                "Fixed Department",
+                "Course duration applies only to college student branches."
+            )
+            return
 
         try:
             current_duration = int(
@@ -3116,49 +3932,6 @@ class DepartmentManagerDialog(QDialog):
         except Exception as error:
             show_error(self, "Database Error", error)
 
-    def handle_delete_department(self):
-        selected = self.table.currentRow()
-
-        if selected < 0:
-            show_warning(
-                self,
-                "Selection Required",
-                "Select a department to remove."
-            )
-            return
-
-        name_item = self.table.item(selected, 0)
-
-        if not name_item:
-            return
-
-        department_name = name_item.text()
-
-        confirm = QMessageBox.question(
-            self,
-            "Confirm Deletion",
-            f"Remove department '{department_name}'?",
-            QMessageBox.StandardButton.Yes |
-            QMessageBox.StandardButton.No
-        )
-
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-
-        try:
-            success, message = self.db.delete_department(
-                department_name
-            )
-
-            if success:
-                self.load_data()
-                show_success(self, "Department Removed", message)
-            else:
-                show_warning(self, "Delete Failed", message)
-
-        except Exception as error:
-            show_error(self, "Database Error", error)
-
 
 # ============================================================
 # ISSUE BOOK WIZARD
@@ -3171,24 +3944,32 @@ class IssueBookDialog(QDialog):
         super().__init__(parent)
 
         self.db = db
+        self._user_edited_days = False
 
         configure_dialog(
             self,
             "Issue Book",
-            440,
-            330
+            470,
+            370,
+            min_width=360,
+            min_height=300,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
 
         layout.addWidget(
             create_heading("📤 Issue a Book")
         )
 
+        form_host = QWidget()
+        form_host_layout = QVBoxLayout(form_host)
+        form_host_layout.setContentsMargins(0, 0, 4, 0)
+        form_host_layout.setSpacing(10)
+
         form = QFormLayout()
-        form.setSpacing(13)
+        configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=10)
 
         self.input_book = QLineEdit()
         self.input_book.setPlaceholderText(
@@ -3199,6 +3980,7 @@ class IssueBookDialog(QDialog):
         self.input_user.setPlaceholderText(
             "Enter User ID or PIN"
         )
+        self.input_user.textChanged.connect(self._update_user_policy_hint)
 
         try:
             default_days = int(
@@ -3213,29 +3995,87 @@ class IssueBookDialog(QDialog):
             max(1, min(default_days, 365))
         )
         self.spin_days.setSuffix(" days")
+        self.spin_days.valueChanged.connect(self._on_spin_days_edited)
 
         form.addRow("Book ID:", self.input_book)
         form.addRow("User ID:", self.input_user)
         form.addRow("Loan Duration:", self.spin_days)
 
-        layout.addLayout(form)
-        layout.addStretch()
+        form_host_layout.addLayout(form)
+
+        c_hint = get_dialog_colors(self)
+        self.lbl_policy_hint = QLabel(
+            "Loan duration automatically adopts the member's role policy when User ID is entered."
+        )
+        self.lbl_policy_hint.setWordWrap(True)
+        self.lbl_policy_hint.setStyleSheet(
+            f"background: {c_hint['surface_alt']}; color: {c_hint['muted']}; "
+            f"border: 1px solid {c_hint['border']}; border-radius: 7px; padding: 7px 10px;"
+        )
+        form_host_layout.addWidget(self.lbl_policy_hint)
+        form_host_layout.addStretch()
+
+        layout.addWidget(wrap_in_scroll_area(form_host, object_name="IssueDialogScroll"), 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
 
         buttons.addWidget(
-            create_button("Cancel", self.reject)
+            create_button("Cancel", self.reject, variant="SecondaryButton")
         )
 
         buttons.addWidget(
             create_button(
                 "📤 Issue Book",
-                self.validate_and_accept
+                self.validate_and_accept,
+                variant="PrimaryButton",
             )
         )
 
         layout.addLayout(buttons)
+
+    def _on_spin_days_edited(self):
+        if not self.spin_days.signalsBlocked():
+            self._user_edited_days = True
+
+    def _update_user_policy_hint(self, *_):
+        c = get_dialog_colors(self)
+        uid = self.input_user.text().strip()
+        if not uid:
+            self.lbl_policy_hint.setText(
+                "Loan duration automatically adopts the member's role policy when User ID is entered."
+            )
+            self.lbl_policy_hint.setStyleSheet(
+                f"background: {c['surface_alt']}; color: {c['muted']}; "
+                f"border: 1px solid {c['border']}; border-radius: 7px; padding: 7px 10px;"
+            )
+            return
+        ok, user = self.db.get_user_details(uid)
+        if not ok or not user:
+            self.lbl_policy_hint.setText("Member ID not found in directory.")
+            self.lbl_policy_hint.setStyleSheet(
+                f"background: {c['danger_soft']}; color: {c['danger']}; "
+                f"border: 1px solid {c['danger']}; border-radius: 7px; padding: 7px 10px; font-weight: 600;"
+            )
+            return
+        role = user[3]
+        policy = self.db.get_loan_policy(role)
+        role_days = max(1, min(int(policy.get("default_days", 14)), 365))
+        if not self._user_edited_days:
+            self.spin_days.blockSignals(True)
+            self.spin_days.setValue(role_days)
+            self.spin_days.blockSignals(False)
+        pending_fines = self.db.get_user_pending_fines_total(user[0])
+        fine_note = f" · Unpaid fines: {money(pending_fines)}" if pending_fines > 0 else ""
+        self.lbl_policy_hint.setText(
+            f"{user[1]} ({role}) · Max {policy.get('max_books', 3)} books · "
+            f"Default {role_days} days · ₹{policy.get('fine_rate', 2.0):.2f}/day{fine_note}"
+        )
+        banner_key = "warning" if pending_fines > 0 else "primary"
+        self.lbl_policy_hint.setStyleSheet(
+            f"background: {c[banner_key + '_soft']}; color: {c[banner_key]}; "
+            f"border: 1px solid {c[banner_key]}; border-radius: 7px; padding: 7px 10px; font-weight: 600;"
+        )
 
     def validate_and_accept(self):
         if not self.input_book.text().strip():
@@ -3294,7 +4134,7 @@ class ReturnBookDialog(QDialog):
         )
 
         form = QFormLayout()
-        form.setSpacing(13)
+        configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=10)
 
         self.input_book = QLineEdit()
         self.input_book.setPlaceholderText("Enter Book ID")
@@ -3312,13 +4152,14 @@ class ReturnBookDialog(QDialog):
         buttons.addStretch()
 
         buttons.addWidget(
-            create_button("Cancel", self.reject)
+            create_button("Cancel", self.reject, variant="SecondaryButton")
         )
 
         buttons.addWidget(
             create_button(
                 "📥 Confirm Return",
-                self.validate_and_accept
+                self.validate_and_accept,
+                variant="SuccessButton",
             )
         )
 
@@ -3364,6 +4205,8 @@ class BatchCirculationDialog(QDialog):
         parent=None,
     ):
         super().__init__(parent)
+        self.db = db
+        self._user_edited_days = False
         self.mode = str(mode).upper()
         self.selected_ids = [str(value) for value in selected_ids]
         self.selection_type = selection_type
@@ -3377,11 +4220,13 @@ class BatchCirculationDialog(QDialog):
             f"{operation} Books for Selected {selected_label.title()}",
             480,
             380 if self.mode == "ISSUE" else 330,
+            min_width=360,
+            min_height=290,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(14)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
         layout.addWidget(
             create_heading(
                 f"{operation} {len(self.selected_ids)} selected "
@@ -3389,9 +4234,14 @@ class BatchCirculationDialog(QDialog):
             )
         )
 
+        body_host = QWidget()
+        body_layout = QVBoxLayout(body_host)
+        body_layout.setContentsMargins(0, 0, 4, 0)
+        body_layout.setSpacing(10)
+
         details = QLabel(", ".join(self.selected_ids))
         details.setWordWrap(True)
-        layout.addWidget(details)
+        body_layout.addWidget(details)
 
         hint = (
             "All selected books will be processed for this user."
@@ -3400,10 +4250,10 @@ class BatchCirculationDialog(QDialog):
         )
         hint_label = QLabel(hint)
         hint_label.setWordWrap(True)
-        layout.addWidget(hint_label)
+        body_layout.addWidget(hint_label)
 
         form = QFormLayout()
-        form.setSpacing(12)
+        configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=10)
         self.target_input = QLineEdit()
         self.target_input.setPlaceholderText(
             f"Enter {target_label} or scan barcode"
@@ -3418,22 +4268,68 @@ class BatchCirculationDialog(QDialog):
             default_days = 14
         self.spin_days.setValue(max(1, min(default_days, 365)))
         self.spin_days.setSuffix(" days")
+        self.spin_days.valueChanged.connect(self._on_spin_days_edited)
         if self.mode == "ISSUE":
             form.addRow("Loan Duration:", self.spin_days)
 
-        layout.addLayout(form)
-        layout.addStretch()
+        body_layout.addLayout(form)
+
+        self.lbl_policy_hint = QLabel("")
+        self.lbl_policy_hint.setWordWrap(True)
+        body_layout.addWidget(self.lbl_policy_hint)
+        if self.is_book_selection and self.mode == "ISSUE":
+            self.target_input.textChanged.connect(self._update_target_policy_hint)
+        else:
+            self.lbl_policy_hint.setVisible(False)
+
+        body_layout.addStretch()
+        layout.addWidget(wrap_in_scroll_area(body_host, object_name="BatchCircDialogScroll"), 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
-        buttons.addWidget(create_button("Cancel", self.reject))
+        buttons.addWidget(create_button("Cancel", self.reject, variant="SecondaryButton"))
         buttons.addWidget(
             create_button(
                 f"{operation} Selected",
                 self.validate_and_accept,
+                variant="PrimaryButton" if self.mode == "ISSUE" else "SuccessButton",
             )
         )
         layout.addLayout(buttons)
+
+    def _on_spin_days_edited(self):
+        if not self.spin_days.signalsBlocked():
+            self._user_edited_days = True
+
+    def _update_target_policy_hint(self, *_):
+        c = get_dialog_colors(self)
+        uid = self.target_input.text().strip()
+        if not uid:
+            self.lbl_policy_hint.setText("")
+            self.lbl_policy_hint.setStyleSheet("")
+            return
+        ok, user = self.db.get_user_details(uid)
+        if not ok or not user:
+            self.lbl_policy_hint.setText("Member ID not found.")
+            self.lbl_policy_hint.setStyleSheet(
+                f"color: {c['danger']}; font-weight: 600;"
+            )
+            return
+        role = user[3]
+        policy = self.db.get_loan_policy(role)
+        role_days = max(1, min(int(policy.get("default_days", 14)), 365))
+        if not self._user_edited_days:
+            self.spin_days.blockSignals(True)
+            self.spin_days.setValue(role_days)
+            self.spin_days.blockSignals(False)
+        self.lbl_policy_hint.setText(
+            f"{user[1]} ({role}) · Max {policy.get('max_books', 3)} books · "
+            f"Default {role_days} days · ₹{policy.get('fine_rate', 2.0):.2f}/day"
+        )
+        self.lbl_policy_hint.setStyleSheet(
+            f"background: {c['primary_soft']}; color: {c['primary']}; "
+            f"border: 1px solid {c['primary']}; border-radius: 7px; padding: 6px 10px; font-weight: 600;"
+        )
 
     def validate_and_accept(self):
         if not self.target_input.text().strip():
@@ -3456,30 +4352,51 @@ class CustomEmailDialog(QDialog):
 
     def __init__(self, recipient_name, parent=None):
         super().__init__(parent)
-        configure_dialog(self, "Send Email to User", 540, 430)
+        configure_dialog(
+            self,
+            "Send Email to User",
+            540,
+            430,
+            min_width=380,
+            min_height=320,
+        )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(14)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
         layout.addWidget(
             create_heading(f"Compose message for {recipient_name}")
         )
 
+        form_host = QWidget()
+        form_host_layout = QVBoxLayout(form_host)
+        form_host_layout.setContentsMargins(0, 0, 4, 0)
         form = QFormLayout()
-        form.setSpacing(12)
+        configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=10)
         self.subject_input = QLineEdit()
         self.subject_input.setPlaceholderText("Email subject")
         self.body_input = QPlainTextEdit()
         self.body_input.setPlaceholderText("Write your message...")
-        self.body_input.setMinimumHeight(190)
+        self.body_input.setMinimumHeight(130)
         form.addRow("Subject:", self.subject_input)
         form.addRow("Message:", self.body_input)
-        layout.addLayout(form, 1)
+        form_host_layout.addLayout(form, 1)
+        layout.addWidget(wrap_in_scroll_area(form_host, object_name="CustomEmailScroll"), 1)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Send
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Cancel
         )
+        send_btn = buttons.addButton(
+            "Send",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        if send_btn is not None:
+            send_btn.setObjectName("PrimaryButton")
+            send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_btn is not None:
+            cancel_btn.setObjectName("SecondaryButton")
+            cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         buttons.accepted.connect(self.validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -3500,3 +4417,830 @@ class CustomEmailDialog(QDialog):
             self.subject_input.text().strip(),
             self.body_input.toPlainText().strip(),
         )
+
+
+# ============================================================
+# ADVANCED LOAN RENEWAL DIALOG
+# ============================================================
+
+class RenewLoanDialog(QDialog):
+    """Advanced loan renewal dialog with live projection, presets,
+    fine resolution, policy override, and renewal history audit.
+    """
+
+    data_updated = pyqtSignal()
+
+    def __init__(self, db, loan_id, parent=None):
+        super().__init__(parent)
+
+        self.db = db
+        self.loan_id = loan_id
+        self.preview = {}
+        self.result_details = {}
+        self.result_message = ""
+
+        configure_dialog(
+            self,
+            f"Renew Loan — Transaction #{loan_id}",
+            760,
+            765,
+            min_width=460,
+            min_height=360,
+        )
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(18, 14, 18, 14)
+        main_layout.setSpacing(10)
+
+        main_layout.addWidget(
+            create_heading(f"🔄 Advanced Loan Renewal — #{loan_id}")
+        )
+
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName("RenewScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll_area.viewport().setObjectName("RenewScrollViewport")
+        scroll_area.setStyleSheet(
+            "QScrollArea#RenewScrollArea, "
+            "QWidget#RenewScrollViewport, "
+            "QWidget#RenewScrollContent { background: transparent; border: none; }"
+        )
+
+        scroll_content = QWidget()
+        scroll_content.setObjectName("RenewScrollContent")
+        scroll_content.setMinimumWidth(0)
+        sections_layout = QVBoxLayout(scroll_content)
+        sections_layout.setContentsMargins(0, 0, 4, 0)
+        sections_layout.setSpacing(8)
+
+        # 1. Loan & Member Snapshot
+        summary_group = QGroupBox("Loan && Policy Snapshot")
+        summary_grid = QGridLayout(summary_group)
+        summary_grid.setContentsMargins(6, 4, 6, 4)
+        summary_grid.setHorizontalSpacing(12)
+        summary_grid.setVerticalSpacing(5)
+        summary_grid.setColumnStretch(1, 1)
+        summary_grid.setColumnStretch(2, 1)
+
+        self.lbl_book = configure_wrapped_label(QLabel())
+        self.lbl_member = configure_wrapped_label(QLabel())
+        self.lbl_dates = configure_wrapped_label(QLabel())
+        self.lbl_status_badge = QLabel()
+        self.lbl_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status_badge.setMinimumHeight(26)
+        self.lbl_stock_info = configure_wrapped_label(QLabel())
+        self.lbl_renewal_quota = configure_wrapped_label(QLabel(), expanding_width=False)
+
+        summary_grid.addWidget(QLabel("<b>Book:</b>"), 0, 0)
+        summary_grid.addWidget(self.lbl_book, 0, 1, 1, 2)
+        summary_grid.addWidget(self.lbl_status_badge, 0, 3)
+
+        summary_grid.addWidget(QLabel("<b>Borrower:</b>"), 1, 0)
+        summary_grid.addWidget(self.lbl_member, 1, 1, 1, 3)
+
+        summary_grid.addWidget(QLabel("<b>Loan Window:</b>"), 2, 0)
+        summary_grid.addWidget(self.lbl_dates, 2, 1, 1, 3)
+
+        summary_grid.addWidget(QLabel("<b>Shelf & Quota:</b>"), 3, 0)
+        summary_grid.addWidget(self.lbl_stock_info, 3, 1, 1, 2)
+        summary_grid.addWidget(self.lbl_renewal_quota, 3, 3)
+
+        sections_layout.addWidget(summary_group)
+
+        # 2. Extension Schedule Configurator
+        schedule_group = QGroupBox("Extension Schedule && Live Preview")
+        schedule_layout = QVBoxLayout(schedule_group)
+        schedule_layout.setContentsMargins(6, 4, 6, 4)
+        schedule_layout.setSpacing(8)
+
+        presets_host = QWidget()
+        presets_row = FlowLayout(presets_host, margin=0, h_spacing=6, v_spacing=6)
+        presets_row.addWidget(QLabel("Quick Extend:"))
+
+        self.btn_preset_7 = create_button("+7 Days", lambda: self.set_extend_days(7), variant="SecondaryButton")
+        self.btn_preset_14 = create_button("+14 Days", lambda: self.set_extend_days(14), variant="SecondaryButton")
+        self.btn_preset_policy = create_button(
+            "Role Default",
+            lambda: self.set_extend_days(self.preview.get("default_days", 14)),
+            variant="InfoButton",
+        )
+        for btn in (self.btn_preset_7, self.btn_preset_14, self.btn_preset_policy):
+            presets_row.addWidget(btn)
+
+        presets_row.addWidget(QLabel("Custom:"))
+
+        self.spin_days = QSpinBox()
+        self.spin_days.setRange(1, 365)
+        self.spin_days.setSuffix(" days")
+        self.spin_days.setMinimumWidth(104)
+        self.spin_days.setMinimumHeight(34)
+        self.spin_days.valueChanged.connect(self.update_preview)
+        presets_row.addWidget(self.spin_days)
+        schedule_layout.addWidget(presets_host)
+
+        base_row = QHBoxLayout()
+        base_row.setSpacing(10)
+        base_row.addWidget(QLabel("Calculate From:"))
+
+        self.combo_base_mode = QComboBox()
+        self.combo_base_mode.setMinimumHeight(34)
+        self.combo_base_mode.setMinimumWidth(240)
+        self.combo_base_mode.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.combo_base_mode.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.combo_base_mode.setMinimumContentsLength(22)
+        self.combo_base_mode.addItem("Current Due Date (Keep unused days)", "DUE_DATE")
+        self.combo_base_mode.addItem("Today (Reset overdue window from now)", "TODAY")
+        self.combo_base_mode.currentIndexChanged.connect(self.update_preview)
+        base_row.addWidget(self.combo_base_mode, 1)
+        schedule_layout.addLayout(base_row)
+
+        self.projection_card = QFrame()
+        self.projection_card.setObjectName("ProjectionCard")
+        self.projection_card.setFrameShape(QFrame.Shape.StyledPanel)
+        self.projection_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        projection_layout = QHBoxLayout(self.projection_card)
+        projection_layout.setContentsMargins(12, 9, 12, 9)
+        projection_layout.setSpacing(10)
+
+        self.lbl_projection = configure_wrapped_label(QLabel())
+        self.lbl_projection.setMinimumHeight(20)
+        projection_layout.addWidget(self.lbl_projection, 1)
+        schedule_layout.addWidget(self.projection_card)
+
+        sections_layout.addWidget(schedule_group)
+
+        # 3. Overdue Fine Handling & Policy Controls
+        self.policy_group = QGroupBox("Fine Resolution, Notes && Policy")
+        policy_layout = QFormLayout(self.policy_group)
+        policy_layout.setContentsMargins(6, 4, 6, 4)
+        configure_inspector_form(policy_layout, horizontal_spacing=10, vertical_spacing=7)
+
+        self.lbl_fine_summary = configure_wrapped_label(QLabel())
+        self.combo_fine_action = QComboBox()
+        self.combo_fine_action.setMinimumHeight(34)
+        self.combo_fine_action.setMinimumWidth(260)
+        self.combo_fine_action.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.combo_fine_action.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.combo_fine_action.setMinimumContentsLength(26)
+        self.combo_fine_action.addItem(
+            "Carry fine onto loan balance (collect at return)",
+            "CARRY",
+        )
+        self.combo_fine_action.addItem(
+            "Collected overdue fine now",
+            "COLLECTED",
+        )
+        self.combo_fine_action.addItem(
+            "Waive overdue fine",
+            "WAIVED",
+        )
+
+        self.lbl_fine_row_title = QLabel("Overdue Fine:")
+        self.lbl_fine_row_title.setMinimumWidth(0)
+        self.lbl_action_row_title = QLabel("Fine Handling:")
+        self.lbl_action_row_title.setMinimumWidth(0)
+        policy_layout.addRow(self.lbl_fine_row_title, self.lbl_fine_summary)
+        policy_layout.addRow(self.lbl_action_row_title, self.combo_fine_action)
+
+        self.chk_override = QCheckBox(
+            "Librarian Override — Allow renewal beyond policy limit"
+        )
+        self.chk_override.toggled.connect(self.update_preview)
+        policy_layout.addRow("", self.chk_override)
+
+        self.input_notes = QLineEdit()
+        self.input_notes.setMinimumHeight(34)
+        self.input_notes.setPlaceholderText(
+            "Optional renewal reason or remark (e.g. Exam extension, Project use)..."
+        )
+        note_lbl = QLabel("Renewal Note:")
+        note_lbl.setMinimumWidth(0)
+        policy_layout.addRow(note_lbl, self.input_notes)
+
+        self.lbl_alert = configure_wrapped_label(QLabel())
+        self.lbl_alert.setMinimumHeight(28)
+        policy_layout.addRow("", self.lbl_alert)
+
+        sections_layout.addWidget(self.policy_group)
+
+        # 4. Prior Renewal Timeline
+        history_group = QGroupBox("Renewal Audit History")
+        history_layout = QVBoxLayout(history_group)
+        history_layout.setContentsMargins(6, 4, 6, 4)
+        history_layout.setSpacing(6)
+
+        self.lbl_no_history = QLabel("No previous renewals recorded for this loan.")
+        history_layout.addWidget(self.lbl_no_history)
+
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(5)
+        self.history_table.setHorizontalHeaderLabels([
+            "Renewed On", "Previous Due", "New Due", "Extended", "Fine & Notes"
+        ])
+        configure_table(self.history_table)
+        self.history_table.setMinimumHeight(90)
+        self.history_table.setMaximumHeight(130)
+        header = self.history_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        history_layout.addWidget(self.history_table)
+
+        sections_layout.addWidget(history_group)
+        sections_layout.addStretch()
+
+        scroll_area.setWidget(scroll_content)
+        main_layout.addWidget(scroll_area, 1)
+
+        # 5. Footer
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+
+        self.btn_cancel = create_button("Cancel", self.reject, variant="SecondaryButton")
+        self.btn_confirm = create_button("🔄 Confirm Renewal", self.confirm_renewal, variant="PrimaryButton")
+
+        buttons.addWidget(self.btn_cancel)
+        buttons.addWidget(self.btn_confirm)
+        main_layout.addLayout(buttons)
+
+        self._initialize_from_preview()
+
+    def _initialize_from_preview(self):
+        initial = self.db.get_loan_renewal_preview(self.loan_id, base_mode="auto")
+        self.preview = initial
+
+        if not initial.get("found"):
+            self.lbl_alert.setText(initial.get("block_reason", "Loan not found."))
+            self.btn_confirm.setEnabled(False)
+            return
+
+        default_days = max(1, min(int(initial.get("default_days", 14)), 365))
+        self.btn_preset_policy.setText(f"+{default_days}d (Policy)")
+
+        self.spin_days.blockSignals(True)
+        self.spin_days.setValue(default_days)
+        self.spin_days.blockSignals(False)
+
+        mode_index = self.combo_base_mode.findData(
+            initial.get("effective_base_mode", "DUE_DATE")
+        )
+        if mode_index >= 0:
+            self.combo_base_mode.blockSignals(True)
+            self.combo_base_mode.setCurrentIndex(mode_index)
+            self.combo_base_mode.blockSignals(False)
+
+        self._populate_history(initial.get("history", []))
+        self.update_preview()
+
+    def set_extend_days(self, days):
+        clamped = max(1, min(int(days), 365))
+        self.spin_days.setValue(clamped)
+
+    def _populate_history(self, history):
+        if not history:
+            self.lbl_no_history.show()
+            self.history_table.hide()
+            return
+
+        self.lbl_no_history.hide()
+        self.history_table.show()
+        self.history_table.setRowCount(len(history))
+        for row_idx, entry in enumerate(history):
+            fine_assessed = float(entry.get("fine_assessed", 0.0) or 0.0)
+            fine_action = entry.get("fine_action", "NONE")
+            note = entry.get("notes", "")
+            parts = []
+            if fine_assessed > 0:
+                parts.append(f"Fine ₹{fine_assessed:.2f} ({fine_action.title()})")
+            if note:
+                parts.append(note)
+            summary = " · ".join(parts) if parts else "Standard renewal"
+            mode_label = (
+                "From Today"
+                if entry.get("base_mode") == "TODAY"
+                else "From Due Date"
+            )
+            values = [
+                entry.get("renewed_at", ""),
+                entry.get("previous_due_date", ""),
+                entry.get("new_due_date", ""),
+                f"+{entry.get('extended_days', 0)}d ({mode_label})",
+                summary,
+            ]
+            for col_idx, val in enumerate(values):
+                item = QTableWidgetItem(str(val))
+                item.setToolTip(str(val))
+                self.history_table.setItem(row_idx, col_idx, item)
+
+    def update_preview(self):
+        base_mode = self.combo_base_mode.currentData() or "DUE_DATE"
+        extend_days = self.spin_days.value()
+        override = self.chk_override.isChecked()
+
+        self.preview = self.db.get_loan_renewal_preview(
+            self.loan_id,
+            extend_days=extend_days,
+            base_mode=base_mode,
+            allow_limit_override=override,
+        )
+        p = self.preview
+        if not p.get("found"):
+            self.btn_confirm.setEnabled(False)
+            self.lbl_alert.setText(p.get("block_reason", "Loan record missing."))
+            return
+
+        self.lbl_book.setText(f"{p['book_title']}  (ID: {p['book_id']})")
+        self.lbl_member.setText(
+            f"{p['user_name']}  (ID: {p['user_id']} · {p['user_role']})"
+        )
+        self.lbl_dates.setText(
+            f"Issued: {p['checkout_date'] or '—'}    |    Current Due: {p['due_date'] or '—'}"
+        )
+        self.lbl_stock_info.setText(
+            f"Copies on shelf: {p['available_copies']} / {p['total_copies']}   ·   "
+            f"Member active loans: {p['active_loans_count']} / {p['max_books']}"
+        )
+
+        max_r = int(p.get("max_renewals", 0))
+        used_r = int(p.get("renewal_count", 0))
+        quota_text = (
+            f"Renewals: {used_r} / {max_r}"
+            if max_r > 0
+            else f"Renewals: {used_r} (Unlimited)"
+        )
+        self.lbl_renewal_quota.setText(f"<b>{quota_text}</b>")
+
+        c = get_dialog_colors(self)
+        display_status = p["display_status"]
+        if display_status == "OVERDUE":
+            badge_text = f"OVERDUE ({p['overdue_days']}d)"
+            badge_bg, badge_fg = c["danger_soft"], c["danger"]
+        elif display_status == "DUE TODAY":
+            badge_text = "DUE TODAY"
+            badge_bg, badge_fg = c["warning_soft"], c["warning"]
+        elif display_status == "RETURNED":
+            badge_text = "RETURNED"
+            badge_bg, badge_fg = c["success_soft"], c["success"]
+        else:
+            badge_text = "ISSUED"
+            badge_bg, badge_fg = c["primary_soft"], c["primary"]
+        self.lbl_status_badge.setText(badge_text)
+        self.lbl_status_badge.setStyleSheet(
+            f"background: {badge_bg}; color: {badge_fg}; "
+            f"border: 1px solid {badge_fg}; border-radius: 10px; "
+            "padding: 4px 10px; font-weight: 700; font-size: 11px;"
+        )
+
+        # Format projected date nicely
+        new_due_str = p.get("new_due_date", "")
+        day_label = ""
+        try:
+            dt = datetime.datetime.strptime(new_due_str, "%Y-%m-%d %H:%M")
+            day_label = dt.strftime("%a, %d %b %Y · %H:%M")
+        except ValueError:
+            day_label = new_due_str
+
+        net_days = int(p.get("net_days_from_today", 0))
+        net_desc = (
+            f"{net_days} day(s) from today"
+            if net_days >= 0
+            else f"{abs(net_days)} day(s) in the past"
+        )
+        base_desc = (
+            "Today" if p.get("effective_base_mode") == "TODAY" else "Current Due Date"
+        )
+        self.lbl_projection.setText(
+            f"<b>Projected New Due Date:</b>  {day_label}  "
+            f"<i>(+{extend_days} days from {base_desc} · {net_desc})</i>"
+        )
+
+        # Fine controls visibility
+        accrued = float(p.get("accrued_fine", 0.0) or 0.0)
+        show_fines = accrued > 0
+        self.lbl_fine_row_title.setVisible(show_fines)
+        self.lbl_fine_summary.setVisible(show_fines)
+        self.lbl_action_row_title.setVisible(show_fines)
+        self.combo_fine_action.setVisible(show_fines)
+        if show_fines:
+            carried = float(p.get("carried_fine", 0.0) or 0.0)
+            extra = f" (plus ₹{carried:.2f} prior carried balance)" if carried > 0 else ""
+            self.lbl_fine_summary.setText(
+                f"₹{accrued:.2f}  ({p['overdue_days']} overdue day(s) × "
+                f"₹{p['fine_rate']:.2f}/day){extra}"
+            )
+
+        show_override = bool(p.get("requires_override")) and p.get("status") == "ISSUED"
+        self.chk_override.setVisible(show_override)
+
+        block_reason = p.get("block_reason", "")
+        warnings = list(p.get("warnings", []))
+        if block_reason:
+            self.lbl_alert.setText(f"⛔ {block_reason}")
+            self.lbl_alert.setStyleSheet(
+                f"background: {c['danger_soft']}; color: {c['danger']}; "
+                f"border: 1px solid {c['danger']}; border-radius: 7px; "
+                "padding: 6px 10px; font-weight: 700;"
+            )
+        elif warnings:
+            self.lbl_alert.setText("⚠️ " + "  |  ".join(warnings))
+            self.lbl_alert.setStyleSheet(
+                f"background: {c['warning_soft']}; color: {c['warning']}; "
+                f"border: 1px solid {c['warning']}; border-radius: 7px; "
+                "padding: 6px 10px; font-weight: 700;"
+            )
+        else:
+            self.lbl_alert.setText("✅ Eligible for standard renewal.")
+            self.lbl_alert.setStyleSheet(
+                f"background: {c['success_soft']}; color: {c['success']}; "
+                f"border: 1px solid {c['success']}; border-radius: 7px; "
+                "padding: 6px 10px; font-weight: 700;"
+            )
+
+        self.btn_confirm.setEnabled(bool(p.get("eligible")))
+
+    def confirm_renewal(self):
+        if not self.preview.get("eligible"):
+            show_warning(
+                self,
+                "Cannot Renew Loan",
+                self.preview.get("block_reason", "Loan is not eligible for renewal."),
+            )
+            return
+
+        extend_days = self.spin_days.value()
+        base_mode = self.combo_base_mode.currentData() or "DUE_DATE"
+        fine_action = (
+            self.combo_fine_action.currentData()
+            if self.combo_fine_action.isVisible()
+            else "NONE"
+        )
+        notes = self.input_notes.text().strip()
+        override = self.chk_override.isChecked() and self.chk_override.isVisible()
+
+        try:
+            success, details, message = self.db.renew_loan(
+                self.loan_id,
+                extend_days=extend_days,
+                base_mode=base_mode,
+                fine_action=fine_action,
+                notes=notes,
+                allow_limit_override=override,
+            )
+            if success:
+                self.result_details = details
+                self.result_message = message
+                self.data_updated.emit()
+                self.accept()
+            else:
+                show_warning(self, "Renewal Failed", message)
+                self.update_preview()
+        except Exception as error:
+            show_error(self, "Renewal Error", error)
+
+
+# ============================================================
+# ADVANCED PENDING FINES COLLECTION & WAIVER DESK
+# ============================================================
+
+class PendingFinesDialog(QDialog):
+    """Interactive desk to review, collect, waive, and export pending library fines."""
+
+    data_updated = pyqtSignal()
+
+    HEADERS = [
+        "Log ID",
+        "User ID",
+        "Member Name",
+        "Book ID",
+        "Book Title",
+        "Loan Status",
+        "Date Ref",
+        "Renewals",
+        "Fine Balance",
+    ]
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.all_rows = []
+        self.filtered_rows = []
+        self._compact_table_mode = None
+
+        configure_dialog(
+            self,
+            "Pending Fines & Collection Desk",
+            1140,
+            650,
+            min_width=500,
+            min_height=380,
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        header.addWidget(create_heading("💳 Pending Fines & Collection Desk"), 1)
+        refresh_btn = create_button("↻ Refresh", self.load_fines, variant="InfoButton")
+        header.addWidget(refresh_btn)
+        layout.addLayout(header)
+
+        self.summary_label = QLabel("")
+        self.summary_label.setWordWrap(True)
+        c = get_dialog_colors(self)
+        self.summary_label.setStyleSheet(
+            f"background: {c['amber_tint']}; color: {c['text']}; "
+            f"border: 1px solid {c['warning']}; border-left: 4px solid {c['warning']}; "
+            "border-radius: 8px; padding: 9px 12px; font-size: 12px; font-weight: 700;"
+        )
+        layout.addWidget(self.summary_label)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText(
+            "Filter by User ID, member name, Book ID, book title, or Log ID..."
+        )
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self.apply_filter)
+        layout.addWidget(self.search_input)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(self.HEADERS))
+        self.table.setHorizontalHeaderLabels(self.HEADERS)
+        configure_table(self.table)
+        self.table.setMinimumHeight(160)
+        self.table.setHorizontalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self._apply_table_column_modes()
+        self.table.itemSelectionChanged.connect(self._update_action_states)
+        layout.addWidget(self.table, 1)
+
+        actions_host = QWidget()
+        actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
+        self.collect_btn = create_button(
+            "💳 Mark Selected Paid",
+            lambda: self.settle_selected("PAID"),
+            False,
+            variant="SuccessButton",
+        )
+        self.waive_btn = create_button(
+            "Waive Selected Fine",
+            lambda: self.settle_selected("WAIVED"),
+            False,
+            variant="WarningButton",
+        )
+        self.collect_user_btn = create_button(
+            "Collect All for Selected User",
+            self.settle_selected_user_all,
+            False,
+            variant="PrimaryButton",
+        )
+        self.export_btn = create_button(
+            "Export CSV",
+            self.export_csv,
+            False,
+            variant="InfoButton",
+        )
+        close_btn = create_button("Close", self.accept, variant="SecondaryButton")
+
+        actions.addWidget(self.collect_btn)
+        actions.addWidget(self.waive_btn)
+        actions.addWidget(self.collect_user_btn)
+        actions.addWidget(self.export_btn)
+        actions.addWidget(close_btn)
+        layout.addWidget(actions_host)
+
+        self.load_fines()
+
+    def _apply_table_column_modes(self):
+        compact = self.width() < 920
+        if compact == self._compact_table_mode:
+            return
+        self._compact_table_mode = compact
+        fines_header = self.table.horizontalHeader()
+        fines_header.setMinimumSectionSize(44)
+        if compact:
+            fines_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+            for col, width in (
+                (0, 62),
+                (1, 102),
+                (2, 140),
+                (3, 64),
+                (4, 190),
+                (5, 86),
+                (6, 120),
+                (7, 70),
+                (8, 96),
+            ):
+                self.table.setColumnWidth(col, width)
+        else:
+            for col in (0, 1, 3, 5, 6, 7, 8):
+                fines_header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+            fines_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(2, 155)
+            fines_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "table"):
+            self._apply_table_column_modes()
+
+    def load_fines(self):
+        c = get_dialog_colors(self)
+        try:
+            ok, rows = self.db.get_pending_fines_detailed()
+            self.all_rows = list(rows or []) if ok else []
+            summary = self.db.get_fines_financial_summary()
+            has_pending = float(summary.get("pending_fines", 0.0) or 0.0) > 0
+            accent_key = "warning" if has_pending else "success"
+            bg_tint = c.get("amber_tint", c["warning_soft"]) if has_pending else c["success_soft"]
+            self.summary_label.setStyleSheet(
+                f"background: {bg_tint}; color: {c['text']}; "
+                f"border: 1px solid {c[accent_key]}; border-left: 4px solid {c[accent_key]}; "
+                "border-radius: 8px; padding: 9px 12px; font-size: 12px; font-weight: 700;"
+            )
+            self.summary_label.setText(
+                f"Pending Items: {len(self.all_rows)}   |   "
+                f"Unpaid Balance: {money(summary['pending_fines'])}   |   "
+                f"Collected (All Time): {money(summary['total_collected'])}   |   "
+                f"Waived (All Time): {money(summary['waived_total'])}"
+            )
+        except Exception as error:
+            self.all_rows = []
+            show_error(self, "Pending Fines Error", error)
+        self.apply_filter()
+
+    def apply_filter(self, *_):
+        query = self.search_input.text().strip().casefold()
+        if not query:
+            self.filtered_rows = list(self.all_rows)
+        else:
+            self.filtered_rows = [
+                row for row in self.all_rows
+                if query in " ".join(safe_text(v) for v in row).casefold()
+            ]
+        self.populate_table()
+
+    def populate_table(self):
+        c = get_dialog_colors(self)
+        self.table.setRowCount(len(self.filtered_rows))
+        for r_idx, row in enumerate(self.filtered_rows):
+            (
+                log_id, user_id, user_name, book_id, book_title,
+                fine_amount, status, due_date, return_date, ren_count,
+            ) = row
+            date_ref = return_date or due_date or "—"
+            raw_status = str(status or "").upper()
+            vals = [
+                f"#{log_id}",
+                safe_text(user_id),
+                safe_text(user_name),
+                safe_text(book_id),
+                safe_text(book_title),
+                safe_text(status),
+                safe_text(date_ref),
+                str(int(ren_count or 0)),
+                money(fine_amount),
+            ]
+            for c_idx, val in enumerate(vals):
+                item = QTableWidgetItem(val)
+                if c_idx == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, row)
+                    item.setForeground(QColor(c["primary"]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                elif c_idx == 5:
+                    color_key = (
+                        "danger"
+                        if raw_status == "OVERDUE"
+                        else "primary"
+                        if raw_status == "ISSUED"
+                        else "success"
+                    )
+                    item.setForeground(QColor(c[color_key]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                elif c_idx == 7 and int(ren_count or 0) > 0:
+                    item.setForeground(QColor(c["cyan"]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                elif c_idx == 8:
+                    item.setForeground(QColor(c["danger"]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                self.table.setItem(r_idx, c_idx, item)
+        self.export_btn.setEnabled(bool(self.filtered_rows))
+        if self.filtered_rows:
+            self.table.selectRow(0)
+        self._update_action_states()
+
+    def _selected_record(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.table.item(rows[0].row(), 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _update_action_states(self):
+        has_sel = self._selected_record() is not None
+        self.collect_btn.setEnabled(has_sel)
+        self.waive_btn.setEnabled(has_sel)
+        self.collect_user_btn.setEnabled(has_sel)
+
+    def settle_selected(self, action):
+        rec = self._selected_record()
+        if not rec:
+            return
+        log_id, user_id, user_name, book_id, _title, fine_amount = rec[:6]
+        verb = "collect & mark PAID" if action == "PAID" else "WAIVE"
+        answer = QMessageBox.question(
+            self,
+            "Confirm Fine Settlement",
+            f"Do you want to {verb} {money(fine_amount)} for {user_name} ({user_id}) "
+            f"on book {book_id} (Transaction #{log_id})?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        success, message = self.db.settle_loan_fine(log_id, action=action)
+        if success:
+            self.data_updated.emit()
+            show_success(self, "Fine Updated", message)
+            self.load_fines()
+        else:
+            show_warning(self, "Settlement Failed", message)
+
+    def settle_selected_user_all(self):
+        rec = self._selected_record()
+        if not rec:
+            return
+        user_id, user_name = rec[1], rec[2]
+        user_total = self.db.get_user_pending_fines_total(user_id)
+        answer = QMessageBox.question(
+            self,
+            "Collect All User Fines",
+            f"Mark all unpaid fines totaling {money(user_total)} for "
+            f"{user_name} ({user_id}) as PAID?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        success, message = self.db.settle_all_user_fines(user_id, action="PAID")
+        if success:
+            self.data_updated.emit()
+            show_success(self, "All Fines Settled", message)
+            self.load_fines()
+        else:
+            show_warning(self, "Bulk Settlement Failed", message)
+
+    def export_csv(self):
+        if not self.filtered_rows:
+            return
+        filename = (
+            "pending_fines_"
+            + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            + ".csv"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Pending Fines",
+            filename,
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(self.HEADERS)
+                for row in self.filtered_rows:
+                    writer.writerow([
+                        row[0], row[1], row[2], row[3], row[4],
+                        row[6], row[8] or row[7], row[9], f"{float(row[5] or 0):.2f}",
+                    ])
+            show_success(self, "Export Successful", f"Pending fines exported to:\n{path}")
+        except Exception as error:
+            show_error(self, "Export Failed", error)

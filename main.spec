@@ -1,11 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
+datas = [('assets', 'assets')]
+datas += collect_data_files('barcode')
+
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    # 1. BUNDLE YOUR ASSETS FOLDER (Source directory, Destination directory in build)
-    datas=[('assets', 'assets')], 
+    # Bundle static assets and package data files (such as python-barcode fonts)
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -26,20 +31,20 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/library_icon.ico', 
+    icon='assets/library_icon.ico',
 )
 coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='main',
 )

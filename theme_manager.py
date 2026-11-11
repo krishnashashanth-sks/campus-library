@@ -40,56 +40,92 @@ class ThemeManager(QObject):
 
     THEME = {
         "dark": {
-            "window": "#0B1120",
-            "surface": "#151F32",
-            "surface_alt": "#1B2940",
-            "input": "#111B2D",
-            "border": "#28354A",
+            "window": "#090E1A",
+            "surface": "#111A2E",
+            "surface_alt": "#182542",
+            "surface_elevated": "#1F2F52",
+            "input": "#0C1426",
+            "border": "#28385C",
+            "border_bright": "#384F82",
             "text": "#F8FAFC",
-            "muted": "#94A3B8",
-            "primary": "#2563EB",
+            "muted": "#9BB0CE",
+            "primary": "#3B82F6",
             "primary_hover": "#2563EB",
-            "selection": "#1D4ED8",
+            "primary_soft": "rgba(59, 130, 246, 0.16)",
+            "selection": "#2563EB",
+            "indigo": "#818CF8",
+            "indigo_hover": "#6366F1",
+            "indigo_soft": "rgba(129, 140, 248, 0.16)",
+            "cyan": "#22D3EE",
+            "cyan_hover": "#06B6D4",
+            "cyan_soft": "rgba(34, 211, 238, 0.16)",
+            "teal": "#2DD4BF",
+            "purple": "#A78BFA",
+            "purple_soft": "rgba(167, 139, 250, 0.16)",
             "success": "#10B981",
             "success_hover": "#059669",
+            "success_soft": "rgba(16, 185, 129, 0.16)",
             "warning": "#F59E0B",
-            "danger": "#EF4444",
-            "tooltip": "#151F32",
-            "table_row": "#131C2E",
-            "table_alt": "#182338",
-            "overdue_tint": "#1E1B18",
-            "amber_tint": "#2B2415",
+            "warning_hover": "#D97706",
+            "warning_soft": "rgba(245, 158, 11, 0.16)",
+            "danger": "#F43F5E",
+            "danger_hover": "#E11D48",
+            "danger_soft": "rgba(244, 63, 94, 0.16)",
+            "tooltip": "#182542",
+            "table_row": "#0F182B",
+            "table_alt": "#142038",
+            "header_bg": "#182745",
+            "overdue_tint": "#2A1420",
+            "amber_tint": "#2B2112",
             "chart_issued": "#38BDF8",
             "chart_returned": "#34D399",
-            "inventory_issued": "#3B82F6",
-            "inventory_due": "#F59E0B",
-            "inventory_overdue": "#EF4444",
+            "inventory_issued": "#60A5FA",
+            "inventory_due": "#FBBF24",
+            "inventory_overdue": "#FB7185",
         },
         "light": {
-            "window": "#F1F5F9",
-            "surface": "#FFFFFF",
-            "surface_alt": "#E8EEF5",
-            "input": "#FFFFFF",
-            "border": "#CBD5E1",
-            "text": "#0F172A",
-            "muted": "#64748B",
-            "primary": "#2563EB",
-            "primary_hover": "#1D4ED8",
-            "selection": "#BFDBFE",
-            "success": "#10B981",
-            "success_hover": "#059669",
-            "warning": "#F59E0B",
-            "danger": "#EF4444",
-            "tooltip": "#FFFFFF",
-            "table_row": "#FFFFFF",
-            "table_alt": "#F1F5F9",
-            "overdue_tint": "#FEE2E2",
-            "amber_tint": "#FEF3C7",
-            "chart_issued": "#38BDF8",
-            "chart_returned": "#34D399",
-            "inventory_issued": "#3B82F6",
-            "inventory_due": "#F59E0B",
-            "inventory_overdue": "#EF4444",
+            "window": "#D2DFEF",
+            "surface": "#E3ECF9",
+            "surface_alt": "#CFDDF3",
+            "surface_elevated": "#BED0EC",
+            "input": "#DAE6F7",
+            "border": "#88A4CE",
+            "border_bright": "#5A7CB2",
+            "text": "#0A1628",
+            "muted": "#283D5E",
+            "primary": "#1D4ED8",
+            "primary_hover": "#1E40AF",
+            "primary_soft": "rgba(29, 78, 216, 0.20)",
+            "selection": "#1D4ED8",
+            "indigo": "#4338CA",
+            "indigo_hover": "#3730A3",
+            "indigo_soft": "rgba(67, 56, 202, 0.20)",
+            "cyan": "#0369A1",
+            "cyan_hover": "#075985",
+            "cyan_soft": "rgba(3, 105, 161, 0.20)",
+            "teal": "#0F766E",
+            "purple": "#6D28D9",
+            "purple_soft": "rgba(109, 40, 217, 0.20)",
+            "success": "#047857",
+            "success_hover": "#065F46",
+            "success_soft": "rgba(4, 120, 87, 0.20)",
+            "warning": "#B45309",
+            "warning_hover": "#92400E",
+            "warning_soft": "rgba(180, 83, 9, 0.22)",
+            "danger": "#BE123C",
+            "danger_hover": "#9F1239",
+            "danger_soft": "rgba(190, 18, 60, 0.20)",
+            "tooltip": "#DCE7F7",
+            "table_row": "#E4EDF9",
+            "table_alt": "#D6E3F6",
+            "header_bg": "#C0D3EE",
+            "overdue_tint": "#F8CFD7",
+            "amber_tint": "#FCE0A2",
+            "chart_issued": "#0369A1",
+            "chart_returned": "#047857",
+            "inventory_issued": "#1D4ED8",
+            "inventory_due": "#B45309",
+            "inventory_overdue": "#BE123C",
         },
     }
     COLORS = {
@@ -259,9 +295,8 @@ class ThemeManager(QObject):
             "assets",
             "checkbox-check.svg",
         ).replace("\\", "/")
-        arrow_scheme = (
-            "light" if c["text"].lower() == "#e8eef8" else "dark"
-        )
+        is_dark = QColor(c["window"]).lightness() < 128
+        arrow_scheme = "light" if is_dark else "dark"
         spin_up_arrow = os.path.join(
             resource_root,
             "assets",
@@ -291,9 +326,10 @@ class ThemeManager(QObject):
         QToolTip {{
             background-color: {c["tooltip"]};
             color: {c["text"]};
-            border: 1px solid {c["border"]};
-            padding: 6px 9px;
-            border-radius: 5px;
+            border: 1px solid {c["primary"]};
+            padding: 7px 10px;
+            border-radius: 7px;
+            font-weight: 500;
         }}
 
         /* ---------- BUTTONS ---------- */
@@ -305,15 +341,17 @@ class ThemeManager(QObject):
             border-radius: 8px;
             padding: 8px 14px;
             min-height: 22px;
+            font-weight: 600;
         }}
 
         QPushButton:hover {{
-            background-color: {c["surface"]};
+            background-color: {c["surface_elevated"]};
             border-color: {c["primary"]};
         }}
 
         QPushButton:pressed {{
             background-color: {c["selection"]};
+            color: #FFFFFF;
         }}
 
         QPushButton:disabled {{
@@ -324,6 +362,131 @@ class ThemeManager(QObject):
 
         QPushButton:default {{
             border: 1px solid {c["primary"]};
+        }}
+
+        /* Semantic Action Button Variants */
+
+        QPushButton#PrimaryButton {{
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 {c["primary"]},
+                stop:1 {c["indigo"]}
+            );
+            color: #FFFFFF;
+            font-weight: 700;
+            border: 1px solid {c["primary_hover"]};
+        }}
+
+        QPushButton#PrimaryButton:hover {{
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 {c["primary_hover"]},
+                stop:1 {c["indigo_hover"]}
+            );
+            border-color: {c["cyan"]};
+        }}
+
+        QPushButton#PrimaryButton:disabled {{
+            background: {c["surface_alt"]};
+            color: {c["muted"]};
+            border: 1px solid {c["border"]};
+        }}
+
+        QPushButton#SuccessButton {{
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 {c["success"]},
+                stop:1 {c["teal"]}
+            );
+            color: #FFFFFF;
+            font-weight: 700;
+            border: 1px solid {c["success_hover"]};
+        }}
+
+        QPushButton#SuccessButton:hover {{
+            background: {c["success_hover"]};
+        }}
+
+        QPushButton#SuccessButton:disabled {{
+            background: {c["surface_alt"]};
+            color: {c["muted"]};
+            border: 1px solid {c["border"]};
+        }}
+
+        QPushButton#WarningButton {{
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 {c["warning"]},
+                stop:1 #EA580C
+            );
+            color: #FFFFFF;
+            font-weight: 700;
+            border: 1px solid {c["warning_hover"]};
+        }}
+
+        QPushButton#WarningButton:hover {{
+            background: {c["warning_hover"]};
+        }}
+
+        QPushButton#WarningButton:disabled {{
+            background: {c["surface_alt"]};
+            color: {c["muted"]};
+            border: 1px solid {c["border"]};
+        }}
+
+        QPushButton#InfoButton {{
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 {c["cyan_hover"]},
+                stop:1 {c["primary"]}
+            );
+            color: #FFFFFF;
+            font-weight: 700;
+            border: 1px solid {c["cyan_hover"]};
+        }}
+
+        QPushButton#InfoButton:hover {{
+            background: {c["cyan_hover"]};
+        }}
+
+        QPushButton#InfoButton:disabled {{
+            background: {c["surface_alt"]};
+            color: {c["muted"]};
+            border: 1px solid {c["border"]};
+        }}
+
+        QPushButton#SecondaryButton {{
+            background-color: {c["surface_alt"]};
+            color: {c["text"]};
+            border: 1px solid {c["border_bright"]};
+            font-weight: 600;
+        }}
+
+        QPushButton#SecondaryButton:hover {{
+            background-color: {c["primary_soft"]};
+            color: {c["text"]};
+            border-color: {c["primary"]};
+        }}
+
+        QPushButton#DangerButton {{
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 {c["danger"]},
+                stop:1 {c["danger_hover"]}
+            );
+            color: #FFFFFF;
+            font-weight: 700;
+            border: 1px solid {c["danger_hover"]};
+        }}
+
+        QPushButton#DangerButton:hover {{
+            background-color: {c["danger_hover"]};
+        }}
+
+        QPushButton#DangerButton:disabled {{
+            background: {c["surface_alt"]};
+            color: {c["muted"]};
+            border: 1px solid {c["border"]};
         }}
 
         /* ---------- INPUTS ---------- */
@@ -339,10 +502,20 @@ class ThemeManager(QObject):
         QComboBox {{
             background-color: {c["input"]};
             color: {c["text"]};
-            border: 1px solid {c["border"]};
+            border: 1.5px solid {c["border"]};
             border-radius: 8px;
             padding: 7px 9px;
             selection-background-color: {c["selection"]};
+        }}
+
+        QLineEdit,
+        QSpinBox,
+        QDoubleSpinBox,
+        QDateEdit,
+        QDateTimeEdit,
+        QTimeEdit,
+        QComboBox {{
+            min-height: 20px;
         }}
 
         QLineEdit:focus,
@@ -353,7 +526,8 @@ class ThemeManager(QObject):
         QDateEdit:focus,
         QDateTimeEdit:focus,
         QComboBox:focus {{
-            border: 1px solid {c["primary"]};
+            border: 1.5px solid {c["primary"]};
+            background-color: {c["surface"]};
         }}
 
         QSpinBox,
@@ -388,7 +562,7 @@ class ThemeManager(QObject):
         QDoubleSpinBox::up-button:hover,
         QSpinBox::down-button:hover,
         QDoubleSpinBox::down-button:hover {{
-            background-color: {c["selection"]};
+            background-color: {c["primary_soft"]};
         }}
 
         QSpinBox::up-arrow,
@@ -408,10 +582,11 @@ class ThemeManager(QObject):
         QComboBox QAbstractItemView {{
             background-color: {c["surface"]};
             color: {c["text"]};
-            border: 1px solid {c["border"]};
+            border: 1px solid {c["primary"]};
             selection-background-color: {c["selection"]};
             selection-color: #FFFFFF;
             outline: none;
+            padding: 3px;
         }}
 
         /* ---------- TABLES ---------- */
@@ -420,8 +595,8 @@ class ThemeManager(QObject):
         QTableView,
         QTreeWidget,
         QTreeView {{
-            background-color: {c["surface"]};
-            alternate-background-color: {c["surface_alt"]};
+            background-color: {c["table_row"]};
+            alternate-background-color: {c["table_alt"]};
             color: {c["text"]};
             border: 1px solid {c["border"]};
             border-radius: 10px;
@@ -450,18 +625,18 @@ class ThemeManager(QObject):
         }}
 
         QHeaderView::section {{
-            background-color: {c["surface_alt"]};
+            background-color: {c["header_bg"]};
             color: {c["text"]};
             border: none;
-            border-bottom: 1px solid {c["border"]};
+            border-bottom: 2px solid {c["border_bright"]};
             padding: 10px 10px;
-            font-weight: 600;
+            font-weight: 700;
         }}
 
         QLabel#PageTitle {{
             color: {c["text"]};
             font-size: 23px;
-            font-weight: 700;
+            font-weight: 800;
         }}
 
         QLabel#PageSubtitle {{
@@ -473,6 +648,78 @@ class ThemeManager(QObject):
             color: {c["text"]};
             font-size: 14px;
             font-weight: 700;
+        }}
+
+        /* Dialog semantic classes & status badges */
+
+        QLabel[class="dialog-heading"] {{
+            color: {c["text"]};
+            font-size: 17px;
+            font-weight: 800;
+            background: {c["primary_soft"]};
+            border-left: 4px solid {c["primary"]};
+            border-radius: 7px;
+            padding: 7px 12px;
+        }}
+
+        QLabel[class="barcode-preview"],
+        QLabel[class="camera-preview"] {{
+            background: {c["surface_alt"]};
+            color: {c["muted"]};
+            border: 1.5px dashed {c["border_bright"]};
+            border-radius: 10px;
+            padding: 12px;
+        }}
+
+        QFrame#ProjectionCard {{
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:1,
+                stop:0 {c["cyan_soft"]},
+                stop:1 {c["indigo_soft"]}
+            );
+            border: 1px solid {c["cyan"]};
+            border-left: 4px solid {c["cyan"]};
+            border-radius: 10px;
+        }}
+
+        QLabel[status="issued"] {{
+            background: {c["primary_soft"]};
+            color: {c["primary"]};
+            border: 1px solid {c["primary"]};
+            border-radius: 10px;
+            padding: 3px 10px;
+            font-weight: 700;
+            font-size: 11px;
+        }}
+
+        QLabel[status="overdue"] {{
+            background: {c["danger_soft"]};
+            color: {c["danger"]};
+            border: 1px solid {c["danger"]};
+            border-radius: 10px;
+            padding: 3px 10px;
+            font-weight: 700;
+            font-size: 11px;
+        }}
+
+        QLabel[status="returned"] {{
+            background: {c["success_soft"]};
+            color: {c["success"]};
+            border: 1px solid {c["success"]};
+            border-radius: 10px;
+            padding: 3px 10px;
+            font-weight: 700;
+            font-size: 11px;
+        }}
+
+        QLabel[status="renewed"] {{
+            background: {c["cyan_soft"]};
+            color: {c["cyan"]};
+            border: 1px solid {c["cyan"]};
+            border-radius: 10px;
+            padding: 3px 10px;
+            font-weight: 700;
+            font-size: 11px;
         }}
 
         /* ---------- CHECKBOXES / RADIO ---------- */
@@ -488,7 +735,7 @@ class ThemeManager(QObject):
             width: 16px;
             height: 16px;
             background-color: {c["input"]};
-            border: 1px solid {c["muted"]};
+            border: 1.5px solid {c["muted"]};
         }}
 
         QCheckBox::indicator {{
@@ -498,7 +745,7 @@ class ThemeManager(QObject):
         QCheckBox::indicator:checked,
         QRadioButton::indicator:checked {{
             background-color: {c["primary"]};
-            border: 1px solid {c["primary"]};
+            border: 1.5px solid {c["primary"]};
         }}
 
         QCheckBox::indicator:checked {{
@@ -528,69 +775,111 @@ class ThemeManager(QObject):
         /* ---------- GROUP BOX ---------- */
 
         QGroupBox {{
-            border: 1px solid {c["border"]};
-            border-radius: 8px;
-            margin-top: 12px;
-            padding: 12px;
-            font-weight: 600;
+            background-color: {c["surface"]};
+            border: 1.5px solid {c["border_bright"]};
+            border-radius: 10px;
+            margin-top: 15px;
+            padding: 18px 12px 12px 12px;
+            font-weight: 700;
         }}
 
         QGroupBox::title {{
             subcontrol-origin: margin;
+            subcontrol-position: top left;
+            top: 4px;
             left: 12px;
-            padding: 0 5px;
+            padding: 2px 10px;
+            color: {c["primary"]};
+            background-color: {c["surface_elevated"]};
+            border: 1.5px solid {c["border_bright"]};
+            border-radius: 6px;
         }}
 
         /* ---------- SCROLLBARS ---------- */
 
+        QAbstractScrollArea::corner {{
+            background: transparent;
+            border: none;
+        }}
+
         QScrollBar:vertical {{
-            background: {c["window"]};
-            width: 10px;
-            margin: 0;
+            background: transparent;
+            width: 8px;
+            margin: 3px 1px 3px 1px;
         }}
 
         QScrollBar:horizontal {{
-            background: {c["window"]};
-            height: 10px;
-            margin: 0;
+            background: transparent;
+            height: 8px;
+            margin: 1px 3px 1px 3px;
         }}
 
         QScrollBar::handle:vertical,
         QScrollBar::handle:horizontal {{
-            background: {c["border"]};
-            border-radius: 5px;
-            min-height: 25px;
-            min-width: 25px;
+            background: {c["border_bright"]};
+            border-radius: 3px;
+            min-height: 28px;
+            min-width: 28px;
         }}
 
-        QScrollBar::handle:hover {{
-            background: {c["muted"]};
+        QScrollBar::handle:vertical:hover,
+        QScrollBar::handle:horizontal:hover {{
+            background: {c["primary"]};
         }}
 
-        QScrollBar::add-line,
-        QScrollBar::sub-line {{
+        QScrollBar::add-line:vertical,
+        QScrollBar::sub-line:vertical,
+        QScrollBar::add-line:horizontal,
+        QScrollBar::sub-line:horizontal {{
             width: 0px;
             height: 0px;
+            border: none;
+            background: transparent;
+        }}
+
+        QScrollBar::add-page:vertical,
+        QScrollBar::sub-page:vertical,
+        QScrollBar::add-page:horizontal,
+        QScrollBar::sub-page:horizontal {{
+            background: transparent;
+            border: none;
         }}
 
         /* ---------- TABS ---------- */
 
         QTabWidget::pane {{
+            background-color: {c["surface"]};
             border: 1px solid {c["border"]};
-            border-radius: 8px;
+            border-radius: 10px;
+            top: -1px;
         }}
 
         QTabBar::tab {{
             background-color: {c["surface_alt"]};
-            color: {c["text"]};
+            color: {c["muted"]};
             padding: 9px 16px;
-            border: none;
-            margin-right: 2px;
+            border: 1px solid {c["border"]};
+            border-bottom: none;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            margin-right: 4px;
+            font-weight: 600;
+        }}
+
+        QTabBar::tab:hover {{
+            background-color: {c["primary_soft"]};
+            color: {c["text"]};
         }}
 
         QTabBar::tab:selected {{
-            background-color: {c["primary"]};
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 {c["primary"]},
+                stop:1 {c["indigo"]}
+            );
             color: #FFFFFF;
+            border-color: {c["primary"]};
+            font-weight: 700;
         }}
 
         /* ---------- MENUS ---------- */
@@ -598,13 +887,14 @@ class ThemeManager(QObject):
         QMenu {{
             background-color: {c["surface"]};
             color: {c["text"]};
-            border: 1px solid {c["border"]};
+            border: 1px solid {c["border_bright"]};
+            border-radius: 8px;
             padding: 5px;
         }}
 
         QMenu::item {{
             padding: 7px 25px;
-            border-radius: 4px;
+            border-radius: 5px;
         }}
 
         QMenu::item:selected {{
@@ -624,13 +914,17 @@ class ThemeManager(QObject):
             background-color: {c["surface_alt"]};
             color: {c["text"]};
             border: 1px solid {c["border"]};
-            border-radius: 5px;
+            border-radius: 6px;
             text-align: center;
         }}
 
         QProgressBar::chunk {{
-            background-color: {c["primary"]};
-            border-radius: 4px;
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 {c["success"]},
+                stop:1 {c["cyan"]}
+            );
+            border-radius: 5px;
         }}
 
         /* ---------- CALENDAR ---------- */
@@ -643,7 +937,7 @@ class ThemeManager(QObject):
         QCalendarWidget QToolButton {{
             background-color: {c["surface_alt"]};
             color: {c["text"]};
-            border: none;
+            border-radius: 5px;
             padding: 5px;
         }}
 
@@ -681,22 +975,9 @@ class ThemeManager(QObject):
         }}
 
         QFrame#DangerFrame {{
-            background-color: rgba(239, 68, 68, 0.08);
-            border: 1px solid rgba(239, 68, 68, 0.30);
-            border-radius: 8px;
-        }}
-
-        QPushButton#PrimaryButton {{
-            background-color: {c["primary"]};
-            color: white;
-            font-weight: 600;
-            border: none;
-        }}
-
-        QPushButton#DangerButton {{
-            background-color: #DC2626;
-            color: white;
-            font-weight: 600;
-            border: none;
+            background-color: {c["danger_soft"]};
+            border: 1px solid {c["danger"]};
+            border-left: 4px solid {c["danger"]};
+            border-radius: 10px;
         }}
         """

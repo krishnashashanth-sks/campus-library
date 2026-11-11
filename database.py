@@ -10,7 +10,13 @@ import secrets
 from contextlib import contextmanager
 from typing import Optional, Iterable, Sequence, Any
 
-from utils import get_appdata_db_path
+from utils import (
+    COLLEGE_BRANCHES,
+    COLLEGE_BRANCH_NAMES,
+    FACULTY_ADDITIONAL_DEPARTMENTS,
+    FACULTY_ADDITIONAL_DEPARTMENT_NAMES,
+    get_appdata_db_path,
+)
 
 
 class LocalDatabase:
@@ -142,6 +148,38 @@ class LocalDatabase:
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS renewal_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    loan_id INTEGER NOT NULL,
+                    book_id TEXT COLLATE NOCASE,
+                    user_id TEXT COLLATE NOCASE,
+                    previous_due_date TIMESTAMP,
+                    new_due_date TIMESTAMP,
+                    extended_days INTEGER NOT NULL CHECK(extended_days > 0),
+                    base_mode TEXT NOT NULL DEFAULT 'DUE_DATE',
+                    fine_assessed DECIMAL(10, 2) DEFAULT 0.00,
+                    fine_action TEXT NOT NULL DEFAULT 'NONE',
+                    notes TEXT,
+                    renewed_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY(loan_id) REFERENCES circulation_logs(id)
+                        ON DELETE CASCADE
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fine_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    loan_id INTEGER NOT NULL,
+                    book_id TEXT COLLATE NOCASE,
+                    user_id TEXT COLLATE NOCASE,
+                    amount DECIMAL(10, 2) NOT NULL CHECK(amount >= 0),
+                    action TEXT NOT NULL CHECK(action IN ('PAID', 'COLLECTED', 'WAIVED')),
+                    note TEXT,
+                    settled_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY(loan_id) REFERENCES circulation_logs(id)
+                        ON DELETE CASCADE
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT
@@ -216,6 +254,12 @@ class LocalDatabase:
             self._ensure_column("books", "isbn", "TEXT")
             self._ensure_column("circulation_logs", "status", "TEXT DEFAULT 'ISSUED'")
             self._ensure_column("circulation_logs", "fine_amount", "DECIMAL(10, 2) DEFAULT 0.00")
+            self._ensure_column("circulation_logs", "renewal_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("circulation_logs", "last_renewed_at", "TIMESTAMP")
+            self._ensure_column("circulation_logs", "fine_settled", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("circulation_logs", "fine_settled_at", "TIMESTAMP")
+            self._ensure_column("circulation_logs", "fine_settlement_action", "TEXT")
+            self._ensure_column("circulation_logs", "fine_settlement_note", "TEXT")
             self._ensure_column("users", "email", "TEXT")
 
             cur.executescript("""
@@ -226,6 +270,9 @@ class LocalDatabase:
                 CREATE INDEX IF NOT EXISTS idx_logs_book_status ON circulation_logs(book_id, status);
                 CREATE INDEX IF NOT EXISTS idx_logs_due_status ON circulation_logs(due_date, status);
                 CREATE INDEX IF NOT EXISTS idx_logs_checkout ON circulation_logs(checkout_date);
+                CREATE INDEX IF NOT EXISTS idx_renewal_logs_loan ON renewal_logs(loan_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_fine_payments_loan ON fine_payments(loan_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_fine_payments_user ON fine_payments(user_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_email_queue_status_created
                     ON email_queue(status, created_at);
             """)
@@ -238,32 +285,33 @@ class LocalDatabase:
                     [("admin_password", "admin123"), ("daily_fine", "10.0"), ("default_days", "14")],
                 )
 
-            if cur.execute("SELECT COUNT(*) FROM departments").fetchone()[0] == 0:
-                departments = [
-                    ("CSE (Computer Science & Engineering)", "STUDENT", 3),
-                    ("ECE (Electronics & Communication)", "STUDENT", 3),
-                    ("EEE (Electrical & Electronics)", "STUDENT", 3),
-                    ("Advanced Manufacturing Technology (AMT)", "STUDENT", 3),
-                    ("Electrical Engineering and Electric Vehicle Technology", "STUDENT", 3),
-                    ("Interior Design (ID)", "STUDENT", 3),
-                    ("Civil Engineering", "STUDENT", 3),
-                    ("Mechanical Engineering", "STUDENT", 3),
-                    ("Automobile Engineering", "STUDENT", 3),
-                    ("Pharmacy", "STUDENT", 2),
-                    ("Sciences & Humanities Department", "FACULTY", 3),
-                    ("Computer Engineering Department", "FACULTY", 3),
-                    ("Electronics & Communication Department", "FACULTY", 3),
-                    ("Electrical & EV Department", "FACULTY", 3),
-                    ("Mechanical & AMT Department", "FACULTY", 3),
-                    ("Civil & Interior Design Department", "FACULTY", 3),
-                    ("Automobile Engineering Department", "FACULTY", 3),
-                    ("Pharmacy Department", "FACULTY", 3),
-                    ("General Administration", "FACULTY", 3),
-                ]
-                cur.executemany(
-                    "INSERT OR IGNORE INTO departments(name, category, duration_years) VALUES (?, ?, ?)",
-                    departments,
-                )
+            cur.executemany(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+                [("max_renewals", "2"), ("allow_overdue_renewal", "1")],
+            )
+
+            canonical_departments = [
+                (name, "STUDENT", duration)
+                for name, duration in COLLEGE_BRANCHES
+            ] + [
+                (name, "FACULTY", duration)
+                for name, duration in FACULTY_ADDITIONAL_DEPARTMENTS
+            ]
+            cur.executemany(
+                """
+                INSERT INTO departments(name, category, duration_years)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    category = excluded.category
+                """,
+                canonical_departments,
+            )
+            allowed_keys = tuple(name.lower() for name, _, _ in canonical_departments)
+            placeholders = ",".join("?" for _ in allowed_keys)
+            cur.execute(
+                f"DELETE FROM departments WHERE LOWER(name) NOT IN ({placeholders})",
+                allowed_keys,
+            )
 
             if cur.execute("SELECT COUNT(*) FROM loan_policies").fetchone()[0] == 0:
                 cur.executemany("""
@@ -747,51 +795,17 @@ class LocalDatabase:
 
     # DEPARTMENTS
     def get_departments(self, category=None):
-        try:
-            if category:
-                category = self._clean(category).upper()
-                if category == "STUDENT":
-                    role_filter = "LOWER(role) LIKE '%student%'"
-                elif category == "FACULTY":
-                    role_filter = (
-                        "LOWER(role) LIKE '%faculty%' "
-                        "OR LOWER(role) LIKE '%staff%' "
-                        "OR LOWER(role) LIKE '%guest%'"
-                    )
-                else:
-                    return []
+        branches = sorted(COLLEGE_BRANCH_NAMES, key=str.casefold)
+        faculty_extras = list(FACULTY_ADDITIONAL_DEPARTMENT_NAMES)
+        if not category:
+            return branches + faculty_extras
 
-                rows = self.conn.execute(
-                    f"""
-                    SELECT name FROM departments WHERE category = ?
-                    UNION
-                    SELECT department FROM users
-                    WHERE department IS NOT NULL
-                        AND TRIM(department) != ''
-                        AND ({role_filter})
-                    ORDER BY 1 COLLATE NOCASE
-                    """,
-                    (category,),
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    """
-                    SELECT name FROM departments
-                    UNION
-                    SELECT department FROM users
-                    WHERE department IS NOT NULL AND TRIM(department) != ''
-                    ORDER BY 1 COLLATE NOCASE
-                    """
-                ).fetchall()
-            values = {
-                self._clean(row[0])
-                for row in rows
-                if row[0] and self._clean(row[0])
-            }
-            return sorted(values, key=str.casefold)
-        except sqlite3.Error:
-            logging.exception("Could not fetch departments")
-            return []
+        category_key = self._clean(category).upper()
+        if category_key == "STUDENT":
+            return branches
+        if category_key == "FACULTY":
+            return branches + faculty_extras
+        return []
 
     def get_course_duration(self, department_name: str) -> int:
         name = self._clean(department_name)
@@ -815,61 +829,50 @@ class LocalDatabase:
         return 3
 
     def add_department(self, name, category="STUDENT", duration_years=3):
-        clean_name = self._clean(name)
-        category = self._clean(category).upper()
-        try:
-            duration = int(duration_years)
-            if not clean_name or category not in ("STUDENT", "FACULTY") or duration < 1:
-                return False, "Enter a valid department name, category, and course duration."
-            with self._transaction():
-                self.conn.execute("""
-                    INSERT INTO departments(name, category, duration_years) VALUES (?, ?, ?)
-                    ON CONFLICT(name) DO UPDATE SET
-                        category = excluded.category,
-                        duration_years = excluded.duration_years
-                """, (clean_name, category, duration))
-            return True, "Department and duration saved successfully."
-        except Exception as exc:
-            return False, self._parse_db_error(exc, "adding department")
+        return False, (
+            "College branches and faculty departments are fixed and cannot be added."
+        )
 
     def update_department(self, dept_id, name, category, duration_years):
         clean_name = self._clean(name)
         category = self._clean(category).upper()
         try:
             duration = int(duration_years)
-            if not clean_name or category not in ("STUDENT", "FACULTY") or duration < 1:
-                return False, "Enter valid department details."
+            if duration < 1:
+                return False, "Enter a valid course duration."
             with self._transaction():
                 row = self.conn.execute(
-                    "SELECT name FROM departments WHERE id = ?", (dept_id,)
+                    "SELECT name, category FROM departments WHERE id = ?", (dept_id,)
                 ).fetchone()
                 if not row:
                     return False, "Department not found."
-                old_name = row[0]
-                self.conn.execute("""
-                    UPDATE departments SET name = ?, category = ?, duration_years = ?
-                    WHERE id = ?
-                """, (clean_name, category, duration, dept_id))
-                if old_name.lower() != clean_name.lower():
-                    self.conn.execute(
-                        "UPDATE users SET department = ? WHERE department = ? COLLATE NOCASE",
-                        (clean_name, old_name),
+                old_name, old_category = row[0], str(row[1] or "").upper()
+                if (
+                    clean_name.casefold() != old_name.casefold()
+                    or category != old_category
+                ):
+                    return (
+                        False,
+                        "Fixed branch names and categories cannot be changed; "
+                        "only course duration can be updated.",
                     )
-            return True, "Department updated successfully."
+                if old_category != "STUDENT":
+                    return (
+                        False,
+                        "Course duration applies only to college student branches.",
+                    )
+                self.conn.execute(
+                    "UPDATE departments SET duration_years = ? WHERE id = ?",
+                    (duration, dept_id),
+                )
+            return True, "Course duration updated successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "department update")
 
     def delete_department(self, name):
-        try:
-            with self._transaction():
-                cur = self.conn.execute(
-                    "DELETE FROM departments WHERE name = ? COLLATE NOCASE", (self._clean(name),)
-                )
-                if cur.rowcount == 0:
-                    return False, "Department not found."
-            return True, "Department removed successfully."
-        except Exception as exc:
-            return False, self._parse_db_error(exc, "deleting department")
+        return False, (
+            "College branches and faculty departments are fixed and cannot be removed."
+        )
 
     # LOAN POLICIES
     def get_loan_policy(self, role):
@@ -1192,6 +1195,496 @@ class LocalDatabase:
         except Exception as exc:
             return False, self._parse_db_error(exc, "book issue")
 
+    @staticmethod
+    def _parse_circulation_datetime(value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        for fmt in (
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M",
+            "%Y-%m-%d",
+        ):
+            try:
+                return datetime.datetime.strptime(text[:19], fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.datetime.strptime(text[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+
+    def get_max_renewals(self):
+        try:
+            value = int(self.get_setting("max_renewals", 2))
+            return max(0, value)
+        except (TypeError, ValueError):
+            return 2
+
+    def get_allow_overdue_renewal(self):
+        raw = str(self.get_setting("allow_overdue_renewal", "1")).strip().casefold()
+        return raw in ("1", "true", "yes", "on")
+
+    def get_renewal_counts(self, log_ids=None):
+        return {
+            loan_id: meta[0]
+            for loan_id, meta in self.get_loan_renewal_meta(log_ids).items()
+        }
+
+    def get_loan_renewal_meta(self, log_ids=None):
+        try:
+            if log_ids is None:
+                rows = self.conn.execute("""
+                    SELECT id, COALESCE(renewal_count, 0), COALESCE(last_renewed_at, '')
+                    FROM circulation_logs
+                """).fetchall()
+                return {
+                    int(row[0]): (int(row[1] or 0), str(row[2] or ""))
+                    for row in rows
+                }
+
+            clean_ids = sorted({int(loan_id) for loan_id in log_ids if loan_id is not None})
+            result = {}
+            for offset in range(0, len(clean_ids), 500):
+                batch = clean_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self.conn.execute(f"""
+                    SELECT id, COALESCE(renewal_count, 0), COALESCE(last_renewed_at, '')
+                    FROM circulation_logs
+                    WHERE id IN ({placeholders})
+                """, batch).fetchall()
+                for row in rows:
+                    result[int(row[0])] = (int(row[1] or 0), str(row[2] or ""))
+            return result
+        except (sqlite3.Error, ValueError, TypeError):
+            logging.exception("Could not fetch loan renewal metadata")
+            return {}
+
+    def get_renewal_history(self, loan_id):
+        try:
+            rows = self.conn.execute("""
+                SELECT id, loan_id, book_id, user_id, previous_due_date, new_due_date,
+                       extended_days, base_mode, fine_assessed, fine_action, notes, renewed_at
+                FROM renewal_logs
+                WHERE loan_id = ?
+                ORDER BY id DESC
+            """, (int(loan_id),)).fetchall()
+            history = []
+            for row in rows:
+                history.append({
+                    "id": int(row[0]),
+                    "loan_id": int(row[1]),
+                    "book_id": str(row[2] or ""),
+                    "user_id": str(row[3] or ""),
+                    "previous_due_date": str(row[4] or ""),
+                    "new_due_date": str(row[5] or ""),
+                    "extended_days": int(row[6] or 0),
+                    "base_mode": str(row[7] or "DUE_DATE"),
+                    "fine_assessed": round(float(row[8] or 0.0), 2),
+                    "fine_action": str(row[9] or "NONE"),
+                    "notes": str(row[10] or ""),
+                    "renewed_at": str(row[11] or ""),
+                })
+            return history
+        except (sqlite3.Error, ValueError, TypeError):
+            logging.exception("Could not fetch renewal history for loan %s", loan_id)
+            return []
+
+    def get_active_loan_id(self, book_id, user_id):
+        bid, uid = self._clean(book_id), self._clean(user_id)
+        try:
+            row = self.conn.execute("""
+                SELECT id FROM circulation_logs
+                WHERE book_id = ? AND user_id = ? AND status = 'ISSUED'
+                ORDER BY id DESC LIMIT 1
+            """, (bid, uid)).fetchone()
+            return int(row[0]) if row else None
+        except (sqlite3.Error, ValueError, TypeError):
+            return None
+
+    def get_loan_renewal_preview(
+        self,
+        loan_id,
+        extend_days=None,
+        base_mode="auto",
+        allow_limit_override=False,
+        now=None,
+    ):
+        now_dt = (now or datetime.datetime.now()).replace(second=0, microsecond=0)
+        try:
+            lid = int(loan_id)
+        except (ValueError, TypeError):
+            return {"found": False, "eligible": False, "block_reason": "Invalid transaction ID."}
+
+        row = self.conn.execute("""
+            SELECT c.id, c.book_id, c.user_id, c.checkout_date, c.due_date, c.return_date,
+                   COALESCE(c.fine_amount, 0), UPPER(COALESCE(c.status, 'ISSUED')),
+                   COALESCE(c.renewal_count, 0), COALESCE(c.last_renewed_at, ''),
+                   COALESCE(b.title, 'Unknown Book'), COALESCE(b.author, ''),
+                   COALESCE(b.total_copies, 0), COALESCE(b.available_copies, 0),
+                   COALESCE(u.full_name, 'Unknown User'), COALESCE(u.role, 'Student'),
+                   COALESCE(u.department, ''), COALESCE(u.email, '')
+            FROM circulation_logs c
+            LEFT JOIN books b ON b.id = c.book_id
+            LEFT JOIN users u ON u.id = c.user_id
+            WHERE c.id = ?
+        """, (lid,)).fetchone()
+        if not row:
+            return {"found": False, "eligible": False, "block_reason": f"Transaction #{lid} was not found."}
+
+        (
+            _id, book_id, user_id, checkout_date, due_date, return_date,
+            carried_fine, status, renewal_count, last_renewed_at,
+            book_title, book_author, total_copies, available_copies,
+            user_name, user_role, user_department, user_email,
+        ) = row
+
+        policy = self.get_loan_policy(user_role)
+        default_days = max(1, int(policy.get("default_days", 14)))
+        max_books = max(0, int(policy.get("max_books", 3)))
+        fine_rate = self._money(policy.get("fine_rate", 2.0), 2.0)
+        max_renewals = self.get_max_renewals()
+        allow_overdue = self.get_allow_overdue_renewal()
+
+        active_loans_count = int(self.conn.execute("""
+            SELECT COUNT(*) FROM circulation_logs
+            WHERE user_id = ? AND status = 'ISSUED'
+        """, (user_id,)).fetchone()[0])
+
+        try:
+            days = default_days if extend_days is None else int(extend_days)
+        except (TypeError, ValueError):
+            days = default_days
+        days_valid = 1 <= days <= 365
+
+        due_dt = self._parse_circulation_datetime(due_date)
+        due_text = str(due_date or "")
+        is_overdue = bool(status == "ISSUED" and due_dt and due_dt.date() < now_dt.date())
+        is_due_today = bool(status == "ISSUED" and due_dt and due_dt.date() == now_dt.date())
+        overdue_days = max(0, (now_dt.date() - due_dt.date()).days) if is_overdue and due_dt else 0
+        accrued_fine = round(overdue_days * fine_rate, 2)
+        carried_fine_val = round(max(0.0, float(carried_fine or 0.0)), 2)
+
+        mode_key = self._clean(base_mode or "auto").upper()
+        if mode_key not in ("AUTO", "DUE_DATE", "TODAY"):
+            mode_key = "AUTO"
+        if mode_key == "AUTO":
+            effective_mode = "TODAY" if is_overdue else "DUE_DATE"
+        else:
+            effective_mode = mode_key
+
+        if effective_mode == "DUE_DATE" and due_dt is not None:
+            if len(due_text.strip()) <= 10:
+                base_dt = due_dt.replace(hour=now_dt.hour, minute=now_dt.minute)
+            else:
+                base_dt = due_dt.replace(second=0, microsecond=0)
+        else:
+            base_dt = now_dt
+
+        new_due_dt = base_dt + datetime.timedelta(days=max(1, days))
+        new_due_text = new_due_dt.strftime("%Y-%m-%d %H:%M")
+        result_date_valid = new_due_dt.date() >= now_dt.date()
+        net_days_from_today = (new_due_dt.date() - now_dt.date()).days
+
+        if status != "ISSUED":
+            display_status = "RETURNED"
+        elif is_overdue:
+            display_status = "OVERDUE"
+        elif is_due_today:
+            display_status = "DUE TODAY"
+        else:
+            display_status = "ISSUED"
+
+        limit_reached = bool(max_renewals > 0 and int(renewal_count) >= max_renewals)
+        overdue_restricted = bool(is_overdue and not allow_overdue)
+        requires_override = bool(limit_reached or overdue_restricted)
+
+        block_reason = ""
+        if status != "ISSUED":
+            block_reason = "This book has already been returned and cannot be renewed."
+        elif not days_valid:
+            block_reason = "Extension duration must be between 1 and 365 days."
+        elif not result_date_valid:
+            block_reason = (
+                "The calculated due date is still in the past. Choose 'Extend from Today' "
+                "or increase the extension days."
+            )
+        elif limit_reached and not allow_limit_override:
+            block_reason = (
+                f"Maximum renewal limit reached ({renewal_count}/{max_renewals}). "
+                "Enable Librarian Override to extend further."
+            )
+        elif overdue_restricted and not allow_limit_override:
+            block_reason = (
+                "Overdue renewals are restricted by Circulation Settings. "
+                "Enable Librarian Override to renew."
+            )
+
+        warnings = []
+        if int(available_copies or 0) <= 0:
+            warnings.append(
+                f"No spare shelf copies are available right now (0/{int(total_copies or 0)} on shelf)."
+            )
+        if active_loans_count > max_books and max_books > 0:
+            warnings.append(
+                f"Member currently holds {active_loans_count} active books (role limit: {max_books})."
+            )
+        if is_overdue and accrued_fine > 0:
+            warnings.append(
+                f"Loan is {overdue_days} day(s) overdue with ₹{accrued_fine:.2f} accrued fine."
+            )
+        if carried_fine_val > 0:
+            warnings.append(
+                f"Loan already carries ₹{carried_fine_val:.2f} in unpaid prior fine."
+            )
+
+        remaining_renewals = (
+            None if max_renewals == 0 else max(0, max_renewals - int(renewal_count))
+        )
+
+        return {
+            "found": True,
+            "loan_id": int(_id),
+            "book_id": str(book_id or ""),
+            "book_title": str(book_title or "Unknown Book"),
+            "book_author": str(book_author or ""),
+            "total_copies": int(total_copies or 0),
+            "available_copies": int(available_copies or 0),
+            "user_id": str(user_id or ""),
+            "user_name": str(user_name or "Unknown User"),
+            "user_role": str(user_role or "Student"),
+            "user_department": str(user_department or ""),
+            "user_email": str(user_email or ""),
+            "active_loans_count": active_loans_count,
+            "max_books": max_books,
+            "checkout_date": str(checkout_date or ""),
+            "due_date": due_text,
+            "return_date": str(return_date or ""),
+            "status": status,
+            "display_status": display_status,
+            "renewal_count": int(renewal_count),
+            "max_renewals": max_renewals,
+            "remaining_renewals": remaining_renewals,
+            "last_renewed_at": str(last_renewed_at or ""),
+            "default_days": default_days,
+            "fine_rate": fine_rate,
+            "allow_overdue_renewal": allow_overdue,
+            "is_overdue": is_overdue,
+            "is_due_today": is_due_today,
+            "overdue_days": overdue_days,
+            "accrued_fine": accrued_fine,
+            "carried_fine": carried_fine_val,
+            "extend_days": days,
+            "base_mode": mode_key,
+            "effective_base_mode": effective_mode,
+            "new_due_date": new_due_text,
+            "net_days_from_today": net_days_from_today,
+            "result_date_valid": result_date_valid,
+            "limit_reached": limit_reached,
+            "overdue_restricted": overdue_restricted,
+            "requires_override": requires_override,
+            "eligible": not bool(block_reason),
+            "block_reason": block_reason,
+            "warnings": warnings,
+            "history": self.get_renewal_history(_id),
+        }
+
+    def renew_loan(
+        self,
+        loan_id,
+        extend_days=None,
+        base_mode="auto",
+        fine_action="CARRY",
+        notes="",
+        allow_limit_override=False,
+    ):
+        try:
+            lid = int(loan_id)
+        except (ValueError, TypeError):
+            return False, {}, "Invalid transaction ID."
+
+        fine_action_key = self._clean(fine_action or "CARRY").upper()
+        if fine_action_key not in ("CARRY", "COLLECTED", "WAIVED", "NONE"):
+            return False, {}, f"Unsupported fine action '{fine_action_key}'."
+
+        clean_notes = self._clean(notes)[:300]
+        now_dt = datetime.datetime.now().replace(second=0, microsecond=0)
+        renewed_at = now_dt.strftime("%Y-%m-%d %H:%M")
+
+        try:
+            with self._transaction(immediate=True):
+                preview = self.get_loan_renewal_preview(
+                    lid,
+                    extend_days=extend_days,
+                    base_mode=base_mode,
+                    allow_limit_override=allow_limit_override,
+                    now=now_dt,
+                )
+                if not preview.get("found"):
+                    return False, {}, preview.get("block_reason", "Loan record not found.")
+                if not preview.get("eligible"):
+                    return False, {}, preview.get("block_reason", "Loan cannot be renewed.")
+
+                accrued_fine = float(preview["accrued_fine"])
+                carried_fine = float(preview["carried_fine"])
+                if accrued_fine <= 0:
+                    effective_fine_action = "NONE"
+                    new_fine_balance = carried_fine
+                else:
+                    if fine_action_key == "NONE":
+                        fine_action_key = "CARRY"
+                    effective_fine_action = fine_action_key
+                    if effective_fine_action == "CARRY":
+                        new_fine_balance = round(carried_fine + accrued_fine, 2)
+                    else:
+                        new_fine_balance = carried_fine
+
+                new_renewal_count = int(preview["renewal_count"]) + 1
+                previous_due = preview["due_date"]
+                new_due = preview["new_due_date"]
+                days = int(preview["extend_days"])
+                effective_base = preview["effective_base_mode"]
+
+                final_notes = clean_notes
+                if allow_limit_override and preview.get("requires_override"):
+                    prefix = "[Override]"
+                    final_notes = f"{prefix} {clean_notes}".strip() if clean_notes else prefix
+
+                cursor = self.conn.execute("""
+                    UPDATE circulation_logs
+                    SET due_date = ?,
+                        fine_amount = ?,
+                        renewal_count = ?,
+                        last_renewed_at = ?,
+                        fine_settled = CASE WHEN ? > 0 THEN 0 ELSE COALESCE(fine_settled, 0) END
+                    WHERE id = ? AND status = 'ISSUED'
+                """, (new_due, new_fine_balance, new_renewal_count, renewed_at, new_fine_balance, lid))
+                if cursor.rowcount == 0:
+                    return False, {}, "The loan is no longer active and could not be renewed."
+
+                self.conn.execute("""
+                    INSERT INTO renewal_logs(
+                        loan_id, book_id, user_id, previous_due_date, new_due_date,
+                        extended_days, base_mode, fine_assessed, fine_action, notes, renewed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    lid,
+                    preview["book_id"],
+                    preview["user_id"],
+                    previous_due,
+                    new_due,
+                    days,
+                    effective_base,
+                    accrued_fine,
+                    effective_fine_action,
+                    final_notes,
+                    renewed_at,
+                ))
+
+                if accrued_fine > 0 and effective_fine_action in ("COLLECTED", "WAIVED"):
+                    self.conn.execute("""
+                        INSERT INTO fine_payments(
+                            loan_id, book_id, user_id, amount, action, note, settled_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        lid,
+                        preview["book_id"],
+                        preview["user_id"],
+                        accrued_fine,
+                        effective_fine_action,
+                        final_notes or f"Recorded during renewal #{new_renewal_count}",
+                        renewed_at,
+                    ))
+
+                # Allow due-today and overdue reminders to evaluate cleanly for the new due date.
+                self.conn.execute(
+                    "DELETE FROM email_notifications WHERE loan_id = ?",
+                    (lid,),
+                )
+
+                email = preview.get("user_email", "")
+                if email:
+                    fine_line = ""
+                    if accrued_fine > 0:
+                        if effective_fine_action == "CARRY":
+                            fine_line = (
+                                f" Overdue fine of ₹{accrued_fine:.2f} was added to your loan "
+                                f"balance (total due on return: ₹{new_fine_balance:.2f})."
+                            )
+                        elif effective_fine_action == "COLLECTED":
+                            fine_line = (
+                                f" Overdue fine of ₹{accrued_fine:.2f} was recorded as collected."
+                            )
+                        elif effective_fine_action == "WAIVED":
+                            fine_line = (
+                                f" Overdue fine of ₹{accrued_fine:.2f} was waived upon renewal."
+                            )
+
+                    self._enqueue_email_in_transaction(
+                        email,
+                        f"Book renewed: {preview['book_title']}",
+                        (
+                            f"Hello {preview['user_name']},\n\n"
+                            f"Book '{preview['book_title']}' (Book ID: {preview['book_id']}) "
+                            f"has been renewed for +{days} day(s). Previous due date: {previous_due}. "
+                            f"New due date: {new_due}.{fine_line}\n\n"
+                            "Library"
+                        ),
+                        "ISSUE",
+                        dedupe_key=f"renew:{lid}:{new_renewal_count}",
+                    )
+
+            details = {
+                "loan_id": lid,
+                "book_id": preview["book_id"],
+                "book_title": preview["book_title"],
+                "user_id": preview["user_id"],
+                "user_name": preview["user_name"],
+                "previous_due_date": previous_due,
+                "new_due_date": new_due,
+                "extended_days": days,
+                "effective_base_mode": effective_base,
+                "renewal_count": new_renewal_count,
+                "max_renewals": preview["max_renewals"],
+                "accrued_fine": accrued_fine,
+                "carried_fine": new_fine_balance,
+                "fine_action": effective_fine_action,
+                "notes": final_notes,
+                "renewed_at": renewed_at,
+            }
+            return True, details, f"Loan #{lid} renewed successfully! New Due Date: {new_due}"
+        except Exception as exc:
+            return False, {}, self._parse_db_error(exc, "loan renewal")
+
+    def renew_book(
+        self,
+        book_id,
+        user_id,
+        extend_days=None,
+        base_mode="auto",
+        fine_action="CARRY",
+        notes="",
+        allow_limit_override=False,
+    ):
+        bid, uid = self._clean(book_id), self._clean(user_id)
+        loan_id = self.get_active_loan_id(bid, uid)
+        if loan_id is None:
+            return False, {}, (
+                f"No active issue record found matching Book ID '{bid}' and User ID '{uid}'."
+            )
+        return self.renew_loan(
+            loan_id,
+            extend_days=extend_days,
+            base_mode=base_mode,
+            fine_action=fine_action,
+            notes=notes,
+            allow_limit_override=allow_limit_override,
+        )
+
     def return_book(self, book_id, user_id):
         bid, uid = self._clean(book_id), self._clean(user_id)
         try:
@@ -1207,7 +1700,7 @@ class LocalDatabase:
 
                 policy = self.get_loan_policy(user[0])
                 record = self.conn.execute("""
-                    SELECT id, due_date FROM circulation_logs
+                    SELECT id, due_date, COALESCE(fine_amount, 0) FROM circulation_logs
                     WHERE book_id = ? AND user_id = ? AND status = 'ISSUED'
                     ORDER BY id DESC LIMIT 1
                 """, (bid, uid)).fetchone()
@@ -1216,29 +1709,30 @@ class LocalDatabase:
                         f"No active issue record found matching Book ID '{bid}' and User ID '{uid}'."
                     )
 
-                log_id, due_text = record
+                log_id, due_text, carried_fine = record
                 now = datetime.datetime.now().replace(second=0, microsecond=0)
                 fine_rate = self._money(policy.get("fine_rate", 2.0), 2.0)
-                fine = 0.0
+                overdue_fine = 0.0
                 if due_text:
-                    try:
-                        due_dt = datetime.datetime.strptime(str(due_text), "%Y-%m-%d %H:%M")
-                    except ValueError:
-                        try:
-                            due_dt = datetime.datetime.strptime(str(due_text)[:10], "%Y-%m-%d")
-                        except ValueError:
-                            due_dt = None
+                    due_dt = self._parse_circulation_datetime(due_text)
                     if due_dt and now > due_dt:
                         # Fine is charged per overdue calendar day, matching the app's date-based policy.
                         overdue_days = (now.date() - due_dt.date()).days
-                        fine = round(max(0, overdue_days) * fine_rate, 2)
+                        overdue_fine = round(max(0, overdue_days) * fine_rate, 2)
+                fine = round(max(0.0, float(carried_fine or 0.0)) + overdue_fine, 2)
 
                 returned_text = now.strftime("%Y-%m-%d %H:%M")
                 self.conn.execute("""
                     UPDATE circulation_logs
-                    SET return_date = ?, fine_amount = ?, status = 'RETURNED'
+                    SET return_date = ?,
+                        fine_amount = ?,
+                        status = 'RETURNED',
+                        fine_settled = CASE WHEN ? > 0 THEN 0 ELSE COALESCE(fine_settled, 0) END,
+                        fine_settled_at = CASE WHEN ? > 0 THEN NULL ELSE fine_settled_at END,
+                        fine_settlement_action = CASE WHEN ? > 0 THEN NULL ELSE fine_settlement_action END,
+                        fine_settlement_note = CASE WHEN ? > 0 THEN NULL ELSE fine_settlement_note END
                     WHERE id = ? AND status = 'ISSUED'
-                """, (returned_text, fine, log_id))
+                """, (returned_text, fine, fine, fine, fine, fine, log_id))
                 self.conn.execute("""
                     UPDATE books SET available_copies = MIN(total_copies, available_copies + 1)
                     WHERE id = ?
@@ -1291,6 +1785,10 @@ class LocalDatabase:
                 ).fetchone()[0]
                 if active:
                     return False, "Cannot clear circulation history while issued books exist."
+                self.conn.execute("DELETE FROM fine_payments")
+                self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'fine_payments'")
+                self.conn.execute("DELETE FROM renewal_logs")
+                self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'renewal_logs'")
                 self.conn.execute("DELETE FROM circulation_logs")
                 self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'circulation_logs'")
                 self.conn.execute("UPDATE books SET available_copies = total_copies")
@@ -1328,7 +1826,9 @@ class LocalDatabase:
                     (SELECT COUNT(*) FROM circulation_logs
                         WHERE status = 'ISSUED' AND substr(due_date, 1, 10) = ?),
                     (SELECT COALESCE(SUM(fine_amount), 0) FROM circulation_logs
-                        WHERE fine_amount > 0 AND status != 'PAID')
+                        WHERE fine_amount > 0
+                          AND COALESCE(fine_settled, 0) = 0
+                          AND UPPER(COALESCE(status, '')) != 'PAID')
             """, (today, today, today)).fetchone()
             return (*row[:8], float(row[8] or 0.0))
         except sqlite3.Error:
@@ -1522,9 +2022,473 @@ class LocalDatabase:
     def get_pending_fines_report(self):
         return self._report_query("""
             SELECT user_id, book_id, fine_amount, return_date
-            FROM circulation_logs WHERE fine_amount > 0 AND status != 'PAID'
+            FROM circulation_logs
+            WHERE fine_amount > 0
+              AND COALESCE(fine_settled, 0) = 0
+              AND UPPER(COALESCE(status, '')) != 'PAID'
             ORDER BY fine_amount DESC
         """)
+
+    def get_pending_fines_detailed(self):
+        return self._report_query("""
+            SELECT c.id,
+                   c.user_id,
+                   COALESCE(u.full_name, 'Unknown User'),
+                   c.book_id,
+                   COALESCE(b.title, 'Unknown Book'),
+                   COALESCE(c.fine_amount, 0),
+                   UPPER(COALESCE(c.status, 'ISSUED')),
+                   COALESCE(c.due_date, ''),
+                   COALESCE(c.return_date, ''),
+                   COALESCE(c.renewal_count, 0)
+            FROM circulation_logs c
+            LEFT JOIN users u ON u.id = c.user_id
+            LEFT JOIN books b ON b.id = c.book_id
+            WHERE c.fine_amount > 0
+              AND COALESCE(c.fine_settled, 0) = 0
+              AND UPPER(COALESCE(c.status, '')) != 'PAID'
+            ORDER BY c.fine_amount DESC, c.id DESC
+        """)
+
+    def get_loan_fine_settlement_meta(self, log_ids=None):
+        try:
+            if log_ids is None:
+                rows = self.conn.execute("""
+                    SELECT id,
+                           COALESCE(fine_settled, 0),
+                           COALESCE(fine_settlement_action, ''),
+                           COALESCE(fine_settled_at, ''),
+                           COALESCE(fine_settlement_note, '')
+                    FROM circulation_logs
+                """).fetchall()
+                return {
+                    int(row[0]): (
+                        int(row[1] or 0),
+                        str(row[2] or ""),
+                        str(row[3] or ""),
+                        str(row[4] or ""),
+                    )
+                    for row in rows
+                }
+
+            clean_ids = sorted({int(lid) for lid in log_ids if lid is not None})
+            result = {}
+            for offset in range(0, len(clean_ids), 500):
+                batch = clean_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self.conn.execute(f"""
+                    SELECT id,
+                           COALESCE(fine_settled, 0),
+                           COALESCE(fine_settlement_action, ''),
+                           COALESCE(fine_settled_at, ''),
+                           COALESCE(fine_settlement_note, '')
+                    FROM circulation_logs
+                    WHERE id IN ({placeholders})
+                """, batch).fetchall()
+                for row in rows:
+                    result[int(row[0])] = (
+                        int(row[1] or 0),
+                        str(row[2] or ""),
+                        str(row[3] or ""),
+                        str(row[4] or ""),
+                    )
+            return result
+        except (sqlite3.Error, ValueError, TypeError):
+            logging.exception("Could not fetch fine settlement metadata")
+            return {}
+
+    def get_user_pending_fines_total(self, user_id):
+        try:
+            row = self.conn.execute("""
+                SELECT COALESCE(SUM(fine_amount), 0)
+                FROM circulation_logs
+                WHERE user_id = ?
+                  AND fine_amount > 0
+                  AND COALESCE(fine_settled, 0) = 0
+                  AND UPPER(COALESCE(status, '')) != 'PAID'
+            """, (self._clean(user_id),)).fetchone()
+            return round(float(row[0] or 0.0), 2) if row else 0.0
+        except sqlite3.Error:
+            logging.exception("Could not fetch user pending fines total")
+            return 0.0
+
+    def settle_loan_fine(self, loan_id, action="PAID", note=""):
+        try:
+            lid = int(loan_id)
+        except (ValueError, TypeError):
+            return False, "Invalid transaction ID."
+
+        action_key = self._clean(action or "PAID").upper()
+        if action_key not in ("PAID", "WAIVED"):
+            return False, f"Unsupported fine settlement action '{action_key}'."
+
+        clean_note = self._clean(note)[:300]
+        now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        try:
+            with self._transaction(immediate=True):
+                row = self.conn.execute("""
+                    SELECT id, book_id, user_id, COALESCE(fine_amount, 0),
+                           COALESCE(fine_settled, 0), UPPER(COALESCE(status, ''))
+                    FROM circulation_logs
+                    WHERE id = ?
+                """, (lid,)).fetchone()
+                if not row:
+                    return False, f"Transaction #{lid} was not found."
+
+                amount = round(float(row[3] or 0.0), 2)
+                already_settled = int(row[4] or 0) == 1 or row[5] == "PAID"
+                if amount <= 0:
+                    return False, f"Transaction #{lid} has no recorded fine balance."
+                if already_settled:
+                    return False, f"Transaction #{lid} fine has already been settled."
+
+                self.conn.execute("""
+                    UPDATE circulation_logs
+                    SET fine_settled = 1,
+                        fine_settled_at = ?,
+                        fine_settlement_action = ?,
+                        fine_settlement_note = ?
+                    WHERE id = ?
+                """, (now_text, action_key, clean_note, lid))
+
+                self.conn.execute("""
+                    INSERT INTO fine_payments(
+                        loan_id, book_id, user_id, amount, action, note, settled_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (lid, row[1], row[2], amount, action_key, clean_note, now_text))
+
+            verb = "collected" if action_key == "PAID" else "waived"
+            return True, f"Fine of ₹{amount:.2f} marked as {verb} for transaction #{lid}."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "fine settlement")
+
+    def settle_all_user_fines(self, user_id, action="PAID", note=""):
+        uid = self._clean(user_id)
+        if not uid:
+            return False, "User ID is required."
+
+        action_key = self._clean(action or "PAID").upper()
+        if action_key not in ("PAID", "WAIVED"):
+            return False, f"Unsupported fine settlement action '{action_key}'."
+
+        clean_note = self._clean(note)[:300]
+        now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        try:
+            with self._transaction(immediate=True):
+                rows = self.conn.execute("""
+                    SELECT id, book_id, user_id, COALESCE(fine_amount, 0)
+                    FROM circulation_logs
+                    WHERE user_id = ?
+                      AND fine_amount > 0
+                      AND COALESCE(fine_settled, 0) = 0
+                      AND UPPER(COALESCE(status, '')) != 'PAID'
+                    ORDER BY id
+                """, (uid,)).fetchall()
+                if not rows:
+                    return False, f"No unpaid fines found for user '{uid}'."
+
+                total = 0.0
+                for lid, bid, row_uid, amount in rows:
+                    amt = round(float(amount or 0.0), 2)
+                    total += amt
+                    self.conn.execute("""
+                        UPDATE circulation_logs
+                        SET fine_settled = 1,
+                            fine_settled_at = ?,
+                            fine_settlement_action = ?,
+                            fine_settlement_note = ?
+                        WHERE id = ?
+                    """, (now_text, action_key, clean_note, lid))
+                    self.conn.execute("""
+                        INSERT INTO fine_payments(
+                            loan_id, book_id, user_id, amount, action, note, settled_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (lid, bid, row_uid, amt, action_key, clean_note, now_text))
+
+            verb = "collected" if action_key == "PAID" else "waived"
+            return True, f"{len(rows)} fine(s) totaling ₹{total:.2f} marked as {verb} for {uid}."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "bulk fine settlement")
+
+    def get_fine_payment_history(self, loan_id=None, limit=200):
+        try:
+            limit = max(1, min(int(limit), 1000))
+            if loan_id is not None:
+                rows = self.conn.execute("""
+                    SELECT id, loan_id, book_id, user_id, amount, action, COALESCE(note, ''), settled_at
+                    FROM fine_payments
+                    WHERE loan_id = ?
+                    ORDER BY id DESC LIMIT ?
+                """, (int(loan_id), limit)).fetchall()
+            else:
+                rows = self.conn.execute("""
+                    SELECT id, loan_id, book_id, user_id, amount, action, COALESCE(note, ''), settled_at
+                    FROM fine_payments
+                    ORDER BY id DESC LIMIT ?
+                """, (limit,)).fetchall()
+            return [
+                {
+                    "id": int(r[0]),
+                    "loan_id": int(r[1]),
+                    "book_id": str(r[2] or ""),
+                    "user_id": str(r[3] or ""),
+                    "amount": round(float(r[4] or 0.0), 2),
+                    "action": str(r[5] or ""),
+                    "note": str(r[6] or ""),
+                    "settled_at": str(r[7] or ""),
+                }
+                for r in rows
+            ]
+        except (sqlite3.Error, ValueError, TypeError):
+            logging.exception("Could not fetch fine payment history")
+            return []
+
+    def get_fines_financial_summary(self, start_date=None, end_date=None):
+        summary = {
+            "pending_fines": 0.0,
+            "settled_paid": 0.0,
+            "collected_on_renewal": 0.0,
+            "waived_total": 0.0,
+            "total_collected": 0.0,
+            "daily_collections": {},
+        }
+        try:
+            pending_row = self.conn.execute("""
+                SELECT COALESCE(SUM(fine_amount), 0)
+                FROM circulation_logs
+                WHERE fine_amount > 0
+                  AND COALESCE(fine_settled, 0) = 0
+                  AND UPPER(COALESCE(status, '')) != 'PAID'
+            """).fetchone()
+            summary["pending_fines"] = round(float(pending_row[0] or 0.0), 2) if pending_row else 0.0
+
+            params = []
+            where = ""
+            if start_date and end_date:
+                where = "WHERE substr(settled_at, 1, 10) BETWEEN ? AND ?"
+                params = [str(start_date)[:10], str(end_date)[:10]]
+
+            rows = self.conn.execute(f"""
+                SELECT action, COALESCE(amount, 0), substr(settled_at, 1, 10)
+                FROM fine_payments
+                {where}
+            """, params).fetchall()
+            daily = {}
+            for action, amount, day in rows:
+                amt = round(float(amount or 0.0), 2)
+                act = str(action or "").upper()
+                if act == "PAID":
+                    summary["settled_paid"] = round(summary["settled_paid"] + amt, 2)
+                    if day:
+                        daily[day] = round(daily.get(day, 0.0) + amt, 2)
+                elif act == "COLLECTED":
+                    summary["collected_on_renewal"] = round(
+                        summary["collected_on_renewal"] + amt, 2
+                    )
+                    if day:
+                        daily[day] = round(daily.get(day, 0.0) + amt, 2)
+                elif act == "WAIVED":
+                    summary["waived_total"] = round(summary["waived_total"] + amt, 2)
+
+            summary["total_collected"] = round(
+                summary["settled_paid"] + summary["collected_on_renewal"], 2
+            )
+            summary["daily_collections"] = daily
+            return summary
+        except sqlite3.Error:
+            logging.exception("Could not fetch fines financial summary")
+            return summary
+
+    def get_renewal_analytics(self, start_date=None, end_date=None):
+        analytics = {
+            "total_renewals": 0,
+            "total_extended_days": 0,
+            "unique_loans_renewed": 0,
+            "daily_renewals": {},
+        }
+        try:
+            params = []
+            where = ""
+            if start_date and end_date:
+                where = "WHERE substr(renewed_at, 1, 10) BETWEEN ? AND ?"
+                params = [str(start_date)[:10], str(end_date)[:10]]
+
+            rows = self.conn.execute(f"""
+                SELECT loan_id, COALESCE(extended_days, 0), substr(renewed_at, 1, 10)
+                FROM renewal_logs
+                {where}
+                ORDER BY renewed_at ASC
+            """, params).fetchall()
+
+            unique_loans = set()
+            daily = {}
+            total_days = 0
+            for loan_id, ext_days, day in rows:
+                unique_loans.add(int(loan_id))
+                total_days += max(0, int(ext_days or 0))
+                if day:
+                    daily[day] = daily.get(day, 0) + 1
+
+            analytics["total_renewals"] = len(rows)
+            analytics["total_extended_days"] = total_days
+            analytics["unique_loans_renewed"] = len(unique_loans)
+            analytics["daily_renewals"] = daily
+            return analytics
+        except sqlite3.Error:
+            logging.exception("Could not fetch renewal analytics")
+            return analytics
+
+    def get_circulation_log_details(self, loan_id):
+        try:
+            lid = int(loan_id)
+        except (ValueError, TypeError):
+            return None
+
+        try:
+            row = self.conn.execute("""
+                SELECT c.id,
+                       c.book_id,
+                       COALESCE(b.title, 'Unknown Book'),
+                       COALESCE(b.author, ''),
+                       c.user_id,
+                       COALESCE(u.full_name, 'Unknown User'),
+                       COALESCE(u.role, 'Student'),
+                       COALESCE(u.department, ''),
+                       COALESCE(c.checkout_date, ''),
+                       COALESCE(c.due_date, ''),
+                       COALESCE(c.return_date, ''),
+                       COALESCE(c.fine_amount, 0),
+                       UPPER(COALESCE(c.status, 'ISSUED')),
+                       COALESCE(c.renewal_count, 0),
+                       COALESCE(c.last_renewed_at, ''),
+                       COALESCE(c.fine_settled, 0),
+                       COALESCE(c.fine_settlement_action, ''),
+                       COALESCE(c.fine_settled_at, ''),
+                       COALESCE(c.fine_settlement_note, '')
+                FROM circulation_logs c
+                LEFT JOIN books b ON b.id = c.book_id
+                LEFT JOIN users u ON u.id = c.user_id
+                WHERE c.id = ?
+            """, (lid,)).fetchone()
+            if not row:
+                return None
+
+            (
+                _id, book_id, book_title, book_author,
+                user_id, user_name, user_role, user_department,
+                checkout_date, due_date, return_date,
+                fine_amount, raw_status,
+                renewal_count, last_renewed_at,
+                fine_settled, fine_action, fine_settled_at, fine_note,
+            ) = row
+
+            today = datetime.date.today().isoformat()
+            due_text = str(due_date or "")
+            if raw_status == "ISSUED" and due_text and due_text[:10] < today:
+                display_status = "OVERDUE"
+            elif raw_status == "ISSUED" and due_text and due_text[:10] == today:
+                display_status = "DUE TODAY"
+            else:
+                display_status = raw_status
+
+            return {
+                "log_id": int(_id),
+                "book_id": str(book_id or ""),
+                "book_title": str(book_title or "Unknown Book"),
+                "book_author": str(book_author or ""),
+                "user_id": str(user_id or ""),
+                "user_name": str(user_name or "Unknown User"),
+                "user_role": str(user_role or "Student"),
+                "user_department": str(user_department or ""),
+                "checkout_date": str(checkout_date or ""),
+                "due_date": due_text,
+                "return_date": str(return_date or ""),
+                "fine_amount": round(float(fine_amount or 0.0), 2),
+                "raw_status": raw_status,
+                "status": display_status,
+                "renewal_count": int(renewal_count or 0),
+                "max_renewals": self.get_max_renewals(),
+                "last_renewed_at": str(last_renewed_at or ""),
+                "fine_settled": bool(int(fine_settled or 0) == 1 or raw_status == "PAID"),
+                "fine_settlement_action": str(fine_action or ""),
+                "fine_settled_at": str(fine_settled_at or ""),
+                "fine_settlement_note": str(fine_note or ""),
+                "renewal_history": self.get_renewal_history(_id),
+                "fine_payment_history": self.get_fine_payment_history(_id),
+            }
+        except sqlite3.Error:
+            logging.exception("Could not fetch circulation log details for %s", loan_id)
+            return None
+
+    def get_activity_history_entries(self, limit=5000):
+        try:
+            limit = max(1, min(int(limit), 10000))
+            today = datetime.date.today().isoformat()
+            rows = self.conn.execute("""
+                SELECT c.id,
+                       UPPER(COALESCE(c.status, 'ISSUED')),
+                       COALESCE(b.title, 'Unknown Book') || ' [ID: ' ||
+                           COALESCE(c.book_id, 'N/A') || ']',
+                       COALESCE(u.full_name, 'Unknown User') || ' (' ||
+                           COALESCE(c.user_id, 'N/A') || ')',
+                       CASE
+                           WHEN UPPER(COALESCE(c.status, '')) = 'RETURNED'
+                               THEN COALESCE(c.return_date, c.checkout_date, 'N/A')
+                           WHEN COALESCE(c.last_renewed_at, '') != ''
+                               THEN c.last_renewed_at
+                           ELSE COALESCE(c.checkout_date, 'N/A')
+                       END,
+                       COALESCE(c.renewal_count, 0),
+                       COALESCE(c.fine_amount, 0),
+                       COALESCE(c.fine_settled, 0),
+                       COALESCE(c.fine_settlement_action, ''),
+                       COALESCE(c.book_id, ''),
+                       COALESCE(c.user_id, ''),
+                       COALESCE(c.due_date, '')
+                FROM circulation_logs c
+                LEFT JOIN books b ON c.book_id = b.id
+                LEFT JOIN users u ON c.user_id = u.id
+                ORDER BY c.id DESC LIMIT ?
+            """, (limit,)).fetchall()
+
+            entries = []
+            for row in rows:
+                (
+                    lid, raw_status, book_label, user_label, ts,
+                    ren_count, fine_amt, fine_settled, fine_act,
+                    bid, uid, due_date,
+                ) = row
+                due_text = str(due_date or "")
+                if raw_status == "ISSUED" and due_text and due_text[:10] < today:
+                    status_label = "OVERDUE"
+                elif raw_status == "ISSUED" and due_text and due_text[:10] == today:
+                    status_label = "DUE TODAY"
+                else:
+                    status_label = raw_status
+
+                entries.append({
+                    "log_id": int(lid),
+                    "raw_status": raw_status,
+                    "status": status_label,
+                    "book_label": str(book_label or ""),
+                    "user_label": str(user_label or ""),
+                    "timestamp": str(ts or ""),
+                    "renewal_count": int(ren_count or 0),
+                    "fine_amount": round(float(fine_amt or 0.0), 2),
+                    "fine_settled": bool(int(fine_settled or 0) == 1 or raw_status == "PAID"),
+                    "fine_settlement_action": str(fine_act or ""),
+                    "book_id": str(bid or ""),
+                    "user_id": str(uid or ""),
+                    "due_date": due_text,
+                })
+            return True, entries
+        except (sqlite3.Error, ValueError, TypeError):
+            logging.exception("Could not fetch activity history entries")
+            return False, []
 
     def _report_query(self, query, params=()):
         try:
@@ -1533,21 +2497,10 @@ class LocalDatabase:
             logging.exception("Could not generate report")
             return False, []
 
-    def get_all_user_departments(self):
-        try:
-            rows = self.conn.execute("""
-                SELECT department FROM users
-                WHERE department IS NOT NULL AND TRIM(department) != ''
-                UNION
-                SELECT name FROM departments
-            """).fetchall()
-            excluded = {"N/A", "GENERAL ADMINISTRATION"}
-            values = {self._clean(row[0]) for row in rows
-                      if row[0] and self._clean(row[0]).upper() not in excluded}
-            return sorted(values, key=str.casefold)
-        except sqlite3.Error:
-            logging.exception("Could not fetch user departments")
-            return []
+    def get_all_user_departments(self, role_filter=None):
+        if self._clean(role_filter).upper() == "STUDENT":
+            return self.get_departments("STUDENT")
+        return self.get_departments("FACULTY")
 
     # IMPORT / EXPORT
     def import_books_batch(self, books_data: list):
@@ -1610,7 +2563,6 @@ class LocalDatabase:
             return True, 0
         try:
             normalized = []
-            departments_to_register = {}
             seen_ids = set()
             seen_phones = set()
             for row in users_data:
@@ -1634,39 +2586,10 @@ class LocalDatabase:
                 if phone_key:
                     seen_phones.add(phone_key)
                 department = self._clean(dept)
-                role_key = role.casefold()
-                department_category = (
-                    "STUDENT"
-                    if "student" in role_key
-                    else "FACULTY"
-                    if any(
-                        kind in role_key
-                        for kind in ("faculty", "staff", "guest")
-                    )
-                    else None
-                )
-                if (
-                    department_category
-                    and department
-                    and department.casefold() not in {
-                        "general",
-                        "general administration",
-                        "n/a",
-                    }
-                ):
-                    departments_to_register.setdefault(
-                        department.casefold(),
-                        (department, department_category),
-                    )
                 normalized.append((uid, name, self._clean(phone) or None, role,
                                    department, self._clean(email).casefold() or None,
                                    created or datetime.date.today().isoformat()))
             with self._transaction(immediate=True):
-                self.conn.executemany("""
-                    INSERT INTO departments(name, category, duration_years)
-                    VALUES (?, ?, 3)
-                    ON CONFLICT(name) DO NOTHING
-                """, list(departments_to_register.values()))
                 new_user_ids = {
                     row[0]
                     for row in normalized

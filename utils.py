@@ -12,10 +12,62 @@ USER_ROLES = {
     "admin": "Admin",
 }
 
+COLLEGE_BRANCHES = (
+    ("CSE (Computer Science & Engineering)", 3),
+    ("ECE (Electronics & Communication)", 3),
+    ("EEE (Electrical & Electronics)", 3),
+    ("Advanced Manufacturing Technology (AMT)", 3),
+    ("Electrical Engineering and Electric Vehicle Technology", 3),
+    ("Interior Design (ID)", 3),
+    ("Civil Engineering", 3),
+    ("Mechanical Engineering", 3),
+    ("Automobile Engineering", 3),
+    ("Pharmacy", 2),
+)
+
+FACULTY_ADDITIONAL_DEPARTMENTS = (
+    ("Sciences & Humanities Department", 3),
+    ("General Administration", 3),
+)
+
+COLLEGE_BRANCH_NAMES = tuple(name for name, _ in COLLEGE_BRANCHES)
+FACULTY_ADDITIONAL_DEPARTMENT_NAMES = tuple(
+    name for name, _ in FACULTY_ADDITIONAL_DEPARTMENTS
+)
+
+_STUDENT_DEPARTMENT_ALIASES = {
+    name.casefold(): name for name in COLLEGE_BRANCH_NAMES
+}
+
+_FACULTY_DEPARTMENT_ALIASES = {
+    **_STUDENT_DEPARTMENT_ALIASES,
+    **{name.casefold(): name for name in FACULTY_ADDITIONAL_DEPARTMENT_NAMES},
+    "humanities & science department": "Sciences & Humanities Department",
+    "humanities and science department": "Sciences & Humanities Department",
+    "sciences and humanities department": "Sciences & Humanities Department",
+    "general administration department": "General Administration",
+    "general adminstration department": "General Administration",
+}
+
 
 def normalize_user_role(role):
     """Return a canonical supported role, or None for an unknown role."""
     return USER_ROLES.get(str(role or "").strip().casefold())
+
+
+def normalize_department_for_role(department, role):
+    """Return the canonical college branch/department allowed for a role, or None."""
+    key = " ".join(str(department or "").split()).casefold()
+    if not key:
+        return None
+    canonical_role = normalize_user_role(role)
+    if canonical_role == "Student":
+        return _STUDENT_DEPARTMENT_ALIASES.get(key)
+    if canonical_role in ("Faculty", "Guest Lecturer"):
+        return _FACULTY_DEPARTMENT_ALIASES.get(key)
+    if canonical_role in ("Admin", "Librarian"):
+        return _FACULTY_DEPARTMENT_ALIASES.get(key, "General Administration")
+    return None
 
 
 def is_valid_book_id(book_id):
@@ -32,7 +84,7 @@ def is_valid_user_id(user_id, role):
     if canonical_role == "Student":
         return re.fullmatch(r"[0-9]{5}-[A-Za-z]{2}-[0-9]{3}", value) is not None
     if canonical_role:
-        return re.fullmatch(r"[A-Za-z]{2}[0-9]{6}", value) is not None
+        return re.fullmatch(r"[0-9]{6}", value) is not None
     return False
 
 
@@ -80,6 +132,7 @@ def clear_layout(layout):
         child_layout = item.layout()
 
         if widget is not None:
+            widget.hide()
             widget.setParent(None)
             widget.deleteLater()
         elif child_layout is not None:

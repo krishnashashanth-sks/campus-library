@@ -10,7 +10,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from PyQt6.QtCore import QEvent, QItemSelectionModel, QPoint, Qt
+from PyQt6.QtCore import QEvent, QItemSelectionModel, QPoint, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -33,6 +33,8 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QComboBox,
     QAbstractItemView,
+    QScrollArea,
+    QSplitter,
     QTabWidget,
 )
 
@@ -44,10 +46,19 @@ from dialogs import (
     BatchCirculationDialog,
     CustomEmailDialog,
 )
+from ui_responsive import (
+    FlowLayout,
+    configure_inspector_button,
+    configure_inspector_form,
+    configure_wrapped_label,
+    make_scrollable_tab,
+    sync_responsive_splitter,
+)
 from utils import (
     clear_layout,
     is_valid_phone_number,
     is_valid_user_id,
+    normalize_department_for_role,
     normalize_user_role,
     rgba_color,
 )
@@ -68,6 +79,7 @@ class ClickableMetricCard(QFrame):
         accent="#3B82F6",
         on_click_callback=None,
         parent=None,
+        colors=None,
     ):
         super().__init__(parent)
 
@@ -75,22 +87,23 @@ class ClickableMetricCard(QFrame):
         self.accent = accent
         self.on_click_callback = on_click_callback
         self.selected = False
+        self._colors = colors or {}
 
         self.setObjectName("MetricCard")
         self.setCursor(
             QCursor(Qt.CursorShape.PointingHandCursor)
         )
 
-        self.setMinimumHeight(100)
+        self.setMinimumHeight(60)
         self.setSizePolicy(
             QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
         )
         self.setMinimumWidth(0)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(4)
+        layout.setContentsMargins(11, 5, 11, 5)
+        layout.setSpacing(2)
 
         self.lbl_title = QLabel(title)
         self.lbl_title.setObjectName("MetricTitle")
@@ -108,34 +121,67 @@ class ClickableMetricCard(QFrame):
         layout.addWidget(self.lbl_title)
         layout.addWidget(self.lbl_value)
 
-        self.apply_style()
+        self.apply_style(self._colors)
+
+    def minimumSizeHint(self):
+        return QSize(0, self.minimumHeight())
 
     def set_value(self, value):
         self.lbl_value.setText(str(value))
 
     def set_selected(self, selected):
         self.selected = bool(selected)
-        self.apply_style()
+        self.apply_style(self._colors)
 
-    def apply_style(self):
-        background = rgba_color(
+    def set_accent(self, accent, colors=None):
+        if accent:
+            self.accent = accent
+        if colors is not None:
+            self._colors = colors
+        self.apply_style(self._colors)
+
+    def apply_style(self, colors=None):
+        if colors is not None:
+            self._colors = colors
+        c = self._colors or {}
+        is_dark = QColor(c.get("window", "#090E1A")).lightness() < 128
+        muted = c.get("muted", "#9BB0CE")
+        bg_start = rgba_color(
             self.accent,
-            0.20 if self.selected else 0.09,
+            (0.25 if self.selected else 0.14)
+            if is_dark
+            else (0.42 if self.selected else 0.30),
         )
+        bg_end = rgba_color(
+            self.accent,
+            (0.12 if self.selected else 0.04)
+            if is_dark
+            else (0.20 if self.selected else 0.14),
+        )
+        hover_start = rgba_color(self.accent, 0.28 if is_dark else 0.46)
+        hover_end = rgba_color(self.accent, 0.12 if is_dark else 0.22)
         border = self.accent if self.selected else rgba_color(
             self.accent,
-            0.48,
+            0.52 if is_dark else 0.65,
         )
 
         self.setStyleSheet(f"""
             QFrame#MetricCard {{
-                background-color: {background};
-                border: 1px solid {border};
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {bg_start}, stop:1 {bg_end}
+                );
+                border: {2 if self.selected else 1}px solid {border};
                 border-left: 4px solid {self.accent};
-                border-radius: 10px;
+                border-radius: 11px;
             }}
 
             QFrame#MetricCard:hover {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {hover_start},
+                    stop:1 {hover_end}
+                );
                 border: 2px solid {self.accent};
                 border-left: 5px solid {self.accent};
             }}
@@ -144,14 +190,15 @@ class ClickableMetricCard(QFrame):
                 background: transparent;
                 border: none;
                 font-size: 10px;
-                font-weight: 700;
-                color: palette(placeholder-text);
+                font-weight: 800;
+                letter-spacing: 0.6px;
+                color: {muted};
             }}
 
             QLabel#MetricValue {{
                 background: transparent;
                 border: none;
-                font-size: 23px;
+                font-size: 20px;
                 font-weight: 800;
                 color: {self.accent};
             }}
@@ -175,34 +222,76 @@ class UserManagementView(QWidget):
 
     COLORS = {
         "Dark": {
-            "window": "#0B1220",
-            "surface": "#111C2E",
-            "surface_alt": "#17243A",
-            "input": "#0F1B2D",
-            "border": "#293B55",
-            "text": "#E8EEF8",
-            "muted": "#94A3B8",
+            "window": "#090E1A",
+            "surface": "#111A2E",
+            "surface_alt": "#182542",
+            "surface_elevated": "#1F2F52",
+            "input": "#0C1426",
+            "border": "#28385C",
+            "border_bright": "#384F82",
+            "text": "#F8FAFC",
+            "muted": "#9BB0CE",
             "primary": "#3B82F6",
             "primary_hover": "#2563EB",
-            "success": "#16A34A",
-            "warning": "#D97706",
-            "danger": "#DC2626",
-            "selection": "#1D4ED8",
+            "primary_soft": "rgba(59, 130, 246, 0.16)",
+            "selection": "#2563EB",
+            "indigo": "#818CF8",
+            "indigo_hover": "#6366F1",
+            "indigo_soft": "rgba(129, 140, 248, 0.16)",
+            "cyan": "#22D3EE",
+            "cyan_hover": "#06B6D4",
+            "cyan_soft": "rgba(34, 211, 238, 0.16)",
+            "teal": "#2DD4BF",
+            "purple": "#A78BFA",
+            "purple_soft": "rgba(167, 139, 250, 0.16)",
+            "success": "#10B981",
+            "success_hover": "#059669",
+            "success_soft": "rgba(16, 185, 129, 0.16)",
+            "warning": "#F59E0B",
+            "warning_hover": "#D97706",
+            "warning_soft": "rgba(245, 158, 11, 0.16)",
+            "danger": "#F43F5E",
+            "danger_hover": "#E11D48",
+            "danger_soft": "rgba(244, 63, 94, 0.16)",
+            "table_row": "#0F182B",
+            "table_alt": "#142038",
+            "header_bg": "#182745",
         },
         "Light": {
-            "window": "#F3F6FB",
-            "surface": "#FFFFFF",
-            "surface_alt": "#EAF0F8",
-            "input": "#FFFFFF",
-            "border": "#D5DEEA",
-            "text": "#172033",
-            "muted": "#64748B",
-            "primary": "#2563EB",
-            "primary_hover": "#1D4ED8",
-            "success": "#15803D",
+            "window": "#D2DFEF",
+            "surface": "#E3ECF9",
+            "surface_alt": "#CFDDF3",
+            "surface_elevated": "#BED0EC",
+            "input": "#DAE6F7",
+            "border": "#88A4CE",
+            "border_bright": "#5A7CB2",
+            "text": "#0A1628",
+            "muted": "#283D5E",
+            "primary": "#1D4ED8",
+            "primary_hover": "#1E40AF",
+            "primary_soft": "rgba(29, 78, 216, 0.20)",
+            "selection": "#1D4ED8",
+            "indigo": "#4338CA",
+            "indigo_hover": "#3730A3",
+            "indigo_soft": "rgba(67, 56, 202, 0.20)",
+            "cyan": "#0369A1",
+            "cyan_hover": "#075985",
+            "cyan_soft": "rgba(3, 105, 161, 0.20)",
+            "teal": "#0F766E",
+            "purple": "#6D28D9",
+            "purple_soft": "rgba(109, 40, 217, 0.20)",
+            "success": "#047857",
+            "success_hover": "#065F46",
+            "success_soft": "rgba(4, 120, 87, 0.20)",
             "warning": "#B45309",
-            "danger": "#B91C1C",
-            "selection": "#DBEAFE",
+            "warning_hover": "#92400E",
+            "warning_soft": "rgba(180, 83, 9, 0.22)",
+            "danger": "#BE123C",
+            "danger_hover": "#9F1239",
+            "danger_soft": "rgba(190, 18, 60, 0.20)",
+            "table_row": "#E4EDF9",
+            "table_alt": "#D6E3F6",
+            "header_bg": "#C0D3EE",
         },
     }
 
@@ -233,6 +322,10 @@ class UserManagementView(QWidget):
         self.filtered_users: List[Tuple] = []
 
         self.current_filter = "ALL"
+        self._page_compact = None
+        self._header_compact = None
+        self._toolbar_compact = None
+        self._splitter_vertical = None
         self._metrics_columns = None
         self._compact_layout = None
         self._table_compact_mode = None
@@ -378,7 +471,17 @@ class UserManagementView(QWidget):
 
         theme = self.get_active_theme()
 
-        self.colors = self.COLORS[theme]
+        merged = dict(self.COLORS.get(theme, self.COLORS["Dark"]))
+        manager = self.theme_manager or self.get_theme_manager()
+        if manager and hasattr(manager, "COLORS"):
+            try:
+                tm_colors = manager.COLORS.get(theme)
+                if tm_colors:
+                    merged.update(tm_colors)
+            except Exception:
+                pass
+
+        self.colors = merged
         c = self.colors
 
         self.setStyleSheet(f"""
@@ -389,6 +492,19 @@ class UserManagementView(QWidget):
                 font-size: 12px;
             }}
 
+            QWidget#UserPageContent {{
+                background-color: transparent;
+            }}
+
+            QSplitter#UserSplitter::handle {{
+                background: {c["border"]};
+                border-radius: 3px;
+            }}
+
+            QSplitter#UserSplitter::handle:hover {{
+                background: {c["primary"]};
+            }}
+
             QLabel {{
                 color: {c["text"]};
                 background: transparent;
@@ -397,7 +513,7 @@ class UserManagementView(QWidget):
 
             QLabel#PageTitle {{
                 font-size: 23px;
-                font-weight: 700;
+                font-weight: 800;
                 color: {c["text"]};
             }}
 
@@ -409,31 +525,36 @@ class UserManagementView(QWidget):
             QLabel#SectionTitle {{
                 font-size: 14px;
                 font-weight: 700;
-                color: {c["text"]};
+                color: {c["primary"]};
             }}
 
-            QFrame#MetricCard {{
-                background-color: {c["surface"]};
-                border: 1px solid {c["border"]};
-                border-radius: 10px;
-            }}
-
-            QLabel#MetricTitle {{
-                color: {c["muted"]};
-                font-size: 10px;
+            QLabel#CountLabel {{
+                background-color: {c["primary_soft"]};
+                color: {c["primary"]};
+                border: 1px solid {rgba_color(c["primary"], 0.35)};
+                border-radius: 9px;
+                padding: 0px 12px;
+                min-height: 26px;
+                max-height: 26px;
+                font-size: 11px;
                 font-weight: 700;
             }}
 
             QFrame#ToolbarCard,
+            QFrame#FilterBar,
             QFrame#InspectorCard {{
                 background-color: {c["surface"]};
-                border: 1px solid {c["border"]};
-                border-radius: 10px;
+                border: 1.5px solid {c["border"]};
+                border-radius: 11px;
+            }}
+
+            QFrame#InspectorCard {{
+                border-top: 3px solid {c["primary"]};
             }}
 
             QFrame#UserHoverPreview {{
                 background-color: {c["surface"]};
-                border: 1px solid {c["border"]};
+                border: 1.5px solid {c["border_bright"]};
                 border-left: 4px solid {c["primary"]};
                 border-radius: 10px;
             }}
@@ -466,16 +587,17 @@ class UserManagementView(QWidget):
             QComboBox {{
                 background-color: {c["input"]};
                 color: {c["text"]};
-                border: 1px solid {c["border"]};
-                border-radius: 7px;
-                padding: 8px 10px;
-                min-height: 20px;
+                border: 1.5px solid {c["border"]};
+                border-radius: 8px;
+                padding: 5px 9px;
+                min-height: 18px;
                 selection-background-color: {c["selection"]};
+                selection-color: #FFFFFF;
             }}
 
             QLineEdit:focus,
             QComboBox:focus {{
-                border: 1px solid {c["primary"]};
+                border: 1.5px solid {c["primary"]};
             }}
 
             QComboBox::drop-down {{
@@ -486,9 +608,9 @@ class UserManagementView(QWidget):
             QComboBox QAbstractItemView {{
                 background-color: {c["surface"]};
                 color: {c["text"]};
-                border: 1px solid {c["border"]};
+                border: 1px solid {c["border_bright"]};
                 selection-background-color: {c["selection"]};
-                selection-color: {c["text"]};
+                selection-color: #FFFFFF;
                 border-radius: 6px;
                 padding: 4px;
             }}
@@ -496,14 +618,15 @@ class UserManagementView(QWidget):
             QPushButton {{
                 background-color: {c["surface_alt"]};
                 color: {c["text"]};
-                border: 1px solid {c["border"]};
-                border-radius: 7px;
-                padding: 8px 12px;
+                border: 1px solid {c["border_bright"]};
+                border-radius: 8px;
+                padding: 5px 12px;
                 font-size: 12px;
                 font-weight: 600;
             }}
 
             QPushButton:hover {{
+                background-color: {c["surface_elevated"]};
                 border-color: {c["primary"]};
             }}
 
@@ -514,54 +637,158 @@ class UserManagementView(QWidget):
             }}
 
             QPushButton#PrimaryButton {{
-                background-color: {c["primary"]};
-                color: white;
-                border: none;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["primary"]};
+                font-weight: 700;
             }}
 
             QPushButton#PrimaryButton:hover {{
-                background-color: {c["primary_hover"]};
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary_hover"]}, stop:1 {c["indigo_hover"]}
+                );
+            }}
+
+            QPushButton#SuccessButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["success"]}, stop:1 {c["teal"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["success"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#SuccessButton:hover {{
+                background-color: {c["success_hover"]};
+            }}
+
+            QPushButton#InfoButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["cyan"]}, stop:1 {c["primary"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["cyan"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#InfoButton:hover {{
+                background-color: {c["cyan_hover"]};
+            }}
+
+            QPushButton#WarningButton {{
+                background-color: {c["warning"]};
+                color: #FFFFFF;
+                border: 1px solid {c["warning"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#WarningButton:hover {{
+                background-color: {c["warning_hover"]};
+            }}
+
+            QPushButton#SecondaryButton {{
+                background-color: {c["surface_alt"]};
+                color: {c["text"]};
+                border: 1px solid {c["border_bright"]};
+            }}
+
+            QPushButton#SecondaryButton:hover {{
+                background-color: {c["surface_elevated"]};
+                border-color: {c["primary"]};
+                color: {c["primary"]};
             }}
 
             QPushButton#DangerButton {{
-                background-color: rgba(220, 38, 38, 0.12);
+                background-color: {c["danger_soft"]};
                 color: {c["danger"]};
-                border: 1px solid {c["danger"]};
+                border: 1px solid {rgba_color(c["danger"], 0.65)};
+                font-weight: 700;
             }}
 
             QPushButton#DangerButton:hover {{
                 background-color: {c["danger"]};
-                color: white;
+                color: #FFFFFF;
+                border-color: {c["danger"]};
             }}
 
             QPushButton#FilterButton {{
-                background: transparent;
-                color: {c["muted"]};
-                border: 1px solid transparent;
-                padding: 7px 11px;
+                background: {c["surface_alt"]};
+                color: {c["text"]};
+                border: 1px solid {c["border_bright"]};
+                border-radius: 7px;
+                padding: 0px 11px;
+                min-height: 26px;
+                max-height: 26px;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+
+            QFrame#FilterBar QComboBox {{
+                padding: 0px 9px;
+                min-height: 25px;
+                max-height: 25px;
+                font-size: 11px;
             }}
 
             QPushButton#FilterButton:hover {{
-                background-color: {c["surface_alt"]};
+                background-color: {c["surface_elevated"]};
                 color: {c["text"]};
-            }}
-
-            QPushButton#FilterButton:checked {{
-                background-color: {c["primary"]};
-                color: white;
                 border-color: {c["primary"]};
             }}
 
+            QPushButton#FilterButton[filterRole="ALL"]:checked {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
+                border-color: {c["primary"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#FilterButton[filterRole="STUDENT"]:checked {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["success"]}, stop:1 {c["teal"]}
+                );
+                color: #FFFFFF;
+                border-color: {c["success"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#FilterButton[filterRole="FACULTY"]:checked {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["cyan"]}, stop:1 {c["primary"]}
+                );
+                color: #FFFFFF;
+                border-color: {c["cyan"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#FilterButton[filterRole="GUEST"]:checked {{
+                background-color: {c["warning"]};
+                color: #FFFFFF;
+                border-color: {c["warning"]};
+                font-weight: 700;
+            }}
+
             QTableWidget {{
-                background-color: {c["surface"]};
-                alternate-background-color: {c["surface_alt"]};
+                background-color: {c["table_row"]};
+                alternate-background-color: {c["table_alt"]};
                 color: {c["text"]};
                 border: 1px solid {c["border"]};
                 border-radius: 10px;
                 gridline-color: {c["border"]};
                 outline: none;
                 selection-background-color: {c["selection"]};
-                selection-color: {c["text"]};
+                selection-color: #FFFFFF;
             }}
 
             QTableWidget::item {{
@@ -570,40 +797,43 @@ class UserManagementView(QWidget):
             }}
 
             QHeaderView::section {{
-                background-color: {c["surface_alt"]};
-                color: {c["muted"]};
+                background-color: {c["header_bg"]};
+                color: {c["text"]};
                 font-weight: 700;
                 font-size: 11px;
                 border: none;
-                border-bottom: 1px solid {c["border"]};
-                padding: 10px 10px;
+                border-bottom: 2px solid {c["border_bright"]};
+                padding: 10px 6px;
             }}
 
             QTabWidget::pane {{
                 border: 1px solid {c["border"]};
                 background: {c["surface"]};
-                border-radius: 6px;
+                border-radius: 8px;
             }}
 
             QTabBar::tab {{
                 background: {c["surface_alt"]};
                 color: {c["muted"]};
-                padding: 6px 12px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
+                padding: 7px 14px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
                 font-size: 11px;
-                font-weight: 600;
+                font-weight: 700;
             }}
 
             QTabBar::tab:selected {{
-                background: {c["primary"]};
-                color: white;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
             }}
 
             QMenu {{
                 background-color: {c["surface"]};
                 color: {c["text"]};
-                border: 1px solid {c["border"]};
+                border: 1px solid {c["border_bright"]};
                 border-radius: 8px;
                 padding: 5px;
             }}
@@ -615,15 +845,34 @@ class UserManagementView(QWidget):
 
             QMenu::item:selected {{
                 background-color: {c["selection"]};
-                color: {c["text"]};
+                color: #FFFFFF;
             }}
         """)
 
-        for card in self.metric_cards.values():
-            card.apply_style()
+        accent_map = {
+            "ALL": c["primary"],
+            "STUDENT": c["success"],
+            "FACULTY": c["cyan"],
+            "GUEST": c["warning"],
+        }
+        for key, card in self.metric_cards.items():
+            card.set_accent(accent_map.get(key, card.accent), c)
 
         if hasattr(self, "table"):
+            if getattr(self, "filtered_users", None) and self.table.rowCount() > 0:
+                self.populate_table(self.filtered_users)
+            else:
+                self._refresh_inspector_theme()
             self.table.viewport().update()
+
+    def _refresh_inspector_theme(self):
+        selected_ids = self.get_selected_user_ids()
+        if not selected_ids:
+            self.show_default_inspector()
+        elif len(selected_ids) == 1:
+            self.display_user_details(selected_ids[0])
+        else:
+            self.show_batch_inspector(selected_ids)
 
     def on_theme_changed(self, *_):
         self.apply_theme()
@@ -633,20 +882,29 @@ class UserManagementView(QWidget):
     # ========================================================
 
     def init_ui(self):
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         main_layout = QVBoxLayout(self)
 
         main_layout.setContentsMargins(
-            20, 16, 20, 16
+            16, 10, 16, 40
         )
 
-        main_layout.setSpacing(12)
+        main_layout.setSpacing(8)
+        self.main_layout = main_layout
 
         # HEADER
-        header = QHBoxLayout()
+        header = QGridLayout()
+        header.setHorizontalSpacing(10)
+        header.setVerticalSpacing(8)
+        self.header_layout = header
 
         title_group = QVBoxLayout()
+        title_group.setContentsMargins(0, 0, 0, 0)
         title_group.setSpacing(2)
+        self.title_column_host = QWidget()
+        self.title_column_host.setLayout(title_group)
+        self.title_column_host.setMinimumWidth(0)
 
         title = QLabel(
             "User Management & Directory"
@@ -676,11 +934,14 @@ class UserManagementView(QWidget):
         title_group.addWidget(title)
         title_group.addWidget(subtitle)
 
-        header.addLayout(title_group, 1)
+        self.header_actions_host = QWidget()
+        header_actions = QHBoxLayout(self.header_actions_host)
+        header_actions.setContentsMargins(0, 0, 0, 0)
+        header_actions.setSpacing(8)
 
         self.refresh_btn = QPushButton("↻ Refresh")
         self.refresh_btn.setObjectName("SecondaryButton")
-        self.refresh_btn.setMinimumHeight(36)
+        self.refresh_btn.setMinimumHeight(32)
         self.refresh_btn.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
@@ -689,11 +950,11 @@ class UserManagementView(QWidget):
             self.load_users_to_table
         )
 
-        header.addWidget(self.refresh_btn)
+        header_actions.addWidget(self.refresh_btn)
 
         self.control_center_btn = QPushButton("Hide Details")
         self.control_center_btn.setObjectName("SecondaryButton")
-        self.control_center_btn.setMinimumHeight(36)
+        self.control_center_btn.setMinimumHeight(32)
         self.control_center_btn.setToolTip(
             "Show or hide the User Control Center"
         )
@@ -703,8 +964,9 @@ class UserManagementView(QWidget):
         self.control_center_btn.clicked.connect(
             self.toggle_control_center
         )
-        header.addWidget(self.control_center_btn)
+        header_actions.addWidget(self.control_center_btn)
 
+        self._reflow_header(compact=False)
         main_layout.addLayout(header)
 
         # KPI STATISTICS
@@ -717,8 +979,10 @@ class UserManagementView(QWidget):
         self.build_filters(main_layout)
 
         # MAIN CONTENT
-        content_layout = QHBoxLayout()
-        content_layout.setSpacing(12)
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setObjectName("UserSplitter")
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.setHandleWidth(8)
 
         # USER TABLE
         self.table = QTableWidget()
@@ -728,6 +992,8 @@ class UserManagementView(QWidget):
         self.table.setHorizontalHeaderLabels(
             self.HEADERS
         )
+        self.table.setMinimumHeight(110)
+        self.table.setMinimumWidth(0)
 
         self.table.setAlternatingRowColors(True)
         self.table.setMouseTracking(True)
@@ -748,14 +1014,12 @@ class UserManagementView(QWidget):
         self.table.setSortingEnabled(False)
 
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(44)
+        self.table.verticalHeader().setDefaultSectionSize(40)
         self.table.setShowGrid(False)
 
         table_header = self.table.horizontalHeader()
-
-        table_header.setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        table_header.setMinimumSectionSize(44)
+        self._apply_table_column_modes(compact=False)
 
         self.table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
@@ -779,10 +1043,7 @@ class UserManagementView(QWidget):
 
         self._create_user_hover_preview()
 
-        content_layout.addWidget(
-            self.table,
-            stretch=3,
-        )
+        self.content_splitter.addWidget(self.table)
 
         # USER INSPECTOR
         self.detail_container = QFrame()
@@ -790,8 +1051,8 @@ class UserManagementView(QWidget):
             "InspectorCard"
         )
 
-        self.detail_container.setMinimumWidth(275)
-        self.detail_container.setMaximumWidth(360)
+        self.detail_container.setMinimumWidth(220)
+        self.detail_container.setMaximumWidth(340)
 
         self.detail_container.setSizePolicy(
             QSizePolicy.Policy.Preferred,
@@ -815,64 +1076,148 @@ class UserManagementView(QWidget):
         self.inspector_title.setObjectName(
             "SectionTitle"
         )
+        configure_wrapped_label(self.inspector_title)
 
         detail_layout.addWidget(
             self.inspector_title
         )
 
         self.tab_widget = QTabWidget()
+        self.tab_widget.setObjectName("InspectorTabs")
+        self.tab_widget.tabBar().setExpanding(False)
+        self.tab_widget.tabBar().setUsesScrollButtons(True)
 
         # PROFILE TAB
-        self.tab_overview = QWidget()
-
-        self.overview_layout = QVBoxLayout(
-            self.tab_overview
-        )
-
-        self.overview_layout.setContentsMargins(
-            8, 8, 8, 8
-        )
-
-        self.overview_layout.setSpacing(8)
-
-        self.tab_widget.addTab(
-            self.tab_overview,
+        self.tab_overview, self.overview_layout, _overview_content = make_scrollable_tab(
+            self.tab_widget,
             "Profile",
+            margins=(8, 8, 8, 8),
+            spacing=8,
+            object_name="UserOverviewScroll",
         )
 
         # ACTIONS TAB
-        self.tab_actions = QWidget()
-
-        self.actions_layout = QVBoxLayout(
-            self.tab_actions
-        )
-
-        self.actions_layout.setContentsMargins(
-            8, 8, 8, 8
-        )
-
-        self.actions_layout.setSpacing(6)
-
-        self.tab_widget.addTab(
-            self.tab_actions,
+        self.tab_actions, self.actions_layout, _actions_content = make_scrollable_tab(
+            self.tab_widget,
             "Actions",
+            margins=(8, 8, 8, 8),
+            spacing=6,
+            object_name="UserActionsScroll",
         )
 
         detail_layout.addWidget(
             self.tab_widget
         )
 
-        content_layout.addWidget(
-            self.detail_container,
-            stretch=0,
+        self.content_splitter.addWidget(
+            self.detail_container
         )
 
-        main_layout.addLayout(
-            content_layout,
+        main_layout.addWidget(
+            self.content_splitter,
             1,
         )
 
+        self._sync_responsive_layout()
         self.show_default_inspector()
+
+    def _reflow_header(self, compact: bool):
+        if compact == self._header_compact:
+            return
+        self.header_layout.removeWidget(self.title_column_host)
+        self.header_layout.removeWidget(self.header_actions_host)
+        self.header_layout.setColumnStretch(0, 1)
+        self.header_layout.setColumnStretch(1, 0)
+        if compact:
+            self.header_layout.addWidget(self.title_column_host, 0, 0)
+            self.header_layout.addWidget(
+                self.header_actions_host,
+                1,
+                0,
+                Qt.AlignmentFlag.AlignLeft,
+            )
+        else:
+            self.header_layout.addWidget(self.title_column_host, 0, 0)
+            self.header_layout.addWidget(
+                self.header_actions_host,
+                0,
+                1,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+        self._header_compact = compact
+
+    def _reflow_toolbar(self, compact: bool):
+        if compact == self._toolbar_compact:
+            return
+        for widget in (self.search_input, self.import_btn, self.export_btn, self.add_btn):
+            self.toolbar_layout.removeWidget(widget)
+        for col in range(4):
+            self.toolbar_layout.setColumnStretch(col, 0)
+        if compact:
+            self.toolbar_layout.addWidget(self.search_input, 0, 0, 1, 3)
+            self.toolbar_layout.addWidget(self.import_btn, 1, 0)
+            self.toolbar_layout.addWidget(self.export_btn, 1, 1)
+            self.toolbar_layout.addWidget(self.add_btn, 1, 2)
+            for col in range(3):
+                self.toolbar_layout.setColumnStretch(col, 1)
+        else:
+            self.toolbar_layout.addWidget(self.search_input, 0, 0)
+            self.toolbar_layout.addWidget(self.import_btn, 0, 1)
+            self.toolbar_layout.addWidget(self.export_btn, 0, 2)
+            self.toolbar_layout.addWidget(self.add_btn, 0, 3)
+            self.toolbar_layout.setColumnStretch(0, 1)
+        self._toolbar_compact = compact
+
+    def _update_splitter_min_height(self):
+        if self._splitter_vertical and self._control_center_expanded:
+            self.content_splitter.setMinimumHeight(250)
+        else:
+            self.content_splitter.setMinimumHeight(120)
+
+    def _sync_responsive_layout(self):
+        avail_w = self.width() if self.width() > 0 else 1000
+
+        compact_page = avail_w < 860
+        if compact_page != self._page_compact:
+            self._page_compact = compact_page
+            if compact_page:
+                self.main_layout.setContentsMargins(12, 6, 12, 40)
+                self.main_layout.setSpacing(6)
+            else:
+                self.main_layout.setContentsMargins(16, 10, 16, 40)
+                self.main_layout.setSpacing(8)
+
+        self._reflow_header(avail_w < 640)
+        self._reflow_toolbar(avail_w < 880)
+
+        columns = (
+            1 if avail_w < 460
+            else 2 if avail_w < 680
+            else 4
+        )
+        self._reflow_metric_cards(columns)
+
+        content_w = max(300, avail_w - (24 if compact_page else 32))
+        self._splitter_vertical = sync_responsive_splitter(
+            self.content_splitter,
+            self.detail_container,
+            content_w,
+            breakpoint=680,
+            max_panel_width=340,
+            min_panel_width=220,
+            min_panel_height=130,
+            current_vertical=self._splitter_vertical,
+        )
+        self._update_splitter_min_height()
+
+        est_table_w = (
+            content_w if self._splitter_vertical or not self._control_center_expanded
+            else max(280, content_w - 290)
+        )
+        table_compact = est_table_w < 550
+        if table_compact != self._table_compact_mode:
+            self._apply_table_column_modes(compact=table_compact)
+            self._table_compact_mode = table_compact
 
     def _reflow_metric_cards(self, columns):
         if self._metrics_columns == columns:
@@ -905,37 +1250,48 @@ class UserManagementView(QWidget):
             if self._control_center_expanded
             else "Show Details"
         )
+        self._update_splitter_min_height()
+
+    def _apply_table_column_modes(self, compact=False):
+        header = self.table.horizontalHeader()
+        if compact:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+            header.setStretchLastSection(False)
+            for col, width in (
+                (0, 88),
+                (1, 145),
+                (2, 98),
+                (3, 76),
+                (4, 86),
+                (5, 165),
+                (6, 84),
+                (7, 175),
+            ):
+                self.table.setColumnWidth(col, width)
+            return
+
+        header.setStretchLastSection(False)
+        fixed_widths = {
+            0: 98,   # PIN / ID
+            2: 98,   # Phone Number
+            3: 76,   # Role
+            4: 106,  # Year of Study
+            6: 88,   # Created At
+        }
+        for col_idx in range(len(self.HEADERS)):
+            if col_idx in fixed_widths:
+                header.setSectionResizeMode(
+                    col_idx, QHeaderView.ResizeMode.Fixed
+                )
+                self.table.setColumnWidth(col_idx, fixed_widths[col_idx])
+            else:
+                header.setSectionResizeMode(
+                    col_idx, QHeaderView.ResizeMode.Stretch
+                )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-
-        compact = self.width() < 1080
-        if compact != self._compact_layout:
-            self._compact_layout = compact
-            self._control_center_expanded = not compact
-            self.detail_container.setVisible(
-                self._control_center_expanded
-            )
-            self.control_center_btn.setText(
-                "Hide Details"
-                if self._control_center_expanded
-                else "Show Details"
-            )
-
-        if compact != self._table_compact_mode:
-            mode = (
-                QHeaderView.ResizeMode.Interactive
-                if compact else QHeaderView.ResizeMode.Stretch
-            )
-            self.table.horizontalHeader().setSectionResizeMode(mode)
-            self._table_compact_mode = compact
-
-        columns = (
-            2 if self.width() < 850
-            else 3 if self.width() < 1050
-            else 4
-        )
-        self._reflow_metric_cards(columns)
+        self._sync_responsive_layout()
 
     # ========================================================
     # KPI STATISTICS
@@ -1186,13 +1542,15 @@ class UserManagementView(QWidget):
         frame = QFrame()
         frame.setObjectName("ToolbarCard")
 
-        layout = QHBoxLayout(frame)
+        toolbar_layout = QGridLayout(frame)
 
-        layout.setContentsMargins(
-            10, 8, 10, 8
+        toolbar_layout.setContentsMargins(
+            8, 6, 8, 6
         )
 
-        layout.setSpacing(8)
+        toolbar_layout.setHorizontalSpacing(8)
+        toolbar_layout.setVerticalSpacing(6)
+        self.toolbar_layout = toolbar_layout
 
         self.search_input = QLineEdit()
 
@@ -1201,45 +1559,48 @@ class UserManagementView(QWidget):
         )
 
         self.search_input.setClearButtonEnabled(True)
-        self.search_input.setMinimumHeight(36)
+        self.search_input.setMinimumHeight(32)
+        self.search_input.setMinimumWidth(0)
 
         self.search_input.textChanged.connect(
             self.apply_filters
         )
 
         self.import_btn = QPushButton("Import CSV / XLSX")
-        self.import_btn.setObjectName("SecondaryButton")
-        self.import_btn.setMinimumHeight(36)
+        self.import_btn.setObjectName("InfoButton")
+        self.import_btn.setMinimumHeight(32)
 
         self.import_btn.clicked.connect(
             self.import_users_from_file
         )
 
         self.export_btn = QPushButton("Export CSV")
-        self.export_btn.setObjectName("SecondaryButton")
-        self.export_btn.setMinimumHeight(36)
+        self.export_btn.setObjectName("SuccessButton")
+        self.export_btn.setMinimumHeight(32)
 
         self.export_btn.clicked.connect(
             self.export_users_to_csv
         )
 
-        self.complaint_btn = QPushButton("New Complaint")
-        self.complaint_btn.setObjectName("SecondaryButton")
-        self.complaint_btn.setMinimumHeight(36)
+        self.complaint_btn = QPushButton("New Complaint", self)
+        self.complaint_btn.setObjectName("WarningButton")
+        self.complaint_btn.setMinimumHeight(32)
         self.complaint_btn.clicked.connect(
             self.open_complaint_dialog
         )
+        self.complaint_btn.hide()
 
-        self.complaint_inbox_btn = QPushButton("Complaint Inbox")
-        self.complaint_inbox_btn.setObjectName("SecondaryButton")
-        self.complaint_inbox_btn.setMinimumHeight(36)
+        self.complaint_inbox_btn = QPushButton("Complaint Inbox", self)
+        self.complaint_inbox_btn.setObjectName("InfoButton")
+        self.complaint_inbox_btn.setMinimumHeight(32)
         self.complaint_inbox_btn.clicked.connect(
             self.open_complaint_inbox
         )
+        self.complaint_inbox_btn.hide()
 
         self.add_btn = QPushButton("+ Add New User")
         self.add_btn.setObjectName("PrimaryButton")
-        self.add_btn.setMinimumHeight(36)
+        self.add_btn.setMinimumHeight(32)
 
         self.add_btn.clicked.connect(
             self.add_user
@@ -1256,15 +1617,9 @@ class UserManagementView(QWidget):
             button.setCursor(
                 Qt.CursorShape.PointingHandCursor
             )
+            button.setMinimumWidth(0)
 
-        layout.addWidget(
-            self.search_input,
-            1,
-        )
-
-        layout.addWidget(self.import_btn)
-        layout.addWidget(self.export_btn)
-        layout.addWidget(self.add_btn)
+        self._reflow_toolbar(compact=False)
 
         parent_layout.addWidget(frame)
 
@@ -1274,8 +1629,22 @@ class UserManagementView(QWidget):
 
     def build_filters(self, parent_layout):
 
-        layout = QHBoxLayout()
-        layout.setSpacing(4)
+        filter_frame = QFrame()
+        filter_frame.setObjectName("FilterBar")
+
+        outer_layout = QHBoxLayout(filter_frame)
+        outer_layout.setContentsMargins(6, 5, 8, 5)
+        outer_layout.setSpacing(8)
+
+        filters_host = QWidget()
+        filters_host.setObjectName("FilterButtonsHost")
+        filters_host.setMinimumWidth(0)
+        filters_host.setStyleSheet("background: transparent; border: none;")
+        filters_host.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        layout = FlowLayout(filters_host, margin=0, h_spacing=6, v_spacing=5)
 
         self.filter_buttons = {}
         self.filter_button_group = QButtonGroup(self)
@@ -1285,12 +1654,10 @@ class UserManagementView(QWidget):
 
             button = QPushButton(label)
             button.setObjectName("FilterButton")
+            button.setProperty("filterRole", key)
             button.setCheckable(True)
-            button.setMinimumHeight(38)
-            button.setSizePolicy(
-                QSizePolicy.Policy.Fixed,
-                QSizePolicy.Policy.Fixed,
-            )
+            button.setFixedHeight(28)
+            button.setMinimumWidth(0)
             button.setAccessibleName(label)
 
             button.setChecked(
@@ -1331,7 +1698,9 @@ class UserManagementView(QWidget):
                 number,
             )
 
-        self.year_combo.setMinimumWidth(80)
+        self.year_combo.setFixedHeight(28)
+        self.year_combo.setMinimumWidth(85)
+        self.year_combo.setMaximumWidth(150)
         self.year_combo.setEnabled(False)
 
         self.year_combo.setCursor(
@@ -1349,7 +1718,9 @@ class UserManagementView(QWidget):
             "ALL",
         )
 
+        self.branch_combo.setFixedHeight(28)
         self.branch_combo.setMinimumWidth(100)
+        self.branch_combo.setMaximumWidth(240)
 
         self.branch_combo.setCursor(
             Qt.CursorShape.PointingHandCursor
@@ -1361,13 +1732,25 @@ class UserManagementView(QWidget):
 
         layout.addWidget(self.year_combo)
         layout.addWidget(self.branch_combo)
-        layout.addStretch()
+
+        outer_layout.addWidget(filters_host, 1)
 
         self.lbl_count = QLabel("0 records")
+        self.lbl_count.setObjectName("CountLabel")
+        self.lbl_count.setFixedHeight(28)
+        self.lbl_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_count.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
 
-        layout.addWidget(self.lbl_count)
+        outer_layout.addWidget(
+            self.lbl_count,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
 
-        parent_layout.addLayout(layout)
+        parent_layout.addWidget(filter_frame)
 
     # ========================================================
     # LOAD USERS
@@ -1420,19 +1803,17 @@ class UserManagementView(QWidget):
 
         try:
 
-            departments = (
-                self.db.get_all_user_departments()
-            )
+            if self.current_filter == "STUDENT":
+                departments = self.db.get_departments("STUDENT")
+            else:
+                departments = self.db.get_all_user_departments()
 
             if departments:
 
-                for department in sorted(
-                    set(
-                        str(value).strip()
-                        for value in departments
-                        if value
-                    ),
-                    key=str.casefold,
+                for department in dict.fromkeys(
+                    str(value).strip()
+                    for value in departments
+                    if value and str(value).strip()
                 ):
 
                     self.branch_combo.addItem(
@@ -1600,6 +1981,7 @@ class UserManagementView(QWidget):
             self.year_combo.setCurrentIndex(0)
             self.year_combo.blockSignals(False)
 
+        self.update_branch_dropdown()
         self.apply_filters()
 
     def apply_filters(self, *_):
@@ -1771,12 +2153,19 @@ class UserManagementView(QWidget):
                             Qt.ItemDataRole.UserRole,
                             str(user_id),
                         )
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                        item.setForeground(QColor(c["primary"]))
 
                     elif column == 3:
 
                         role_text = str(
                             role or ""
                         ).lower()
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
 
                         if "guest" in role_text:
 
@@ -1790,7 +2179,7 @@ class UserManagementView(QWidget):
                         ):
 
                             item.setForeground(
-                                QColor(c["primary"])
+                                QColor(c["cyan"])
                             )
 
                         else:
@@ -1801,9 +2190,18 @@ class UserManagementView(QWidget):
 
                     elif column == 4:
 
-                        item.setForeground(
-                            QColor(c["primary"])
-                        )
+                        year_str = str(value or "").strip()
+                        if year_str.startswith("N/A"):
+                            item.setForeground(QColor(c["muted"]))
+                        elif "(Final)" in year_str:
+                            font = item.font()
+                            font.setBold(True)
+                            item.setFont(font)
+                            item.setForeground(QColor(c["cyan"]))
+                        elif "(Graduated)" in year_str:
+                            item.setForeground(QColor(c["purple"]))
+                        else:
+                            item.setForeground(QColor(c["indigo"]))
 
                     self.table.setItem(
                         row_index,
@@ -1877,7 +2275,7 @@ class UserManagementView(QWidget):
             "profile information, assigned books, and account status."
         )
 
-        lbl.setWordWrap(True)
+        configure_wrapped_label(lbl)
 
         lbl.setStyleSheet(
             f"color: {self.colors['muted']}; font-size: 11px;"
@@ -1930,10 +2328,13 @@ class UserManagementView(QWidget):
             "by the database."
         )
 
-        lbl.setWordWrap(True)
+        configure_wrapped_label(lbl)
 
         lbl.setStyleSheet(
-            f"color: {self.colors['muted']}; font-size: 11px;"
+            f"background-color: {self.colors['primary_soft']}; "
+            f"color: {self.colors['text']}; "
+            f"border: 1px solid {rgba_color(self.colors['primary'], 0.35)}; "
+            "border-radius: 8px; padding: 10px; font-size: 11px; font-weight: 600;"
         )
 
         self.overview_layout.addWidget(lbl)
@@ -1941,11 +2342,12 @@ class UserManagementView(QWidget):
 
         for mode, text, object_name in (
             ("ISSUE", "Issue a Book to Selected Users", "PrimaryButton"),
-            ("RETURN", "Return a Book from Selected Users", "SecondaryButton"),
+            ("RETURN", "Return a Book from Selected Users", "SuccessButton"),
         ):
             button = QPushButton(text)
             button.setObjectName(object_name)
             button.setMinimumHeight(34)
+            configure_inspector_button(button)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(
                 lambda checked=False, selected_mode=mode:
@@ -1965,6 +2367,7 @@ class UserManagementView(QWidget):
         )
 
         delete_button.setMinimumHeight(34)
+        configure_inspector_button(delete_button)
 
         delete_button.setCursor(
             Qt.CursorShape.PointingHandCursor
@@ -2114,17 +2517,29 @@ class UserManagementView(QWidget):
         if overdue_count > 0:
 
             status_text = "OVERDUE BOOKS"
-            status_color = c["danger"]
+            status_bg = (
+                f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                f"stop:0 {c['danger']}, stop:1 {c['danger_hover']})"
+            )
+            status_border = c["danger"]
 
         elif active_loans:
 
             status_text = "ISSUED BOOKS"
-            status_color = c["warning"]
+            status_bg = (
+                f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                f"stop:0 {c['warning']}, stop:1 {c['warning_hover']})"
+            )
+            status_border = c["warning"]
 
         else:
 
             status_text = "CLEAR ACCOUNT"
-            status_color = c["success"]
+            status_bg = (
+                f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                f"stop:0 {c['success']}, stop:1 {c['teal']})"
+            )
+            status_border = c["success"]
 
         status_lbl = QLabel(
             f"{status_text}\n"
@@ -2132,17 +2547,20 @@ class UserManagementView(QWidget):
             f"({overdue_count} overdue)"
         )
 
+        configure_wrapped_label(status_lbl)
+
         status_lbl.setAlignment(
             Qt.AlignmentFlag.AlignCenter
         )
 
         status_lbl.setStyleSheet(f"""
-            background: {status_color};
-            color: white;
-            border-radius: 6px;
-            padding: 8px;
-            font-weight: 700;
-            font-size: 10px;
+            background: {status_bg};
+            color: #FFFFFF;
+            border: 1px solid {status_border};
+            border-radius: 8px;
+            padding: 9px;
+            font-weight: 800;
+            font-size: 11px;
         """)
 
         self.overview_layout.addWidget(
@@ -2160,20 +2578,38 @@ class UserManagementView(QWidget):
 
         # PROFILE FORM
         form = QFormLayout()
+        configure_inspector_form(form, horizontal_spacing=10, vertical_spacing=7)
 
         form.setContentsMargins(
             0, 4, 0, 4
         )
 
-        form.setVerticalSpacing(8)
+        try:
+            policy = self.db.get_loan_policy(user[3])
+            policy_label = (
+                f"Max {policy.get('max_books', 3)} books · "
+                f"{policy.get('default_days', 14)} days · "
+                f"₹{float(policy.get('fine_rate', 2.0)):.2f}/day"
+            )
+        except Exception:
+            policy_label = "Standard policy"
+
+        try:
+            unpaid_fines = float(
+                self.db.get_user_pending_fines_total(user[0]) or 0.0
+            )
+        except Exception:
+            unpaid_fines = 0.0
 
         fields = [
             ("ID / PIN", user[0]),
             ("Full Name", user[1]),
             ("Phone", user[2] or "N/A"),
             ("Role", user[3]),
+            ("Loan Policy", policy_label),
             ("Year", year_label),
             ("Department", user[4]),
+            ("Unpaid Fines", f"₹{unpaid_fines:.2f}"),
             ("Created", user[5]),
             ("Email", user[6] if len(user) > 6 else ""),
         ]
@@ -2181,6 +2617,7 @@ class UserManagementView(QWidget):
         for key, value in fields:
 
             key_label = QLabel(key)
+            configure_wrapped_label(key_label, expanding_width=False)
 
             value_label = QLabel(
                 str(
@@ -2189,18 +2626,22 @@ class UserManagementView(QWidget):
                     else "—"
                 )
             )
+            configure_wrapped_label(value_label, expanding_width=True)
 
             key_label.setStyleSheet(
                 f"color: {c['muted']}; "
                 "font-size: 10px; font-weight: 600;"
             )
 
+            value_color = (
+                c["warning"]
+                if key == "Unpaid Fines" and unpaid_fines > 0
+                else c["text"]
+            )
             value_label.setStyleSheet(
-                f"color: {c['text']}; "
+                f"color: {value_color}; "
                 "font-size: 11px; font-weight: 600;"
             )
-
-            value_label.setWordWrap(True)
 
             form.addRow(
                 key_label,
@@ -2225,14 +2666,20 @@ class UserManagementView(QWidget):
             (
                 "Send Custom Email",
                 lambda: self.send_custom_email(user[0]),
-                "SecondaryButton",
-            ),
-            (
-                "Delete User",
-                lambda: self.delete_user(user[0]),
-                "DangerButton",
+                "InfoButton",
             ),
         ]
+        if unpaid_fines > 0:
+            actions.append((
+                f"💳 Settle Pending Fines (₹{unpaid_fines:.2f})",
+                lambda: self.settle_user_fines(user[0]),
+                "WarningButton",
+            ))
+        actions.append((
+            "Delete User",
+            lambda: self.delete_user(user[0]),
+            "DangerButton",
+        ))
 
         for text, callback, object_name in actions:
 
@@ -2243,6 +2690,7 @@ class UserManagementView(QWidget):
             )
 
             button.setMinimumHeight(34)
+            configure_inspector_button(button)
 
             button.setCursor(
                 Qt.CursorShape.PointingHandCursor
@@ -2487,13 +2935,60 @@ class UserManagementView(QWidget):
             message,
         )
 
+    def settle_user_fines(self, user_id):
+        try:
+            total = float(self.db.get_user_pending_fines_total(user_id) or 0.0)
+        except Exception:
+            total = 0.0
+        if total <= 0:
+            QMessageBox.information(
+                self,
+                "No Pending Fines",
+                f"User '{user_id}' has no unsettled fines.",
+            )
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Settle Pending Fines")
+        msg.setText(
+            f"User '{user_id}' currently has ₹{total:.2f} in unpaid fines.\n\n"
+            "How would you like to settle these fines?"
+        )
+        pay_btn = msg.addButton("Mark All Paid", QMessageBox.ButtonRole.AcceptRole)
+        waive_btn = msg.addButton("Waive All", QMessageBox.ButtonRole.DestructiveRole)
+        msg.addButton(QMessageBox.StandardButton.Cancel)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked == pay_btn:
+            action = "PAID"
+        elif clicked == waive_btn:
+            action = "WAIVED"
+        else:
+            return
+
+        try:
+            success, message = self.db.settle_all_user_fines(
+                user_id, action, "Settled from User Management"
+            )
+            if success:
+                QMessageBox.information(self, "Fines Settled", str(message))
+                self.load_users_to_table()
+            else:
+                QMessageBox.warning(self, "Settlement Failed", str(message))
+        except Exception as error:
+            QMessageBox.critical(self, "Settlement Error", str(error))
+
     def view_books(self, user_id):
 
-        ViewBooksDialog(
+        dialog = ViewBooksDialog(
             self.db,
             user_id,
             parent=self,
-        ).exec()
+        )
+        dialog.data_updated.connect(self.load_users_to_table)
+        dialog.exec()
+        self.load_users_to_table()
 
     def open_complaint_dialog(self):
         try:
@@ -2771,7 +3266,7 @@ class UserManagementView(QWidget):
                     if role == "Student":
                         expected_format = "24001-CS-097"
                     else:
-                        expected_format = "CS000001"
+                        expected_format = "123456"
                     errors.append(
                         f"Line {line_number}: Invalid ID '{user_id}' for "
                         f"{role}; expected a format like {expected_format}."
@@ -2799,18 +3294,25 @@ class UserManagementView(QWidget):
                     )
                     continue
 
-                if role in ("Student", "Faculty", "Guest Lecturer") and (
-                    not department
-                    or department.casefold()
-                    in {"general", "general administration", "n/a"}
-                ):
+                canonical_department = normalize_department_for_role(
+                    department,
+                    role,
+                )
+                if role == "Student" and not canonical_department:
                     errors.append(
-                        f"Line {line_number}: A branch or department is "
-                        f"required for {role}."
+                        f"Line {line_number}: Students must be assigned an "
+                        "official college branch (not Sciences & Humanities "
+                        "or General Administration)."
                     )
                     continue
-                if not department:
-                    department = "General Administration"
+                if role in ("Faculty", "Guest Lecturer") and not canonical_department:
+                    errors.append(
+                        f"Line {line_number}: {role} must be assigned a "
+                        "college branch, Sciences & Humanities Department, "
+                        "or General Administration."
+                    )
+                    continue
+                department = canonical_department or "General Administration"
 
                 if email and (
                     "@" not in email

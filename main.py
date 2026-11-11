@@ -7,7 +7,7 @@ import datetime
 
 from PyQt6.QtWidgets import QApplication, QDialog
 from PyQt6.QtGui import QIcon, QFont
-from PyQt6.QtCore import QElapsedTimer, QTimer
+from PyQt6.QtCore import QElapsedTimer, QTimer, Qt
 
 from mainwindow import MainWindow
 from database import LocalDatabase
@@ -24,7 +24,7 @@ from app_version import get_app_version
 APP_NAME = "Library Management System"
 
 # Keep production authentication enabled; bypass is for local testing only.
-BYPASS_LOGIN = True
+BYPASS_LOGIN = False
 
 DEFAULT_THEME = "Dark"
 SPLASH_DURATION = 1500
@@ -99,6 +99,10 @@ def initialize_database():
 
 def main():
 
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
     app = QApplication(sys.argv)
 
     app.setApplicationName(APP_NAME)
@@ -157,10 +161,32 @@ def main():
         return 1
 
     # --------------------------------------------------------
-    # 5. Safe database shutdown
+    # 5. Safe database & worker shutdown
     # --------------------------------------------------------
 
+    window_ref = {"window": None}
+    background_timers = []
+
     def close_database():
+        for timer in background_timers:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+        win = window_ref.get("window")
+        if win is not None and hasattr(win, "_shutdown_background_workers"):
+            try:
+                win._shutdown_background_workers()
+            except Exception as error:
+                print(f"Worker shutdown warning: {error}")
+        else:
+            sync_manager = getattr(app, "email_sync_manager", None)
+            if sync_manager is not None and hasattr(sync_manager, "stop"):
+                try:
+                    sync_manager.stop(wait_ms=3500)
+                except Exception as error:
+                    print(f"Email sync shutdown warning: {error}")
 
         try:
             connection = getattr(db, "conn", None)
@@ -174,12 +200,16 @@ def main():
     app.aboutToQuit.connect(close_database)
 
     # --------------------------------------------------------
-    # 6. Authentication
+    # 6. Authentication & Main Window Handoff
     # --------------------------------------------------------
 
     if BYPASS_LOGIN:
 
         window = MainWindow(db)
+        window_ref["window"] = window
+        window.theme_manager = theme_manager
+        window.setWindowTitle(f"{APP_NAME} v{get_app_version()}")
+        window.showMaximized()
 
     else:
 
@@ -187,30 +217,27 @@ def main():
             splash.close()
             splash = None
 
-        login_dialog = LoginDialog(db)
+        app.setQuitOnLastWindowClosed(False)
+        try:
+            login_dialog = LoginDialog(db)
 
-        if login_dialog.exec() != QDialog.DialogCode.Accepted:
-            close_database()
-            return 0
+            if login_dialog.exec() != QDialog.DialogCode.Accepted:
+                close_database()
+                return 0
 
-        window = MainWindow(db)
-
-    # --------------------------------------------------------
-    # 7. Connect theme manager
-    # --------------------------------------------------------
-
-    window.theme_manager = theme_manager
-
-    # --------------------------------------------------------
-    # 8. Launch application
-    # --------------------------------------------------------
-
-    window.setWindowTitle(f"{APP_NAME} v{get_app_version()}")
-    window.showMaximized()
+            window = MainWindow(db)
+            window_ref["window"] = window
+            window.theme_manager = theme_manager
+            window.setWindowTitle(f"{APP_NAME} v{get_app_version()}")
+            window.showMaximized()
+        finally:
+            app.setQuitOnLastWindowClosed(True)
 
     reminder_lock = threading.Lock()
 
     def run_due_email_reminders():
+        if app.closingDown():
+            return
         if not reminder_lock.acquire(blocking=False):
             return
 
@@ -255,11 +282,14 @@ def main():
     reminder_timer.setInterval(60 * 60 * 1000)
     reminder_timer.timeout.connect(run_due_email_reminders)
     reminder_timer.start()
+    background_timers.append(reminder_timer)
     QTimer.singleShot(1000, run_due_email_reminders)
 
     drive_backup_lock = threading.Lock()
 
     def run_automatic_drive_backup():
+        if app.closingDown():
+            return
         if not drive_backup_lock.acquire(blocking=False):
             return
 
@@ -318,6 +348,7 @@ def main():
     drive_backup_timer.setInterval(60 * 60 * 1000)
     drive_backup_timer.timeout.connect(run_automatic_drive_backup)
     drive_backup_timer.start()
+    background_timers.append(drive_backup_timer)
     QTimer.singleShot(2000, run_automatic_drive_backup)
 
     if splash:

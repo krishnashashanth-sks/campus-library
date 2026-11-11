@@ -423,7 +423,7 @@ expecting an update to be found.
 ### 👤 Users Details
 - **Add User**: Register new library users with department and role
 - **Edit User**: Update user information
-- **Import CSV/XLSX**: Student IDs use `24001-CS-097` format (5 digits, a 2-letter branch code, then 3 digits); employee IDs use a 2-letter branch code plus 6 digits (for example, `CS000001`). Phone numbers, when provided, must contain exactly 10 digits. Students need a branch and faculty/guest lecturers need a department.
+- **Import CSV/XLSX**: Student IDs use `24001-CS-097` format (5 digits, a 2-letter branch code, then 3 digits); employee IDs use 6 digits (for example, `123456`). Phone numbers, when provided, must contain exactly 10 digits. Students need a college branch; faculty and guest lecturers need a college branch, Sciences & Humanities Department, or General Administration.
 - **Delete**: Remove users without active checkouts
 - **View Books**: See all books borrowed by a user
 - **Batch Circulation**: Select multiple users, then use Actions to issue or return one book for each selected user

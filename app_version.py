@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 
-APP_VERSION = "2.0"
+APP_VERSION = "1.0"
 INSTALLED_VERSION_FILE = "library_version.txt"
 _VERSION_PATTERN = re.compile(
     r"v?(\d+(?:\.\d+){1,3})",

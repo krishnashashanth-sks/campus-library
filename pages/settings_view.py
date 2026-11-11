@@ -5,15 +5,18 @@ import shutil
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QSignalBlocker, QThreadPool, QTimer, QUrl
+from PyQt6 import sip
+from PyQt6.QtCore import Qt, QSignalBlocker, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QLabel, QHBoxLayout, QVBoxLayout,
     QLineEdit, QCheckBox, QPushButton, QFileDialog,
     QMessageBox, QDoubleSpinBox, QSpinBox, QComboBox,
     QScrollArea, QFrame, QInputDialog, QApplication,
-    QGridLayout, QSizePolicy, QProgressBar
+    QGridLayout, QSizePolicy, QProgressBar, QTabWidget
 )
+from ui_responsive import FlowLayout, configure_wrapped_label, wrap_in_scroll_area
+from utils import rgba_color
 
 from dialogs import (
     DepartmentManagerDialog,
@@ -38,13 +41,43 @@ from update_service import (
 )
 
 
+class _WrappedCheckLabel(QLabel):
+    """Clickable multi-line label paired with a QCheckBox so long descriptions wrap cleanly."""
+
+    def __init__(self, text, checkbox, parent=None):
+        super().__init__(text, parent)
+        self._checkbox = checkbox
+
+    def mouseReleaseEvent(self, event):
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.pos())
+            and self._checkbox is not None
+            and self._checkbox.isEnabled()
+        ):
+            self._checkbox.click()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class SettingsView(QWidget):
 
     DEFAULTS = {
         "daily_fine": 10.00,
         "default_days": 14,
+        "max_renewals": 2,
+        "allow_overdue_renewal": True,
         "theme_mode": "Dark",
     }
+
+    DEFAULT_ROLE_POLICIES = (
+        ("Student", 3, 14, 2.00),
+        ("Faculty", 8, 30, 1.00),
+        ("Guest Lecturer", 5, 21, 2.00),
+        ("Admin", 15, 60, 0.00),
+        ("Librarian", 10, 30, 0.00),
+    )
 
     THEMES = ("Dark", "Light", "System")
 
@@ -54,11 +87,21 @@ class SettingsView(QWidget):
         self.db = db
         self._loading_settings = False
         self._saving_settings = False
+        self._has_loaded_once = False
         self._theme_manager = None
         self._update_pool = QThreadPool(self)
         self._update_worker = None
         self._pending_update = None
         self._email_test_worker = None
+        self._closing = False
+        self.role_policy_controls = {}
+        self.role_policy_rows = []
+        self.role_policy_headers = []
+        self._role_policy_mode = None
+        self._settings_compact = None
+        self._settings_stacked = None
+        self._action_bar_stacked = None
+        self._password_rows = []
 
         self.setObjectName("SettingsView")
 
@@ -107,40 +150,79 @@ class SettingsView(QWidget):
     def apply_theme(self, *_):
         manager = self._theme_manager or self.get_theme_manager()
         theme = getattr(manager, "active_theme", "Dark")
-        colors = getattr(manager, "COLORS", {}).get(theme)
+        tm_colors = getattr(manager, "COLORS", {}).get(theme)
 
-        if colors is None:
-            palette = QApplication.palette()
+        if theme == "Light":
             colors = {
-                "window": palette.color(
-                    palette.ColorRole.Window
-                ).name(),
-                "surface": palette.color(
-                    palette.ColorRole.Button
-                ).name(),
-                "surface_alt": palette.color(
-                    palette.ColorRole.AlternateBase
-                ).name(),
-                "input": palette.color(
-                    palette.ColorRole.Base
-                ).name(),
-                "border": palette.color(
-                    palette.ColorRole.Mid
-                ).name(),
-                "text": palette.color(
-                    palette.ColorRole.Text
-                ).name(),
-                "muted": palette.color(
-                    palette.ColorRole.PlaceholderText
-                ).name(),
-                "primary": palette.color(
-                    palette.ColorRole.Highlight
-                ).name(),
-                "primary_hover": palette.color(
-                    palette.ColorRole.Highlight
-                ).darker(115).name(),
-                "danger": "#DC2626",
+                "window": "#D2DFEF",
+                "surface": "#E3ECF9",
+                "surface_alt": "#CFDDF3",
+                "surface_elevated": "#BED0EC",
+                "input": "#DAE6F7",
+                "border": "#88A4CE",
+                "border_bright": "#5A7CB2",
+                "text": "#0A1628",
+                "muted": "#283D5E",
+                "primary": "#1D4ED8",
+                "primary_hover": "#1E40AF",
+                "primary_soft": "rgba(29, 78, 216, 0.20)",
+                "selection": "#1D4ED8",
+                "indigo": "#4338CA",
+                "indigo_hover": "#3730A3",
+                "indigo_soft": "rgba(67, 56, 202, 0.20)",
+                "cyan": "#0369A1",
+                "cyan_hover": "#075985",
+                "cyan_soft": "rgba(3, 105, 161, 0.20)",
+                "teal": "#0F766E",
+                "purple": "#6D28D9",
+                "purple_soft": "rgba(109, 40, 217, 0.20)",
+                "success": "#047857",
+                "success_hover": "#065F46",
+                "success_soft": "rgba(4, 120, 87, 0.20)",
+                "warning": "#B45309",
+                "warning_hover": "#92400E",
+                "warning_soft": "rgba(180, 83, 9, 0.22)",
+                "danger": "#BE123C",
+                "danger_hover": "#9F1239",
+                "danger_soft": "rgba(190, 18, 60, 0.20)",
             }
+        else:
+            colors = {
+                "window": "#090E1A",
+                "surface": "#111A2E",
+                "surface_alt": "#182542",
+                "surface_elevated": "#1F2F52",
+                "input": "#0C1426",
+                "border": "#28385C",
+                "border_bright": "#384F82",
+                "text": "#F8FAFC",
+                "muted": "#9BB0CE",
+                "primary": "#3B82F6",
+                "primary_hover": "#2563EB",
+                "primary_soft": "rgba(59, 130, 246, 0.16)",
+                "selection": "#2563EB",
+                "indigo": "#818CF8",
+                "indigo_hover": "#6366F1",
+                "indigo_soft": "rgba(129, 140, 248, 0.16)",
+                "cyan": "#22D3EE",
+                "cyan_hover": "#06B6D4",
+                "cyan_soft": "rgba(34, 211, 238, 0.16)",
+                "teal": "#2DD4BF",
+                "purple": "#A78BFA",
+                "purple_soft": "rgba(167, 139, 250, 0.16)",
+                "success": "#10B981",
+                "success_hover": "#059669",
+                "success_soft": "rgba(16, 185, 129, 0.16)",
+                "warning": "#F59E0B",
+                "warning_hover": "#D97706",
+                "warning_soft": "rgba(245, 158, 11, 0.16)",
+                "danger": "#F43F5E",
+                "danger_hover": "#E11D48",
+                "danger_soft": "rgba(244, 63, 94, 0.16)",
+            }
+
+        if isinstance(tm_colors, dict):
+            colors.update(tm_colors)
 
         c = colors
         self.setStyleSheet(f"""
@@ -149,6 +231,15 @@ class SettingsView(QWidget):
                 color: {c["text"]};
                 font-family: "Segoe UI";
                 font-size: 12px;
+            }}
+
+            QWidget#SettingsContainer {{
+                background: transparent;
+            }}
+
+            QScrollArea#SettingsScrollArea {{
+                background: transparent;
+                border: none;
             }}
 
             QLabel {{
@@ -160,7 +251,7 @@ class SettingsView(QWidget):
             QLabel#PageTitle {{
                 color: {c["text"]};
                 font-size: 23px;
-                font-weight: 700;
+                font-weight: 800;
             }}
 
             QLabel#PageSubtitle,
@@ -172,9 +263,24 @@ class SettingsView(QWidget):
 
             QLabel#SectionTitle {{
                 color: {c["text"]};
-                font-size: 14px;
-                font-weight: 700;
+                font-size: 15px;
+                font-weight: 800;
             }}
+
+            QFrame#SectionAccentBar {{
+                border-radius: 2px;
+                border: none;
+                background-color: {c["primary"]};
+            }}
+
+            QFrame#SectionAccentBar[accentRole="primary"] {{ background-color: {c["primary"]}; }}
+            QFrame#SectionAccentBar[accentRole="warning"] {{ background-color: {c["warning"]}; }}
+            QFrame#SectionAccentBar[accentRole="purple"] {{ background-color: {c["purple"]}; }}
+            QFrame#SectionAccentBar[accentRole="indigo"] {{ background-color: {c["indigo"]}; }}
+            QFrame#SectionAccentBar[accentRole="cyan"] {{ background-color: {c["cyan"]}; }}
+            QFrame#SectionAccentBar[accentRole="teal"] {{ background-color: {c["teal"]}; }}
+            QFrame#SectionAccentBar[accentRole="danger"] {{ background-color: {c["danger"]}; }}
+            QFrame#SectionAccentBar[accentRole="success"] {{ background-color: {c["success"]}; }}
 
             QLabel#FieldLabel {{
                 color: {c["text"]};
@@ -182,68 +288,183 @@ class SettingsView(QWidget):
                 font-weight: 600;
             }}
 
-            QLabel#DangerTitle {{
-                color: {c["danger"]};
-                font-size: 14px;
+            QLabel#RoleBadge {{
+                border-radius: 7px;
+                padding: 5px 10px;
+                font-size: 11px;
                 font-weight: 700;
             }}
 
-            QFrame#SettingsCard,
+            QLabel#RoleBadge[roleAccent="student"] {{
+                background-color: {c["success_soft"]};
+                color: {c["success"]};
+                border: 1px solid {rgba_color(c["success"], 0.40)};
+            }}
+
+            QLabel#RoleBadge[roleAccent="faculty"] {{
+                background-color: {c["cyan_soft"]};
+                color: {c["cyan"]};
+                border: 1px solid {rgba_color(c["cyan"], 0.40)};
+            }}
+
+            QLabel#RoleBadge[roleAccent="guest"] {{
+                background-color: {c["warning_soft"]};
+                color: {c["warning"]};
+                border: 1px solid {rgba_color(c["warning"], 0.40)};
+            }}
+
+            QLabel#RoleBadge[roleAccent="admin"] {{
+                background-color: {c["purple_soft"]};
+                color: {c["purple"]};
+                border: 1px solid {rgba_color(c["purple"], 0.40)};
+            }}
+
+            QLabel#RoleBadge[roleAccent="librarian"] {{
+                background-color: {c["indigo_soft"]};
+                color: {c["indigo"]};
+                border: 1px solid {rgba_color(c["indigo"], 0.40)};
+            }}
+
+            QLabel#DangerTitle {{
+                color: {c["danger"]};
+                font-size: 14px;
+                font-weight: 800;
+            }}
+
+            QFrame#SettingsCard {{
+                background-color: {c["surface"]};
+                border: 1.5px solid {c["border"]};
+                border-left: 4px solid {c["primary"]};
+                border-radius: 11px;
+            }}
+
+            QFrame#SettingsCard[accentRole="primary"] {{ border-left: 4px solid {c["primary"]}; }}
+            QFrame#SettingsCard[accentRole="warning"] {{ border-left: 4px solid {c["warning"]}; }}
+            QFrame#SettingsCard[accentRole="purple"] {{ border-left: 4px solid {c["purple"]}; }}
+            QFrame#SettingsCard[accentRole="indigo"] {{ border-left: 4px solid {c["indigo"]}; }}
+            QFrame#SettingsCard[accentRole="cyan"] {{ border-left: 4px solid {c["cyan"]}; }}
+            QFrame#SettingsCard[accentRole="teal"] {{ border-left: 4px solid {c["teal"]}; }}
+            QFrame#SettingsCard[accentRole="danger"] {{ border-left: 4px solid {c["danger"]}; }}
+            QFrame#SettingsCard[accentRole="success"] {{ border-left: 4px solid {c["success"]}; }}
+
             QFrame#SettingsActionBar {{
                 background-color: {c["surface"]};
-                border: 1px solid {c["border"]};
-                border-radius: 10px;
+                border: 1.5px solid {c["border_bright"]};
+                border-top: 2px solid {c["primary"]};
+                border-radius: 11px;
             }}
 
             QFrame#InfoFrame {{
-                background-color: {c["surface_alt"]};
-                border: 1px solid {c["border"]};
-                border-radius: 8px;
+                background-color: {c["primary_soft"]};
+                border: 1px solid {rgba_color(c["primary"], 0.35)};
+                border-left: 3px solid {c["primary"]};
+                border-radius: 9px;
+            }}
+
+            QFrame#InfoFrame QLabel#MutedLabel {{
+                color: {c["text"]};
             }}
 
             QFrame#DangerFrame {{
-                background-color: {c["surface_alt"]};
-                border: 1px solid {c["danger"]};
-                border-radius: 8px;
+                background-color: {c["danger_soft"]};
+                border: 1px solid {rgba_color(c["danger"], 0.55)};
+                border-left: 4px solid {c["danger"]};
+                border-radius: 9px;
             }}
 
             QFrame#SettingsSeparator {{
-                color: {c["border"]};
+                color: {c["border_bright"]};
             }}
 
             QPushButton {{
                 color: {c["text"]};
                 font-size: 12px;
                 font-weight: 600;
-                border-radius: 7px;
-                padding: 8px 13px;
+                border-radius: 8px;
+                padding: 6px 13px;
             }}
 
             QPushButton#PrimaryButton {{
-                background-color: {c["primary"]};
-                color: white;
-                border: none;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["primary"]};
+                font-weight: 700;
             }}
 
             QPushButton#PrimaryButton:hover {{
-                background-color: {c["primary_hover"]};
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary_hover"]}, stop:1 {c["indigo_hover"]}
+                );
+            }}
+
+            QPushButton#SuccessButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["success"]}, stop:1 {c["teal"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["success"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#SuccessButton:hover {{
+                background-color: {c["success_hover"]};
+            }}
+
+            QPushButton#InfoButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["cyan"]}, stop:1 {c["primary"]}
+                );
+                color: #FFFFFF;
+                border: 1px solid {c["cyan"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#InfoButton:hover {{
+                background-color: {c["cyan_hover"]};
+            }}
+
+            QPushButton#WarningButton {{
+                background-color: {c["warning"]};
+                color: #FFFFFF;
+                border: 1px solid {c["warning"]};
+                font-weight: 700;
+            }}
+
+            QPushButton#WarningButton:hover {{
+                background-color: {c["warning_hover"]};
             }}
 
             QPushButton#SecondaryButton,
             QPushButton#SmallButton {{
                 background-color: {c["surface_alt"]};
-                border: 1px solid {c["border"]};
+                color: {c["text"]};
+                border: 1px solid {c["border_bright"]};
             }}
 
             QPushButton#SecondaryButton:hover,
             QPushButton#SmallButton:hover {{
+                background-color: {c["surface_elevated"]};
                 border-color: {c["primary"]};
+                color: {c["primary"]};
             }}
 
             QPushButton#DangerButton {{
+                background-color: {c["danger_soft"]};
+                color: {c["danger"]};
+                border: 1px solid {rgba_color(c["danger"], 0.65)};
+                font-weight: 700;
+            }}
+
+            QPushButton#DangerButton:hover {{
                 background-color: {c["danger"]};
-                color: white;
-                border: none;
+                color: #FFFFFF;
+                border-color: {c["danger"]};
             }}
 
             QLineEdit,
@@ -252,16 +473,78 @@ class SettingsView(QWidget):
             QDoubleSpinBox {{
                 background-color: {c["input"]};
                 color: {c["text"]};
-                border: 1px solid {c["border"]};
-                border-radius: 7px;
-                padding: 7px 10px;
+                border: 1.5px solid {c["border"]};
+                border-radius: 8px;
+                padding: 5px 9px;
                 font-size: 12px;
+                selection-background-color: {c["selection"]};
+                selection-color: #FFFFFF;
             }}
 
             QLineEdit:focus,
             QComboBox:focus,
             QSpinBox:focus,
             QDoubleSpinBox:focus {{
+                border: 1.5px solid {c["primary"]};
+            }}
+
+            QComboBox QAbstractItemView {{
+                background-color: {c["surface"]};
+                color: {c["text"]};
+                border: 1px solid {c["border_bright"]};
+                selection-background-color: {c["selection"]};
+                selection-color: #FFFFFF;
+            }}
+
+            QProgressBar {{
+                background-color: {c["input"]};
+                border: 1px solid {c["border"]};
+                border-radius: 6px;
+                text-align: center;
+                color: {c["text"]};
+                font-weight: 700;
+            }}
+
+            QProgressBar::chunk {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["cyan"]}, stop:0.5 {c["primary"]}, stop:1 {c["success"]}
+                );
+                border-radius: 5px;
+            }}
+
+            QTabWidget#SettingsCategoryTabs::pane {{
+                background: transparent;
+                border: 1.5px solid {c["border"]};
+                border-radius: 11px;
+                top: -1px;
+            }}
+
+            QTabWidget#SettingsCategoryTabs > QTabBar::tab {{
+                background-color: {c["surface_alt"]};
+                color: {c["muted"]};
+                border: 1px solid {c["border"]};
+                border-bottom: none;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                padding: 7px 14px;
+                margin-right: 4px;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+
+            QTabWidget#SettingsCategoryTabs > QTabBar::tab:hover {{
+                background-color: {c["surface_elevated"]};
+                color: {c["text"]};
+                border-color: {c["primary"]};
+            }}
+
+            QTabWidget#SettingsCategoryTabs > QTabBar::tab:selected {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {c["primary"]}, stop:1 {c["indigo"]}
+                );
+                color: #FFFFFF;
                 border-color: {c["primary"]};
             }}
         """)
@@ -286,6 +569,16 @@ class SettingsView(QWidget):
             return False
 
     def on_global_theme_changed(self, theme_name):
+        manager = self._theme_manager or self.get_theme_manager()
+        if manager and hasattr(self, "combo_theme"):
+            selected_theme = manager.get_theme()
+            if (
+                selected_theme in self.THEMES
+                and self.combo_theme.currentText() != selected_theme
+            ):
+                blocker = QSignalBlocker(self.combo_theme)
+                self.combo_theme.setCurrentText(selected_theme)
+                del blocker
         self.apply_theme()
         self.update_theme_description()
 
@@ -316,80 +609,130 @@ class SettingsView(QWidget):
     # UI HELPERS
     # =========================================================
 
-    def create_card_frame(self, object_name="SettingsCard"):
+    def create_card_frame(self, object_name="SettingsCard", accent_role=None):
         frame = QFrame()
         frame.setObjectName(object_name)
+        if accent_role:
+            frame.setProperty("accentRole", accent_role)
         frame.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred
         )
         return frame
 
-    def create_section_header(self, title, description=""):
+    def create_section_header(self, title, description="", accent_role="primary"):
         wrapper = QWidget()
         wrapper.setObjectName("SettingsSectionHeader")
 
         layout = QVBoxLayout(wrapper)
-        layout.setContentsMargins(0, 8, 0, 3)
-        layout.setSpacing(4)
+        layout.setContentsMargins(0, 4, 0, 2)
+        layout.setSpacing(2)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
+
+        accent_bar = QFrame()
+        accent_bar.setObjectName("SectionAccentBar")
+        accent_bar.setProperty("accentRole", accent_role)
+        accent_bar.setFixedSize(4, 16)
 
         title_label = QLabel(title)
         title_label.setObjectName("SectionTitle")
+        configure_wrapped_label(title_label)
 
-        layout.addWidget(title_label)
+        title_row.addWidget(accent_bar)
+        title_row.addWidget(title_label, 1)
+        layout.addLayout(title_row)
 
         if description:
             desc = QLabel(description)
             desc.setObjectName("SectionDescription")
-            desc.setWordWrap(True)
+            configure_wrapped_label(desc)
             layout.addWidget(desc)
 
+        wrapper.setMinimumWidth(0)
         return wrapper
 
     def create_info_frame(self, text):
         frame = QFrame()
         frame.setObjectName("InfoFrame")
+        frame.setMinimumWidth(0)
 
         layout = QHBoxLayout(frame)
-        layout.setContentsMargins(13, 11, 13, 11)
+        layout.setContentsMargins(12, 8, 12, 8)
 
         label = QLabel(text)
         label.setObjectName("MutedLabel")
-        label.setWordWrap(True)
+        configure_wrapped_label(label)
 
-        layout.addWidget(label)
+        layout.addWidget(label, 1)
         return frame
 
     def create_field_label(self, text):
         label = QLabel(text)
         label.setObjectName("FieldLabel")
+        configure_wrapped_label(label, expanding_width=False)
         return label
 
     def create_button(self, text, object_name="SecondaryButton"):
         button = QPushButton(text)
         button.setObjectName(object_name)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setMinimumHeight(40)
+        button.setMinimumWidth(0)
+        button.setMinimumHeight(34)
         return button
+
+    def create_wrapped_checkbox(self, text, checked=False, tooltip=None):
+        """Return (row_container, QCheckBox) where the label wraps cleanly on narrow screens."""
+        container = QWidget()
+        container.setMinimumWidth(0)
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 2, 0, 2)
+        row.setSpacing(8)
+
+        checkbox = QCheckBox()
+        checkbox.setAccessibleName(text)
+        checkbox.setChecked(checked)
+        checkbox.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
+
+        text_label = _WrappedCheckLabel(text, checkbox, container)
+        configure_wrapped_label(text_label)
+        text_label.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        if tooltip:
+            checkbox.setToolTip(tooltip)
+            text_label.setToolTip(tooltip)
+            container.setToolTip(tooltip)
+
+        row.addWidget(checkbox, 0, Qt.AlignmentFlag.AlignTop)
+        row.addWidget(text_label, 1)
+        return container, checkbox
 
     def create_password_field(self, placeholder):
         field = QLineEdit()
         field.setObjectName("PasswordField")
         field.setPlaceholderText(placeholder)
         field.setEchoMode(QLineEdit.EchoMode.Password)
-        field.setMinimumHeight(40)
+        field.setMinimumWidth(0)
+        field.setMinimumHeight(34)
         field.setClearButtonEnabled(True)
         return field
 
     def create_password_row(self, label_text, placeholder):
         wrapper = QWidget()
+        wrapper.setMinimumWidth(0)
 
-        layout = QHBoxLayout(wrapper)
+        layout = QGridLayout(wrapper)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(6)
 
         label = self.create_field_label(label_text)
-        label.setMinimumWidth(155)
+        label.setMinimumWidth(145)
 
         field = self.create_password_field(placeholder)
 
@@ -408,9 +751,11 @@ class SettingsView(QWidget):
 
         toggle.toggled.connect(toggle_visibility)
 
-        layout.addWidget(label)
-        layout.addWidget(field, 1)
-        layout.addWidget(toggle)
+        layout.addWidget(label, 0, 0)
+        layout.addWidget(field, 0, 1)
+        layout.addWidget(toggle, 0, 2)
+        layout.setColumnStretch(1, 1)
+        self._password_rows.append((layout, label, field, toggle))
 
         return wrapper, field
 
@@ -425,72 +770,111 @@ class SettingsView(QWidget):
     # MAIN INTERFACE
     # =========================================================
 
+    def _add_settings_tab(self, title, object_name):
+        container = QWidget()
+        container.setObjectName("SettingsContainer")
+        container.setMinimumWidth(0)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(8)
+
+        scroll = wrap_in_scroll_area(container, object_name=object_name)
+        self.tab_scrolls.append(scroll)
+        self.tab_containers.append(container)
+        self.tab_layouts.append(layout)
+        self.settings_tabs.addTab(scroll, title)
+        return scroll, container, layout
+
+    def _on_settings_tab_changed(self, index):
+        if 0 <= index < len(self.tab_scrolls):
+            self.scroll = self.tab_scrolls[index]
+            self.container = self.tab_containers[index]
+        self._reflow_layout()
+
     def init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 16, 20, 16)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(16, 10, 16, 40)
+        main_layout.setSpacing(8)
+        self.main_layout = main_layout
 
         # Header
-        header = QHBoxLayout()
-
         title_group = QVBoxLayout()
+        title_group.setContentsMargins(0, 0, 0, 0)
         title_group.setSpacing(2)
 
         title = QLabel("Settings & Configuration")
         title.setObjectName("PageTitle")
+        configure_wrapped_label(title)
 
         subtitle = QLabel(
             "Manage application preferences, circulation policies, "
             "academic records, security and database maintenance."
         )
         subtitle.setObjectName("PageSubtitle")
-        subtitle.setWordWrap(True)
+        configure_wrapped_label(subtitle)
 
         title_group.addWidget(title)
         title_group.addWidget(subtitle)
+        main_layout.addLayout(title_group)
 
-        header.addLayout(title_group)
-        header.addStretch()
+        # Category tabs so each section stays readable without a giant vertical scroll wall
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.setObjectName("SettingsCategoryTabs")
+        self.settings_tabs.tabBar().setExpanding(False)
+        self.settings_tabs.tabBar().setUsesScrollButtons(True)
+        self.tab_scrolls = []
+        self.tab_containers = []
+        self.tab_layouts = []
 
-        main_layout.addLayout(header)
-
-        # Scrollable content
-        self.scroll = QScrollArea()
-        self.scroll.setObjectName("SettingsScrollArea")
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        _s0, _c0, tab_policies_layout = self._add_settings_tab(
+            "Policies & Theme", "SettingsPoliciesScroll"
+        )
+        _s1, _c1, tab_academic_layout = self._add_settings_tab(
+            "Academic & Rollover", "SettingsAcademicScroll"
+        )
+        _s2, _c2, tab_comms_layout = self._add_settings_tab(
+            "Email & Updates", "SettingsCommsScroll"
+        )
+        _s3, _c3, tab_backup_layout = self._add_settings_tab(
+            "Backup & Security", "SettingsSecurityScroll"
         )
 
-        self.container = QWidget()
-        self.container.setObjectName("SettingsContainer")
-
-        self.content_layout = QVBoxLayout(self.container)
-        self.content_layout.setContentsMargins(2, 5, 12, 15)
-        self.content_layout.setSpacing(12)
-
-        self.build_department_section()
-        self.build_rollover_section()
+        self.content_layout = tab_policies_layout
         self.build_appearance_section()
         self.build_circulation_section()
+        tab_policies_layout.addStretch()
+
+        self.content_layout = tab_academic_layout
+        self.build_department_section()
+        self.build_rollover_section()
+        tab_academic_layout.addStretch()
+
+        self.content_layout = tab_comms_layout
         self.build_email_section()
         self.build_update_section()
-        self.build_database_section()
+        tab_comms_layout.addStretch()
+
+        self.content_layout = tab_backup_layout
         self.build_cloud_backup_section()
+        self.build_database_section()
         self.build_security_section()
+        tab_backup_layout.addStretch()
 
-        self.content_layout.addStretch()
+        self.content_layout = tab_policies_layout
+        self.scroll = self.tab_scrolls[0]
+        self.container = self.tab_containers[0]
+        self.settings_tabs.currentChanged.connect(self._on_settings_tab_changed)
 
-        self.scroll.setWidget(self.container)
-        main_layout.addWidget(self.scroll, 1)
+        main_layout.addWidget(self.settings_tabs, 1)
 
         # Action bar
         action_frame = self.create_card_frame("SettingsActionBar")
 
-        action_layout = QHBoxLayout(action_frame)
-        action_layout.setContentsMargins(15, 12, 15, 12)
-        action_layout.setSpacing(10)
+        self.action_bar_layout = QGridLayout(action_frame)
+        self.action_bar_layout.setContentsMargins(14, 9, 14, 9)
+        self.action_bar_layout.setHorizontalSpacing(10)
+        self.action_bar_layout.setVerticalSpacing(6)
 
         self.btn_reset = self.create_button(
             "Reset Defaults",
@@ -504,40 +888,40 @@ class SettingsView(QWidget):
         )
         self.btn_save.clicked.connect(self.save_settings)
 
-        action_layout.addWidget(self.btn_reset)
-        action_layout.addStretch()
-        action_layout.addWidget(self.btn_save)
+        self.action_bar_layout.addWidget(self.btn_reset, 0, 0)
+        self.action_bar_layout.addWidget(self.btn_save, 0, 2)
+        self.action_bar_layout.setColumnStretch(1, 1)
 
         main_layout.addWidget(action_frame)
+        self._reflow_layout()
 
     # =========================================================
     # 1. DEPARTMENT MANAGEMENT
     # =========================================================
 
     def build_department_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Academic Departments",
-                "Manage the academic branches and departments "
-                "available in your institution."
-            )
+        header = self.create_section_header(
+            "Academic Departments",
+            "Manage the academic branches and departments "
+            "available in your institution.",
+            accent_role="primary",
         )
+        self.content_layout.addWidget(header)
 
-        card = self.create_card_frame()
+        card = self.create_card_frame(accent_role="primary")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(9)
 
         layout.addWidget(
             self.create_info_frame(
-                "Add, edit and remove academic departments. "
-                "Department changes are managed separately from "
-                "general application settings."
+                "View fixed college branches and faculty departments, "
+                "and adjust course durations for student branches."
             )
         )
 
         self.btn_manage_depts = self.create_button(
-            "Manage Departments",
+            "View Branches && Departments",
             "PrimaryButton"
         )
         self.btn_manage_depts.clicked.connect(
@@ -552,18 +936,18 @@ class SettingsView(QWidget):
     # =========================================================
 
     def build_rollover_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Academic Year Rollover",
-                "Archive graduating students and remove eligible "
-                "records from the active database."
-            )
+        header = self.create_section_header(
+            "Academic Year Rollover",
+            "Archive graduating students and remove eligible "
+            "records from the active database.",
+            accent_role="warning",
         )
+        self.content_layout.addWidget(header)
 
-        card = self.create_card_frame()
+        card = self.create_card_frame(accent_role="warning")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setSpacing(13)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(9)
 
         layout.addWidget(
             self.create_info_frame(
@@ -573,16 +957,16 @@ class SettingsView(QWidget):
             )
         )
 
-        self.chk_skip_active = QCheckBox(
-            "Skip students with issued books"
+        chk_skip_row, self.chk_skip_active = self.create_wrapped_checkbox(
+            "Skip students with issued books",
+            checked=True,
         )
-        self.chk_skip_active.setChecked(True)
 
-        layout.addWidget(self.chk_skip_active)
+        layout.addWidget(chk_skip_row)
 
         self.btn_archive_batch = self.create_button(
-            "Export & Clear Graduating Batch",
-            "SecondaryButton"
+            "Export && Clear Graduating Batch",
+            "WarningButton"
         )
         self.btn_archive_batch.clicked.connect(
             self.handle_batch_rollover_action
@@ -596,19 +980,23 @@ class SettingsView(QWidget):
     # =========================================================
 
     def build_appearance_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Appearance & Interface",
-                "Configure the visual appearance of the application."
-            )
+        header = self.create_section_header(
+            "Appearance & Interface",
+            "Configure the visual appearance of the application.",
+            accent_role="purple",
         )
+        self.content_layout.addWidget(header)
 
-        card = self.create_card_frame()
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setSpacing(15)
+        card = self.create_card_frame(accent_role="purple")
+        self.appearance_layout = QGridLayout(card)
+        self.appearance_layout.setContentsMargins(14, 11, 14, 11)
+        self.appearance_layout.setHorizontalSpacing(14)
+        self.appearance_layout.setVerticalSpacing(8)
 
-        text_layout = QVBoxLayout()
+        self.appearance_text_host = QWidget()
+        self.appearance_text_host.setMinimumWidth(0)
+        text_layout = QVBoxLayout(self.appearance_text_host)
+        text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(5)
 
         label = self.create_field_label("Application Theme")
@@ -617,15 +1005,15 @@ class SettingsView(QWidget):
             "Choose the appearance used throughout the application."
         )
         self.theme_description.setObjectName("MutedLabel")
-        self.theme_description.setWordWrap(True)
+        configure_wrapped_label(self.theme_description)
 
         text_layout.addWidget(label)
         text_layout.addWidget(self.theme_description)
 
         self.combo_theme = QComboBox()
         self.combo_theme.addItems(self.THEMES)
-        self.combo_theme.setMinimumWidth(180)
-        self.combo_theme.setMinimumHeight(40)
+        self.combo_theme.setMinimumWidth(160)
+        self.combo_theme.setMinimumHeight(34)
         self.combo_theme.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
@@ -633,8 +1021,9 @@ class SettingsView(QWidget):
             self.on_theme_changed
         )
 
-        layout.addLayout(text_layout, 1)
-        layout.addWidget(self.combo_theme)
+        self.appearance_layout.addWidget(self.appearance_text_host, 0, 0)
+        self.appearance_layout.addWidget(self.combo_theme, 0, 1)
+        self.appearance_layout.setColumnStretch(0, 1)
 
         self.content_layout.addWidget(card)
 
@@ -643,81 +1032,246 @@ class SettingsView(QWidget):
     # =========================================================
 
     def build_circulation_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Circulation Policies",
-                "Configure borrowing duration and overdue fine calculation."
-            )
+        header = self.create_section_header(
+            "Circulation Policies",
+            "Configure borrowing duration and overdue fine calculation.",
+            accent_role="indigo",
         )
+        self.content_layout.addWidget(header)
 
-        card = self.create_card_frame()
-        layout = QGridLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setHorizontalSpacing(22)
-        layout.setVerticalSpacing(13)
+        card = self.create_card_frame(accent_role="indigo")
+        self.circ_form_layout = QGridLayout(card)
+        self.circ_form_layout.setContentsMargins(14, 11, 14, 11)
+        self.circ_form_layout.setHorizontalSpacing(16)
+        self.circ_form_layout.setVerticalSpacing(8)
 
-        fine_label = self.create_field_label("Daily Overdue Fine")
+        self.circ_fine_label = self.create_field_label("Daily Overdue Fine")
 
         self.spin_daily_fine = QDoubleSpinBox()
         self.spin_daily_fine.setRange(0, 1000)
         self.spin_daily_fine.setDecimals(2)
         self.spin_daily_fine.setSingleStep(0.50)
         self.spin_daily_fine.setPrefix("₹ ")
-        self.spin_daily_fine.setMinimumHeight(40)
+        self.spin_daily_fine.setMinimumWidth(0)
+        self.spin_daily_fine.setMinimumHeight(34)
+        self.spin_daily_fine.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
 
-        fine_description = QLabel(
+        self.circ_fine_desc = QLabel(
             "Amount charged for each overdue day."
         )
-        fine_description.setObjectName("MutedLabel")
+        self.circ_fine_desc.setObjectName("MutedLabel")
+        configure_wrapped_label(self.circ_fine_desc)
 
-        days_label = self.create_field_label("Default Loan Duration")
+        self.circ_days_label = self.create_field_label("Default Loan Duration")
 
         self.spin_default_days = QSpinBox()
         self.spin_default_days.setRange(1, 365)
         self.spin_default_days.setSuffix(" days")
-        self.spin_default_days.setMinimumHeight(40)
+        self.spin_default_days.setMinimumWidth(0)
+        self.spin_default_days.setMinimumHeight(34)
+        self.spin_default_days.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
 
-        days_description = QLabel(
+        self.circ_days_desc = QLabel(
             "Default number of days allowed for borrowing."
         )
-        days_description.setObjectName("MutedLabel")
+        self.circ_days_desc.setObjectName("MutedLabel")
+        configure_wrapped_label(self.circ_days_desc)
 
-        layout.addWidget(fine_label, 0, 0)
-        layout.addWidget(days_label, 0, 1)
+        self.circ_max_renew_label = self.create_field_label("Max Renewals per Loan")
 
-        layout.addWidget(self.spin_daily_fine, 1, 0)
-        layout.addWidget(self.spin_default_days, 1, 1)
+        self.spin_max_renewals = QSpinBox()
+        self.spin_max_renewals.setRange(0, 20)
+        self.spin_max_renewals.setSpecialValueText("Unlimited")
+        self.spin_max_renewals.setSuffix(" times")
+        self.spin_max_renewals.setMinimumWidth(0)
+        self.spin_max_renewals.setMinimumHeight(34)
+        self.spin_max_renewals.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
 
-        layout.addWidget(fine_description, 2, 0)
-        layout.addWidget(days_description, 2, 1)
+        self.circ_max_renew_desc = QLabel(
+            "Maximum standard renewals per checkout (0 allows unlimited renewals)."
+        )
+        self.circ_max_renew_desc.setObjectName("MutedLabel")
+        configure_wrapped_label(self.circ_max_renew_desc)
 
-        self.content_layout.addWidget(card)
-
-    def build_email_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Email Notifications & Complaints",
-                "Send due-date reminders to users and forward submitted "
-                "complaints to the library contact. Pause delivery and review "
-                "or remove queued messages at any time.",
+        self.chk_allow_overdue_row, self.chk_allow_overdue_renew = (
+            self.create_wrapped_checkbox(
+                "Allow renewing overdue loans (assesses overdue fines upon renewal)"
             )
         )
 
-        card = self.create_card_frame()
-        layout = QGridLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setHorizontalSpacing(16)
-        layout.setVerticalSpacing(10)
+        self.circ_form_layout.addWidget(self.circ_fine_label, 0, 0)
+        self.circ_form_layout.addWidget(self.circ_days_label, 0, 1)
+        self.circ_form_layout.addWidget(self.spin_daily_fine, 1, 0)
+        self.circ_form_layout.addWidget(self.spin_default_days, 1, 1)
+        self.circ_form_layout.addWidget(self.circ_fine_desc, 2, 0)
+        self.circ_form_layout.addWidget(self.circ_days_desc, 2, 1)
+        self.circ_form_layout.addWidget(self.circ_max_renew_label, 3, 0, 1, 2)
+        self.circ_form_layout.addWidget(self.spin_max_renewals, 4, 0)
+        self.circ_form_layout.addWidget(self.circ_max_renew_desc, 4, 1)
+        self.circ_form_layout.addWidget(self.chk_allow_overdue_row, 5, 0, 1, 2)
+        self.circ_form_layout.setColumnStretch(0, 1)
+        self.circ_form_layout.setColumnStretch(1, 1)
 
+        self.content_layout.addWidget(card)
+
+        # Role-Based Loan & Fine Policies Editor
+        role_card = self.create_card_frame(accent_role="cyan")
+        self.role_policy_card = role_card
+        self.role_policy_layout = QGridLayout(role_card)
+        self.role_policy_layout.setContentsMargins(14, 11, 14, 11)
+        self.role_policy_layout.setHorizontalSpacing(10)
+        self.role_policy_layout.setVerticalSpacing(7)
+
+        self.role_policy_title = self.create_field_label("Role-Based Borrowing & Fine Policies")
+        configure_wrapped_label(self.role_policy_title)
+        self.role_policy_subtitle = QLabel(
+            "Configure concurrent book limits, default checkout/renewal durations, "
+            "and daily overdue fine rates for each user role."
+        )
+        self.role_policy_subtitle.setObjectName("MutedLabel")
+        configure_wrapped_label(self.role_policy_subtitle)
+
+        self.role_policy_headers = []
+        for col_text in (
+            "Member Role",
+            "Max Books Allowed",
+            "Default Loan Days",
+            "Daily Fine (₹)",
+        ):
+            hdr = self.create_field_label(col_text)
+            hdr.setParent(role_card)
+            configure_wrapped_label(hdr)
+            self.role_policy_headers.append(hdr)
+
+        role_accent_map = {
+            "Student": "student",
+            "Faculty": "faculty",
+            "Guest Lecturer": "guest",
+            "Admin": "admin",
+            "Librarian": "librarian",
+        }
+        self.role_policy_rows = []
+        for idx, (role_name, def_books, def_days, def_fine) in enumerate(
+            self.DEFAULT_ROLE_POLICIES
+        ):
+            lbl_role = QLabel(role_name, role_card)
+            lbl_role.setObjectName("RoleBadge")
+            configure_wrapped_label(lbl_role, expanding_width=False)
+            lbl_role.setProperty(
+                "roleAccent",
+                role_accent_map.get(role_name, "student"),
+            )
+
+            spin_books = QSpinBox(role_card)
+            spin_books.setRange(0, 100)
+            spin_books.setValue(def_books)
+            spin_books.setSuffix(" books")
+            spin_books.setMinimumWidth(0)
+            spin_books.setMinimumHeight(31)
+            spin_books.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+
+            spin_days = QSpinBox(role_card)
+            spin_days.setRange(1, 365)
+            spin_days.setValue(def_days)
+            spin_days.setSuffix(" days")
+            spin_days.setMinimumWidth(0)
+            spin_days.setMinimumHeight(31)
+            spin_days.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+
+            spin_fine = QDoubleSpinBox(role_card)
+            spin_fine.setRange(0, 1000)
+            spin_fine.setDecimals(2)
+            spin_fine.setSingleStep(0.50)
+            spin_fine.setPrefix("₹ ")
+            spin_fine.setValue(def_fine)
+            spin_fine.setMinimumWidth(0)
+            spin_fine.setMinimumHeight(31)
+            spin_fine.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+
+            lbl_books = self.create_field_label("Max Books Allowed")
+            lbl_books.setParent(role_card)
+            lbl_days = self.create_field_label("Default Loan Days")
+            lbl_days.setParent(role_card)
+            lbl_fine = self.create_field_label("Daily Fine (₹)")
+            lbl_fine.setParent(role_card)
+            divider = (
+                self.create_separator()
+                if idx < len(self.DEFAULT_ROLE_POLICIES) - 1
+                else None
+            )
+            if divider is not None:
+                divider.setParent(role_card)
+
+            self.role_policy_rows.append(
+                {
+                    "badge": lbl_role,
+                    "lbl_books": lbl_books,
+                    "spin_books": spin_books,
+                    "lbl_days": lbl_days,
+                    "spin_days": spin_days,
+                    "lbl_fine": lbl_fine,
+                    "spin_fine": spin_fine,
+                    "divider": divider,
+                }
+            )
+
+            self.role_policy_controls[role_name] = {
+                "max_books": spin_books,
+                "default_days": spin_days,
+                "fine_per_day": spin_fine,
+            }
+
+        self.content_layout.addWidget(role_card)
+
+    def build_email_section(self):
+        header = self.create_section_header(
+            "Email Notifications & Complaints",
+            "Send due-date reminders to users and forward submitted "
+            "complaints to the library contact. Pause delivery and review "
+            "or remove queued messages at any time.",
+            accent_role="cyan",
+        )
+        self.content_layout.addWidget(header)
+
+        card = self.create_card_frame(accent_role="cyan")
+        self.email_form_layout = QGridLayout(card)
+        self.email_form_layout.setContentsMargins(14, 11, 14, 11)
+        self.email_form_layout.setHorizontalSpacing(14)
+        self.email_form_layout.setVerticalSpacing(8)
+
+        self.email_sender_label = self.create_field_label("Gmail sender")
+        self.library_contact_label = self.create_field_label("Library contact")
         self.email_sender_input = QLineEdit()
+        self.email_sender_input.setMinimumWidth(0)
         self.email_sender_input.setPlaceholderText(
             "Gmail address used to send messages"
         )
         self.library_contact_input = QLineEdit()
+        self.library_contact_input.setMinimumWidth(0)
         self.library_contact_input.setPlaceholderText(
             "Library inbox for complaints"
         )
+        self.smtp_app_password_label = self.create_field_label("Gmail app password")
         self.smtp_app_password_input = QLineEdit()
+        self.smtp_app_password_input.setMinimumWidth(0)
         self.smtp_app_password_input.setEchoMode(
             QLineEdit.EchoMode.Password
         )
@@ -725,33 +1279,35 @@ class SettingsView(QWidget):
             "Gmail app password (saved in Windows Credential Manager)"
         )
 
-        layout.addWidget(self.create_field_label("Gmail sender"), 0, 0)
-        layout.addWidget(self.create_field_label("Library contact"), 0, 1)
-        layout.addWidget(self.email_sender_input, 1, 0)
-        layout.addWidget(self.library_contact_input, 1, 1)
-        layout.addWidget(
-            self.create_field_label("Gmail app password"),
+        self.email_form_layout.addWidget(self.email_sender_label, 0, 0)
+        self.email_form_layout.addWidget(self.library_contact_label, 0, 1)
+        self.email_form_layout.addWidget(self.email_sender_input, 1, 0)
+        self.email_form_layout.addWidget(self.library_contact_input, 1, 1)
+        self.email_form_layout.addWidget(
+            self.smtp_app_password_label,
             2,
             0,
             1,
             2,
         )
-        layout.addWidget(self.smtp_app_password_input, 3, 0, 1, 2)
+        self.email_form_layout.addWidget(self.smtp_app_password_input, 3, 0, 1, 2)
 
-        actions = QHBoxLayout()
+        self.email_actions_host = QWidget()
+        self.email_actions_host.setMinimumWidth(0)
+        actions = FlowLayout(self.email_actions_host, margin=0, h_spacing=8, v_spacing=8)
         self.save_email_btn = self.create_button(
             "Save Email Settings",
-            "SecondaryButton",
+            "SuccessButton",
         )
         self.save_email_btn.clicked.connect(self.save_email_settings)
         self.test_email_btn = self.create_button(
             "Send Test Email",
-            "SecondaryButton",
+            "InfoButton",
         )
         self.test_email_btn.clicked.connect(self.send_test_email)
         self.clear_email_secret_btn = self.create_button(
             "Remove Saved App Password",
-            "SecondaryButton",
+            "WarningButton",
         )
         self.clear_email_secret_btn.clicked.connect(
             self.remove_email_secret
@@ -760,43 +1316,55 @@ class SettingsView(QWidget):
         actions.addWidget(self.save_email_btn)
         actions.addWidget(self.test_email_btn)
         actions.addWidget(self.clear_email_secret_btn)
-        actions.addStretch()
-        layout.addLayout(actions, 4, 0, 1, 2)
+        self.email_form_layout.addWidget(self.email_actions_host, 4, 0, 1, 2)
 
-        self.email_reminders_checkbox = QCheckBox(
-            "Send one reminder on the due date and one when a loan becomes overdue"
-        )
-        self.email_delivery_checkbox = QCheckBox(
-            "Enable sending queued emails to recipient addresses"
-        )
-        self.email_delivery_checkbox.setToolTip(
-            "Only enable after confirming all queued recipient addresses are "
-            "real and intended. Fake test-user addresses will fail delivery."
+        self.email_delivery_row, self.email_delivery_checkbox = (
+            self.create_wrapped_checkbox(
+                "Enable sending queued emails to recipient addresses",
+                tooltip=(
+                    "Only enable after confirming all queued recipient addresses are "
+                    "real and intended. Fake test-user addresses will fail delivery."
+                ),
+            )
         )
         self.email_delivery_checkbox.toggled.connect(
             self.set_email_delivery_enabled
         )
-        layout.addWidget(
-            self.email_delivery_checkbox,
+        self.email_reminders_row, self.email_reminders_checkbox = (
+            self.create_wrapped_checkbox(
+                "Send one reminder on the due date and one when a loan becomes overdue"
+            )
+        )
+        self.email_form_layout.addWidget(
+            self.email_delivery_row,
             5,
             0,
             1,
             2,
         )
-        layout.addWidget(
-            self.email_reminders_checkbox,
+        self.email_form_layout.addWidget(
+            self.email_reminders_row,
             6,
             0,
             1,
             2,
         )
 
-        queue_actions = QHBoxLayout()
+        self.email_queue_row = QWidget()
+        self.email_queue_row.setMinimumWidth(0)
+        self.email_queue_layout = QGridLayout(self.email_queue_row)
+        self.email_queue_layout.setContentsMargins(0, 0, 0, 0)
+        self.email_queue_layout.setHorizontalSpacing(10)
+        self.email_queue_layout.setVerticalSpacing(8)
         self.email_queue_status = QLabel("Email queue status unavailable")
         self.email_queue_status.setObjectName("MutedLabel")
+        configure_wrapped_label(self.email_queue_status)
+        self.email_queue_btns = QWidget()
+        self.email_queue_btns.setMinimumWidth(0)
+        queue_btns_flow = FlowLayout(self.email_queue_btns, margin=0, h_spacing=8, v_spacing=8)
         self.sync_email_btn = self.create_button(
             "Sync Now",
-            "SecondaryButton",
+            "PrimaryButton",
         )
         self.sync_email_btn.setEnabled(
             self.email_delivery_checkbox.isChecked()
@@ -809,10 +1377,14 @@ class SettingsView(QWidget):
         self.manage_email_queue_btn.clicked.connect(
             self.manage_email_queue
         )
-        queue_actions.addWidget(self.email_queue_status, 1)
-        queue_actions.addWidget(self.manage_email_queue_btn)
-        queue_actions.addWidget(self.sync_email_btn)
-        layout.addLayout(queue_actions, 7, 0, 1, 2)
+        queue_btns_flow.addWidget(self.manage_email_queue_btn)
+        queue_btns_flow.addWidget(self.sync_email_btn)
+        self.email_queue_layout.addWidget(self.email_queue_status, 0, 0)
+        self.email_queue_layout.addWidget(self.email_queue_btns, 0, 1)
+        self.email_queue_layout.setColumnStretch(0, 1)
+        self.email_form_layout.addWidget(self.email_queue_row, 7, 0, 1, 2)
+        self.email_form_layout.setColumnStretch(0, 1)
+        self.email_form_layout.setColumnStretch(1, 1)
 
         app = QApplication.instance()
         self._email_sync_manager = (
@@ -844,18 +1416,18 @@ class SettingsView(QWidget):
             self._email_sync_manager.refresh_status()
 
     def build_update_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Application Updates",
-                "Check for a newer Windows build and update from within "
-                "the application.",
-            )
+        header = self.create_section_header(
+            "Application Updates",
+            "Check for a newer Windows build and update from within "
+            "the application.",
+            accent_role="teal",
         )
+        self.content_layout.addWidget(header)
 
-        card = self.create_card_frame()
+        card = self.create_card_frame(accent_role="teal")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(8)
 
         description = QLabel(
             f"Installed version: {get_app_version()}. Update checks use the "
@@ -864,19 +1436,24 @@ class SettingsView(QWidget):
             "will close and restart."
         )
         description.setObjectName("MutedLabel")
-        description.setWordWrap(True)
+        configure_wrapped_label(description)
         layout.addWidget(description)
 
-        actions = QHBoxLayout()
+        self.update_actions_layout = QGridLayout()
+        self.update_actions_layout.setHorizontalSpacing(10)
+        self.update_actions_layout.setVerticalSpacing(8)
         self.update_status_label = QLabel("Ready to check for updates")
         self.update_status_label.setObjectName("MutedLabel")
+        configure_wrapped_label(self.update_status_label)
+        self.update_btns_host = QWidget()
+        self.update_btns_host.setMinimumWidth(0)
+        update_btns_flow = FlowLayout(self.update_btns_host, margin=0, h_spacing=8, v_spacing=8)
         self.update_button = self.create_button(
             "Check for Updates",
-            "SecondaryButton",
+            "InfoButton",
         )
         self.update_button.clicked.connect(self.check_for_updates)
-        actions.addWidget(self.update_status_label, 1)
-        actions.addWidget(self.update_button)
+        update_btns_flow.addWidget(self.update_button)
         self.manage_versions_button = self.create_button(
             "Manage Versions",
             "SecondaryButton",
@@ -884,8 +1461,11 @@ class SettingsView(QWidget):
         self.manage_versions_button.clicked.connect(
             self.manage_application_versions
         )
-        actions.addWidget(self.manage_versions_button)
-        layout.addLayout(actions)
+        update_btns_flow.addWidget(self.manage_versions_button)
+        self.update_actions_layout.addWidget(self.update_status_label, 0, 0)
+        self.update_actions_layout.addWidget(self.update_btns_host, 0, 1)
+        self.update_actions_layout.setColumnStretch(0, 1)
+        layout.addLayout(self.update_actions_layout)
 
         self.update_progress_bar = QProgressBar()
         self.update_progress_bar.setRange(0, 100)
@@ -897,7 +1477,7 @@ class SettingsView(QWidget):
         self.content_layout.addWidget(card)
 
     def check_for_updates(self):
-        if self._update_worker is not None:
+        if self._closing or self._update_worker is not None:
             return
 
         self.update_button.setEnabled(False)
@@ -910,7 +1490,7 @@ class SettingsView(QWidget):
         self._update_pool.start(worker)
 
     def manage_application_versions(self):
-        if self._update_worker is not None:
+        if self._closing or self._update_worker is not None:
             return
         if not self.verify_admin_password(
             "Administrator Authorization",
@@ -929,6 +1509,9 @@ class SettingsView(QWidget):
         self._update_pool.start(worker)
 
     def _on_version_history_finished(self, result):
+        if getattr(self, "_closing", False) or sip.isdeleted(self):
+            self._update_worker = None
+            return
         self._update_worker = None
         self.update_button.setEnabled(True)
         self.manage_versions_button.setEnabled(True)
@@ -963,6 +1546,9 @@ class SettingsView(QWidget):
             self._on_update_check_finished(selected_release)
 
     def _on_update_check_finished(self, result):
+        if getattr(self, "_closing", False) or sip.isdeleted(self):
+            self._update_worker = None
+            return
         self._update_worker = None
         self.update_button.setEnabled(True)
 
@@ -1090,6 +1676,8 @@ class SettingsView(QWidget):
         self._update_pool.start(worker)
 
     def _on_update_progress(self, progress):
+        if getattr(self, "_closing", False) or sip.isdeleted(self):
+            return
         if self.update_progress_bar.minimum() != 0:
             return
         if self.update_progress_bar.maximum() == 0:
@@ -1097,6 +1685,9 @@ class SettingsView(QWidget):
         self.update_progress_bar.setValue(progress)
 
     def _on_update_download_finished(self, result):
+        if getattr(self, "_closing", False) or sip.isdeleted(self):
+            self._update_worker = None
+            return
         self._update_worker = None
         self.update_progress_bar.hide()
         self.update_button.setEnabled(True)
@@ -1142,18 +1733,18 @@ class SettingsView(QWidget):
             QTimer.singleShot(400, application.quit)
 
     def build_cloud_backup_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Encrypted Google Drive Backup",
-                "Connect a Google account and upload an encrypted "
-                "SQLite backup to its Drive.",
-            )
+        header = self.create_section_header(
+            "Encrypted Google Drive Backup",
+            "Connect a Google account and upload an encrypted "
+            "SQLite backup to its Drive.",
+            accent_role="success",
         )
+        self.content_layout.addWidget(header)
 
-        card = self.create_card_frame()
+        card = self.create_card_frame(accent_role="success")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(8)
 
         description = QLabel(
             "The backup is encrypted before upload. Its encryption key "
@@ -1162,13 +1753,15 @@ class SettingsView(QWidget):
             "are lost."
         )
         description.setObjectName("MutedLabel")
-        description.setWordWrap(True)
+        configure_wrapped_label(description)
         layout.addWidget(description)
 
-        actions = QHBoxLayout()
+        self.drive_actions_host = QWidget()
+        self.drive_actions_host.setMinimumWidth(0)
+        actions = FlowLayout(self.drive_actions_host, margin=0, h_spacing=8, v_spacing=8)
         self.drive_backup_btn = self.create_button(
             "Back Up to Google Drive",
-            "SecondaryButton",
+            "InfoButton",
         )
         self.drive_backup_btn.clicked.connect(
             self.backup_to_google_drive
@@ -1184,26 +1777,26 @@ class SettingsView(QWidget):
         actions.addWidget(self.drive_restore_btn)
         self.drive_key_btn = self.create_button(
             "Export Backup Recovery Key",
-            "SecondaryButton",
+            "WarningButton",
         )
         self.drive_key_btn.clicked.connect(
             self.export_drive_recovery_key
         )
         actions.addWidget(self.drive_key_btn)
-        self.auto_drive_backup_checkbox = QCheckBox(
+
+        auto_drive_row, self.auto_drive_backup_checkbox = self.create_wrapped_checkbox(
             "Automatically upload one encrypted backup per day while the app is running"
         )
         self.save_drive_settings_btn = self.create_button(
             "Save Backup Settings",
-            "SecondaryButton",
+            "SuccessButton",
         )
         self.save_drive_settings_btn.clicked.connect(
             self.save_drive_backup_settings
         )
-        layout.addWidget(self.auto_drive_backup_checkbox)
+        layout.addWidget(auto_drive_row)
         layout.addWidget(self.save_drive_settings_btn)
-        actions.addStretch()
-        layout.addLayout(actions)
+        layout.addWidget(self.drive_actions_host)
         self.content_layout.addWidget(card)
 
     def save_email_settings(self, show_confirmation=True):
@@ -1331,6 +1924,8 @@ class SettingsView(QWidget):
             self.sync_email_btn.setEnabled(enabled)
 
     def send_test_email(self):
+        if self._closing:
+            return
         if not self.email_sender_input.text().strip():
             QMessageBox.warning(
                 self,
@@ -1353,9 +1948,12 @@ class SettingsView(QWidget):
         self.update_status_label_if_available(
             "Sending test email to the configured sender..."
         )
-        QThreadPool.globalInstance().start(worker)
+        self._update_pool.start(worker)
 
     def _on_test_email_finished(self, result):
+        if getattr(self, "_closing", False) or sip.isdeleted(self):
+            self._email_test_worker = None
+            return
         self._email_test_worker = None
         self.test_email_btn.setEnabled(True)
         if result.get("sent"):
@@ -1572,22 +2170,26 @@ class SettingsView(QWidget):
     # =========================================================
 
     def build_database_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Database Maintenance",
-                "Back up your library database and manage circulation logs."
-            )
+        header = self.create_section_header(
+            "Database Maintenance",
+            "Back up your library database and manage circulation logs.",
+            accent_role="danger",
         )
+        self.content_layout.addWidget(header)
 
-        card = self.create_card_frame()
+        card = self.create_card_frame(accent_role="danger")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setSpacing(15)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(10)
 
-        backup_row = QHBoxLayout()
-        backup_row.setSpacing(15)
+        self.db_backup_row_layout = QGridLayout()
+        self.db_backup_row_layout.setHorizontalSpacing(15)
+        self.db_backup_row_layout.setVerticalSpacing(10)
 
-        backup_text = QVBoxLayout()
+        self.db_backup_text_host = QWidget()
+        self.db_backup_text_host.setMinimumWidth(0)
+        backup_text = QVBoxLayout(self.db_backup_text_host)
+        backup_text.setContentsMargins(0, 0, 0, 0)
         backup_text.setSpacing(5)
 
         backup_title = self.create_field_label("Database Backup")
@@ -1596,21 +2198,22 @@ class SettingsView(QWidget):
             "Create an independent copy of the current SQLite database."
         )
         backup_desc.setObjectName("MutedLabel")
-        backup_desc.setWordWrap(True)
+        configure_wrapped_label(backup_desc)
 
         backup_text.addWidget(backup_title)
         backup_text.addWidget(backup_desc)
 
         self.db_backup_btn = self.create_button(
             "Create Backup",
-            "SecondaryButton"
+            "InfoButton"
         )
         self.db_backup_btn.clicked.connect(self.database_backup)
 
-        backup_row.addLayout(backup_text, 1)
-        backup_row.addWidget(self.db_backup_btn)
+        self.db_backup_row_layout.addWidget(self.db_backup_text_host, 0, 0)
+        self.db_backup_row_layout.addWidget(self.db_backup_btn, 0, 1)
+        self.db_backup_row_layout.setColumnStretch(0, 1)
 
-        layout.addLayout(backup_row)
+        layout.addLayout(self.db_backup_row_layout)
         layout.addWidget(self.create_separator())
 
         danger_frame = self.create_card_frame("DangerFrame")
@@ -1626,8 +2229,8 @@ class SettingsView(QWidget):
             "Permanently delete all circulation activity logs. "
             "This operation cannot be undone."
         )
-        danger_desc.setWordWrap(True)
         danger_desc.setObjectName("MutedLabel")
+        configure_wrapped_label(danger_desc)
 
         self.clear_logs_btn = self.create_button(
             "Clear All Circulation Logs",
@@ -1647,18 +2250,18 @@ class SettingsView(QWidget):
     # =========================================================
 
     def build_security_section(self):
-        self.content_layout.addWidget(
-            self.create_section_header(
-                "Administrator Security",
-                "Update the administrator password used for "
-                "protected system operations."
-            )
+        header = self.create_section_header(
+            "Administrator Security",
+            "Update the administrator password used for "
+            "protected system operations.",
+            accent_role="indigo",
         )
+        self.content_layout.addWidget(header)
 
-        card = self.create_card_frame()
+        card = self.create_card_frame(accent_role="indigo")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 17, 18, 17)
-        layout.setSpacing(13)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(9)
 
         layout.addWidget(
             self.create_info_frame(
@@ -1688,7 +2291,7 @@ class SettingsView(QWidget):
 
         self.btn_recovery_code = self.create_button(
             "Generate / Replace Recovery Code",
-            "SecondaryButton",
+            "WarningButton",
         )
         self.btn_recovery_code.clicked.connect(
             self.generate_recovery_code
@@ -1731,6 +2334,16 @@ class SettingsView(QWidget):
                 self.DEFAULTS["default_days"]
             )
 
+            max_renewals = self.db.get_setting(
+                "max_renewals",
+                self.DEFAULTS["max_renewals"],
+            )
+
+            allow_overdue_renewal = self.db.get_setting(
+                "allow_overdue_renewal",
+                "1" if self.DEFAULTS["allow_overdue_renewal"] else "0",
+            )
+
             theme = self.db.get_setting(
                 "theme_mode",
                 self.DEFAULTS["theme_mode"]
@@ -1755,6 +2368,7 @@ class SettingsView(QWidget):
 
             fine = float(fine)
             days = int(days)
+            max_renewals_int = max(0, min(int(max_renewals), 20))
 
             legacy_themes = {
                 "Dark Slate (Default)": "Dark",
@@ -1769,7 +2383,18 @@ class SettingsView(QWidget):
 
             self.spin_daily_fine.setValue(fine)
             self.spin_default_days.setValue(days)
-            self.combo_theme.setCurrentText(theme)
+            self.spin_max_renewals.setValue(max_renewals_int)
+            self.chk_allow_overdue_renew.setChecked(
+                str(allow_overdue_renewal).casefold()
+                in ("1", "true", "yes")
+            )
+            manager = self._theme_manager or self.get_theme_manager()
+            display_theme = theme
+            if self._has_loaded_once and manager is not None:
+                live_theme = manager.get_theme()
+                if live_theme in self.THEMES:
+                    display_theme = live_theme
+            self.combo_theme.setCurrentText(display_theme)
             self.email_sender_input.setText(email_sender or "")
             self.library_contact_input.setText(
                 library_contact or ""
@@ -1790,6 +2415,20 @@ class SettingsView(QWidget):
                 in ("1", "true", "yes")
             )
 
+            policies_ok, policy_rows = self.db.get_all_loan_policies()
+            if policies_ok and policy_rows:
+                policy_map = {
+                    str(r[0]).casefold(): (int(r[1]), int(r[2]), float(r[3]))
+                    for r in policy_rows
+                    if len(r) >= 4
+                }
+                for role_name, ctrls in self.role_policy_controls.items():
+                    vals = policy_map.get(role_name.casefold())
+                    if vals:
+                        ctrls["max_books"].setValue(vals[0])
+                        ctrls["default_days"].setValue(vals[1])
+                        ctrls["fine_per_day"].setValue(vals[2])
+
         except Exception as error:
             QMessageBox.warning(
                 self,
@@ -1801,7 +2440,11 @@ class SettingsView(QWidget):
             self._loading_settings = False
 
         self.update_theme_description()
-        self.apply_selected_theme(self.combo_theme.currentText())
+        if not self._has_loaded_once:
+            self._has_loaded_once = True
+            manager = self._theme_manager or self.get_theme_manager()
+            if manager is None or manager.get_theme() == self.DEFAULTS["theme_mode"]:
+                self.apply_selected_theme(self.combo_theme.currentText())
 
     # =========================================================
     # ADMINISTRATOR AUTHORIZATION
@@ -2137,6 +2780,21 @@ class SettingsView(QWidget):
             self.DEFAULTS["default_days"]
         )
 
+        self.spin_max_renewals.setValue(
+            self.DEFAULTS["max_renewals"]
+        )
+
+        self.chk_allow_overdue_renew.setChecked(
+            self.DEFAULTS["allow_overdue_renewal"]
+        )
+
+        for role_name, def_books, def_days, def_fine in self.DEFAULT_ROLE_POLICIES:
+            ctrls = self.role_policy_controls.get(role_name)
+            if ctrls:
+                ctrls["max_books"].setValue(def_books)
+                ctrls["default_days"].setValue(def_days)
+                ctrls["fine_per_day"].setValue(def_fine)
+
         self.chk_skip_active.setChecked(True)
 
         blocker = QSignalBlocker(self.combo_theme)
@@ -2289,6 +2947,26 @@ class SettingsView(QWidget):
                 self.spin_default_days.value()
             )
 
+            self.db.set_setting(
+                "max_renewals",
+                self.spin_max_renewals.value()
+            )
+
+            self.db.set_setting(
+                "allow_overdue_renewal",
+                "1" if self.chk_allow_overdue_renew.isChecked() else "0"
+            )
+
+            for role_name, ctrls in self.role_policy_controls.items():
+                ok, err = self.db.update_loan_policy(
+                    role_name,
+                    ctrls["max_books"].value(),
+                    ctrls["default_days"].value(),
+                    ctrls["fine_per_day"].value(),
+                )
+                if not ok:
+                    raise RuntimeError(f"Role '{role_name}' policy error: {err}")
+
             theme_name = self.combo_theme.currentText()
 
             self.db.set_setting(
@@ -2338,10 +3016,308 @@ class SettingsView(QWidget):
             self.btn_save.setEnabled(True)
 
     # =========================================================
-    # CLEANUP
+    # RESPONSIVE REFLOW & CLEANUP
     # =========================================================
 
-    def closeEvent(self, event):
+    def _reflow_role_policy_layout(self, avail_w):
+        if not hasattr(self, "role_policy_layout") or not self.role_policy_rows:
+            return
+        self.role_policy_layout.setHorizontalSpacing(6 if avail_w < 680 else 12)
+
+        role_mode = (
+            "table"
+            if avail_w >= 900
+            else ("three_up" if avail_w >= 680 else "stacked")
+        )
+        if role_mode == self._role_policy_mode:
+            return
+        self._role_policy_mode = role_mode
+
+        layout = self.role_policy_layout
+        layout.removeWidget(self.role_policy_title)
+        layout.removeWidget(self.role_policy_subtitle)
+        for hdr in self.role_policy_headers:
+            layout.removeWidget(hdr)
+            hdr.setHidden(role_mode != "table")
+        for row_info in self.role_policy_rows:
+            for key in (
+                "badge",
+                "lbl_books",
+                "spin_books",
+                "lbl_days",
+                "spin_days",
+                "lbl_fine",
+                "spin_fine",
+                "divider",
+            ):
+                wid = row_info.get(key)
+                if wid is not None:
+                    layout.removeWidget(wid)
+
+        col_span = 4 if role_mode == "table" else (3 if role_mode == "three_up" else 2)
+        layout.addWidget(self.role_policy_title, 0, 0, 1, col_span)
+        layout.addWidget(self.role_policy_subtitle, 1, 0, 1, col_span)
+
+        for col_idx in range(4):
+            layout.setColumnStretch(col_idx, 0)
+
+        if role_mode == "table":
+            for col_idx, hdr in enumerate(self.role_policy_headers):
+                hdr.setHidden(False)
+                layout.addWidget(hdr, 2, col_idx)
+            for idx, row_info in enumerate(self.role_policy_rows):
+                grid_row = 3 + idx
+                for hidden_key in ("lbl_books", "lbl_days", "lbl_fine", "divider"):
+                    wid = row_info.get(hidden_key)
+                    if wid is not None:
+                        wid.setHidden(True)
+                layout.addWidget(row_info["badge"], grid_row, 0)
+                layout.addWidget(row_info["spin_books"], grid_row, 1)
+                layout.addWidget(row_info["spin_days"], grid_row, 2)
+                layout.addWidget(row_info["spin_fine"], grid_row, 3)
+            layout.setColumnStretch(0, 0)
+            layout.setColumnStretch(1, 1)
+            layout.setColumnStretch(2, 1)
+            layout.setColumnStretch(3, 1)
+        elif role_mode == "three_up":
+            grid_row = 2
+            for row_info in self.role_policy_rows:
+                layout.addWidget(
+                    row_info["badge"],
+                    grid_row,
+                    0,
+                    1,
+                    3,
+                    Qt.AlignmentFlag.AlignLeft,
+                )
+                grid_row += 1
+                for col_idx, lbl_key in enumerate(("lbl_books", "lbl_days", "lbl_fine")):
+                    row_info[lbl_key].setHidden(False)
+                    layout.addWidget(row_info[lbl_key], grid_row, col_idx)
+                grid_row += 1
+                for col_idx, spin_key in enumerate(("spin_books", "spin_days", "spin_fine")):
+                    layout.addWidget(row_info[spin_key], grid_row, col_idx)
+                grid_row += 1
+                if row_info["divider"] is not None:
+                    row_info["divider"].setHidden(False)
+                    layout.addWidget(row_info["divider"], grid_row, 0, 1, 3)
+                    grid_row += 1
+            layout.setColumnStretch(0, 1)
+            layout.setColumnStretch(1, 1)
+            layout.setColumnStretch(2, 1)
+        else:
+            grid_row = 2
+            for row_info in self.role_policy_rows:
+                layout.addWidget(
+                    row_info["badge"],
+                    grid_row,
+                    0,
+                    1,
+                    2,
+                    Qt.AlignmentFlag.AlignLeft,
+                )
+                grid_row += 1
+                for lbl_key, spin_key in (
+                    ("lbl_books", "spin_books"),
+                    ("lbl_days", "spin_days"),
+                    ("lbl_fine", "spin_fine"),
+                ):
+                    row_info[lbl_key].setHidden(False)
+                    layout.addWidget(row_info[lbl_key], grid_row, 0)
+                    layout.addWidget(row_info[spin_key], grid_row, 1)
+                    grid_row += 1
+                if row_info["divider"] is not None:
+                    row_info["divider"].setHidden(False)
+                    layout.addWidget(row_info["divider"], grid_row, 0, 1, 2)
+                    grid_row += 1
+            layout.setColumnStretch(0, 1)
+            layout.setColumnStretch(1, 1)
+
+    def _reflow_layout(self):
+        if not hasattr(self, "main_layout"):
+            return
+        sb = self.scroll.verticalScrollBar() if hasattr(self, "scroll") else None
+        sb_w = sb.width() if (sb is not None and sb.isVisible()) else 0
+        avail_w = max(320, self.width() - sb_w) if self.width() > 0 else 1080
+
+        compact_outer = avail_w < 840
+        if compact_outer != self._settings_compact:
+            self._settings_compact = compact_outer
+            margin = 12 if compact_outer else 16
+            v_margin = 8 if compact_outer else 10
+            self.main_layout.setContentsMargins(margin, v_margin, margin, 40)
+
+        h_m = 6 if avail_w < 720 else 10
+        for tab_layout in getattr(self, "tab_layouts", ()):
+            tab_layout.setContentsMargins(h_m, 8, h_m, 10)
+
+        self._reflow_role_policy_layout(avail_w)
+
+        action_stacked = avail_w < 440
+        if action_stacked != self._action_bar_stacked and hasattr(self, "action_bar_layout"):
+            self._action_bar_stacked = action_stacked
+            self.action_bar_layout.removeWidget(self.btn_reset)
+            self.action_bar_layout.removeWidget(self.btn_save)
+            if action_stacked:
+                self.action_bar_layout.addWidget(self.btn_reset, 0, 0)
+                self.action_bar_layout.addWidget(self.btn_save, 1, 0)
+                self.action_bar_layout.setColumnStretch(0, 1)
+                self.action_bar_layout.setColumnStretch(1, 0)
+                self.action_bar_layout.setColumnStretch(2, 0)
+            else:
+                self.action_bar_layout.addWidget(self.btn_reset, 0, 0)
+                self.action_bar_layout.addWidget(self.btn_save, 0, 2)
+                self.action_bar_layout.setColumnStretch(0, 0)
+                self.action_bar_layout.setColumnStretch(1, 1)
+                self.action_bar_layout.setColumnStretch(2, 0)
+
+        stacked = avail_w < 580
+        if stacked == self._settings_stacked:
+            return
+        self._settings_stacked = stacked
+
+        if hasattr(self, "appearance_layout"):
+            self.appearance_layout.removeWidget(self.appearance_text_host)
+            self.appearance_layout.removeWidget(self.combo_theme)
+            self.combo_theme.setMinimumWidth(0 if stacked else 160)
+            if stacked:
+                self.appearance_layout.addWidget(self.appearance_text_host, 0, 0)
+                self.appearance_layout.addWidget(self.combo_theme, 1, 0)
+            else:
+                self.appearance_layout.addWidget(self.appearance_text_host, 0, 0)
+                self.appearance_layout.addWidget(self.combo_theme, 0, 1)
+            self.appearance_layout.setColumnStretch(0, 1)
+            self.appearance_layout.setColumnStretch(1, 0)
+
+        if hasattr(self, "circ_form_layout"):
+            circ_widgets = (
+                self.circ_fine_label,
+                self.spin_daily_fine,
+                self.circ_fine_desc,
+                self.circ_days_label,
+                self.spin_default_days,
+                self.circ_days_desc,
+                self.circ_max_renew_label,
+                self.spin_max_renewals,
+                self.circ_max_renew_desc,
+                self.chk_allow_overdue_row,
+            )
+            for w in circ_widgets:
+                self.circ_form_layout.removeWidget(w)
+            if stacked:
+                for row_idx, w in enumerate(circ_widgets):
+                    self.circ_form_layout.addWidget(w, row_idx, 0)
+                self.circ_form_layout.setColumnStretch(0, 1)
+                self.circ_form_layout.setColumnStretch(1, 0)
+            else:
+                self.circ_form_layout.addWidget(self.circ_fine_label, 0, 0)
+                self.circ_form_layout.addWidget(self.circ_days_label, 0, 1)
+                self.circ_form_layout.addWidget(self.spin_daily_fine, 1, 0)
+                self.circ_form_layout.addWidget(self.spin_default_days, 1, 1)
+                self.circ_form_layout.addWidget(self.circ_fine_desc, 2, 0)
+                self.circ_form_layout.addWidget(self.circ_days_desc, 2, 1)
+                self.circ_form_layout.addWidget(self.circ_max_renew_label, 3, 0, 1, 2)
+                self.circ_form_layout.addWidget(self.spin_max_renewals, 4, 0)
+                self.circ_form_layout.addWidget(self.circ_max_renew_desc, 4, 1)
+                self.circ_form_layout.addWidget(self.chk_allow_overdue_row, 5, 0, 1, 2)
+                self.circ_form_layout.setColumnStretch(0, 1)
+                self.circ_form_layout.setColumnStretch(1, 1)
+
+        if hasattr(self, "email_form_layout"):
+            email_widgets = (
+                self.email_sender_label,
+                self.email_sender_input,
+                self.library_contact_label,
+                self.library_contact_input,
+                self.smtp_app_password_label,
+                self.smtp_app_password_input,
+                self.email_actions_host,
+                self.email_delivery_row,
+                self.email_reminders_row,
+                self.email_queue_row,
+            )
+            for w in email_widgets:
+                self.email_form_layout.removeWidget(w)
+            if stacked:
+                for row_idx, w in enumerate(email_widgets):
+                    self.email_form_layout.addWidget(w, row_idx, 0)
+                self.email_form_layout.setColumnStretch(0, 1)
+                self.email_form_layout.setColumnStretch(1, 0)
+            else:
+                self.email_form_layout.addWidget(self.email_sender_label, 0, 0)
+                self.email_form_layout.addWidget(self.library_contact_label, 0, 1)
+                self.email_form_layout.addWidget(self.email_sender_input, 1, 0)
+                self.email_form_layout.addWidget(self.library_contact_input, 1, 1)
+                self.email_form_layout.addWidget(self.smtp_app_password_label, 2, 0, 1, 2)
+                self.email_form_layout.addWidget(self.smtp_app_password_input, 3, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_actions_host, 4, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_delivery_row, 5, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_reminders_row, 6, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_queue_row, 7, 0, 1, 2)
+                self.email_form_layout.setColumnStretch(0, 1)
+                self.email_form_layout.setColumnStretch(1, 1)
+
+        if hasattr(self, "email_queue_layout"):
+            self.email_queue_layout.removeWidget(self.email_queue_status)
+            self.email_queue_layout.removeWidget(self.email_queue_btns)
+            self.email_queue_layout.addWidget(self.email_queue_status, 0, 0)
+            if stacked:
+                self.email_queue_layout.addWidget(self.email_queue_btns, 1, 0)
+            else:
+                self.email_queue_layout.addWidget(self.email_queue_btns, 0, 1)
+            self.email_queue_layout.setColumnStretch(0, 1)
+
+        if hasattr(self, "update_actions_layout"):
+            self.update_actions_layout.removeWidget(self.update_status_label)
+            self.update_actions_layout.removeWidget(self.update_btns_host)
+            self.update_actions_layout.addWidget(self.update_status_label, 0, 0)
+            if stacked:
+                self.update_actions_layout.addWidget(self.update_btns_host, 1, 0)
+            else:
+                self.update_actions_layout.addWidget(self.update_btns_host, 0, 1)
+            self.update_actions_layout.setColumnStretch(0, 1)
+
+        if hasattr(self, "db_backup_row_layout"):
+            self.db_backup_row_layout.removeWidget(self.db_backup_text_host)
+            self.db_backup_row_layout.removeWidget(self.db_backup_btn)
+            self.db_backup_row_layout.addWidget(self.db_backup_text_host, 0, 0)
+            if stacked:
+                self.db_backup_row_layout.addWidget(self.db_backup_btn, 1, 0)
+            else:
+                self.db_backup_row_layout.addWidget(self.db_backup_btn, 0, 1)
+            self.db_backup_row_layout.setColumnStretch(0, 1)
+
+        for pw_layout, lbl, fld, tgl in self._password_rows:
+            pw_layout.removeWidget(lbl)
+            pw_layout.removeWidget(fld)
+            pw_layout.removeWidget(tgl)
+            if stacked:
+                lbl.setMinimumWidth(0)
+                pw_layout.addWidget(lbl, 0, 0, 1, 2)
+                pw_layout.addWidget(fld, 1, 0)
+                pw_layout.addWidget(tgl, 1, 1)
+                pw_layout.setColumnStretch(0, 1)
+                pw_layout.setColumnStretch(1, 0)
+                pw_layout.setColumnStretch(2, 0)
+            else:
+                lbl.setMinimumWidth(145)
+                pw_layout.addWidget(lbl, 0, 0)
+                pw_layout.addWidget(fld, 0, 1)
+                pw_layout.addWidget(tgl, 0, 2)
+                pw_layout.setColumnStretch(0, 0)
+                pw_layout.setColumnStretch(1, 1)
+                pw_layout.setColumnStretch(2, 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow_layout()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._reflow_layout()
+
+    def stop_workers(self, wait_ms=1000):
+        self._closing = True
         manager = self._theme_manager
 
         if manager:
@@ -2353,4 +3329,31 @@ class SettingsView(QWidget):
                 except (TypeError, RuntimeError):
                     pass
 
+        for worker_attr, slot in (
+            ("_update_worker", self._on_update_check_finished),
+            ("_update_worker", self._on_version_history_finished),
+            ("_update_worker", self._on_update_download_finished),
+            ("_email_test_worker", self._on_test_email_finished),
+        ):
+            worker = getattr(self, worker_attr, None)
+            if worker is not None:
+                signals = getattr(worker, "signals", None)
+                finished = getattr(signals, "finished", None)
+                if finished is not None:
+                    try:
+                        finished.disconnect(slot)
+                    except (TypeError, RuntimeError):
+                        pass
+
+        pool = getattr(self, "_update_pool", None)
+        if pool is not None:
+            try:
+                pool.waitForDone(wait_ms)
+            except (RuntimeError, AttributeError):
+                pass
+        self._update_worker = None
+        self._email_test_worker = None
+
+    def closeEvent(self, event):
+        self.stop_workers(wait_ms=1000)
         super().closeEvent(event)
