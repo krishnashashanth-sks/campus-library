@@ -1,4 +1,4 @@
-# LibCore - Campus Library Management System
+# Library Management System
 
 A comprehensive desktop application for managing campus library operations, including book catalog management, user administration, circulation tracking, and detailed reporting. Built with Python and PyQt6 for a native desktop experience.
 
