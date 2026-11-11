@@ -19,7 +19,7 @@ from ui_responsive import (
     make_scrollable_tab,
     sync_responsive_splitter,
 )
-from utils import clear_layout, rgba_color
+from utils import clear_layout, format_log_id_display, rgba_color
 from dialogs import IssueBookDialog, PendingFinesDialog, RenewLoanDialog, ReturnBookDialog
 
 
@@ -210,6 +210,7 @@ class CirculationView(QWidget):
         self._page_compact = None
         self._filter_compact_mode = None
         self._control_center_expanded = True
+        self._closing = False
 
         self._updating_table = False
 
@@ -231,6 +232,15 @@ class CirculationView(QWidget):
         if self.theme_manager:
             try:
                 self.theme_manager.themeChanged.connect(
+                    self.apply_theme
+                )
+            except (AttributeError, TypeError, RuntimeError):
+                pass
+
+    def _disconnect_theme_manager(self):
+        if self.theme_manager:
+            try:
+                self.theme_manager.themeChanged.disconnect(
                     self.apply_theme
                 )
             except (AttributeError, TypeError, RuntimeError):
@@ -567,7 +577,7 @@ class CirculationView(QWidget):
             }}
 
             QTableWidget#CirculationTable::item {{
-                padding: 7px 9px;
+                padding: 6px 5px;
                 border-bottom: 1px solid {c['border']};
             }}
 
@@ -576,7 +586,7 @@ class CirculationView(QWidget):
                 color: {c['text']};
                 border: none;
                 border-bottom: 2px solid {c['border_bright']};
-                padding: 10px 10px;
+                padding: 9px 5px;
                 font-size: 11px;
                 font-weight: 700;
             }}
@@ -633,7 +643,13 @@ class CirculationView(QWidget):
         for key, card in getattr(self, "metric_cards", {}).items():
             card.set_accent(accent_map.get(key, card.accent), c)
 
-        if hasattr(self, "table") and self.table.rowCount() > 0 and self.filtered_logs:
+        if (
+            not self._closing
+            and getattr(self.db, "conn", None) is not None
+            and hasattr(self, "table")
+            and self.table.rowCount() > 0
+            and self.filtered_logs
+        ):
             selected_ids = self._get_selected_log_ids()
             self.populate_table(self.filtered_logs)
             if selected_ids:
@@ -827,7 +843,7 @@ class CirculationView(QWidget):
         filters_host = QWidget()
         filters_host.setObjectName("FilterButtonsHost")
         filters_host.setMinimumWidth(0)
-        filters_host.setStyleSheet("background: transparent; border: none;")
+        filters_host.setStyleSheet("QWidget#FilterButtonsHost { background: transparent; border: none; }")
         filters_host.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
@@ -1048,7 +1064,7 @@ class CirculationView(QWidget):
             header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
             header.setStretchLastSection(False)
             compact_widths = {
-                0: 74,   # Log ID
+                0: 124,  # Log ID
                 1: 82,   # Book ID
                 2: 122,  # User ID
                 3: 92,   # Status
@@ -1062,12 +1078,12 @@ class CirculationView(QWidget):
         else:
             header.setStretchLastSection(False)
             fixed_widths = {
-                0: 56,   # Log ID
-                1: 68,   # Book ID
-                3: 94,   # Status
-                4: 118,  # Issue Date
-                6: 118,  # Return Date
-                7: 78,   # Fine
+                0: 118,  # Log ID (fits CIR-YYMMDD-NNNN cleanly without overflow)
+                1: 52,   # Book ID
+                3: 82,   # Status
+                4: 117,  # Issue Date
+                6: 117,  # Return Date
+                7: 62,   # Fine
             }
             for col in range(len(self.HEADERS)):
                 if col in fixed_widths:
@@ -1266,9 +1282,11 @@ class CirculationView(QWidget):
         except (TypeError, ValueError):
             fine_value = 0.0
 
-        renewal_count, last_renewed = self.renewal_meta.get(int(log_id), (0, ""))
-        settled, fine_action, _, _ = self.fine_meta.get(
-            int(log_id), (False, "", "", "")
+        renewal_count, last_renewed = self._lookup_meta(
+            self.renewal_meta, log_id, (0, "")
+        )
+        settled, fine_action, _, _ = self._lookup_meta(
+            self.fine_meta, log_id, (False, "", "", "")
         )
         fine_text = f"₹{fine_value:.2f}"
         if fine_value > 0 and settled:
@@ -1287,7 +1305,7 @@ class CirculationView(QWidget):
         }
 
         self.hover_preview_title.setText(
-            f"Transaction #{log_id}"
+            f"Transaction {format_log_id_display(log_id)}"
         )
         self.hover_preview_status.setText(display_status)
         status_color = (
@@ -1409,9 +1427,17 @@ class CirculationView(QWidget):
         except (IndexError, TypeError):
             return False
 
+    @staticmethod
+    def _lookup_meta(mapping, log_id, default):
+        if not mapping:
+            return default
+        if log_id in mapping:
+            return mapping[log_id]
+        return mapping.get(str(log_id), default)
+
     def _get_renewal_count(self, log_id):
         try:
-            return int(self.renewal_meta.get(int(log_id), (0, ""))[0] or 0)
+            return int(self._lookup_meta(self.renewal_meta, log_id, (0, ""))[0] or 0)
         except (TypeError, ValueError):
             return 0
 
@@ -1564,8 +1590,8 @@ class CirculationView(QWidget):
                     continue
 
             renewal_count = self._get_renewal_count(row[0])
-            settled, fine_action, _, _ = self.fine_meta.get(
-                int(row[0]), (False, "", "", "")
+            settled, fine_action, _, _ = self._lookup_meta(
+                self.fine_meta, row[0], (False, "", "", "")
             )
             fine_tag = (
                 "waived" if settled and str(fine_action).upper() == "WAIVED"
@@ -1613,11 +1639,11 @@ class CirculationView(QWidget):
                 ) = row
 
                 display_status = self._display_status(row)
-                renewal_count, last_renewed = self.renewal_meta.get(
-                    int(log_id), (0, "")
+                renewal_count, last_renewed = self._lookup_meta(
+                    self.renewal_meta, log_id, (0, "")
                 )
-                settled, fine_action, settled_at, _ = self.fine_meta.get(
-                    int(log_id), (False, "", "", "")
+                settled, fine_action, settled_at, _ = self._lookup_meta(
+                    self.fine_meta, log_id, (False, "", "", "")
                 )
 
                 try:
@@ -1860,7 +1886,7 @@ class CirculationView(QWidget):
             banner_border = c["indigo"]
 
         status_lbl = QLabel(
-            f"{status}\nTransaction #{log_id}"
+            f"{status}\nTransaction {format_log_id_display(log_id)}"
         )
 
         status_lbl.setAlignment(
@@ -1885,8 +1911,8 @@ class CirculationView(QWidget):
         except (TypeError, ValueError):
             fine_value = 0.0
 
-        renewal_meta = self.db.get_loan_renewal_meta([log_id]).get(
-            int(log_id), (0, "")
+        renewal_meta = self._lookup_meta(
+            self.db.get_loan_renewal_meta([log_id]), log_id, (0, "")
         )
         renewal_count, last_renewed = renewal_meta
         max_renewals = self.db.get_max_renewals()
@@ -1895,10 +1921,10 @@ class CirculationView(QWidget):
             if max_renewals > 0
             else f"{renewal_count} (Unlimited)"
         )
-        settled, fine_action, settled_at, fine_note = (
-            self.db.get_loan_fine_settlement_meta([log_id]).get(
-                int(log_id), (False, "", "", "")
-            )
+        settled, fine_action, settled_at, fine_note = self._lookup_meta(
+            self.db.get_loan_fine_settlement_meta([log_id]),
+            log_id,
+            (False, "", "", ""),
         )
         if fine_value <= 0:
             fine_status_text = "No fine"
@@ -2063,7 +2089,7 @@ class CirculationView(QWidget):
             unpaid_fine_rows = [
                 r for r in selected_records
                 if float(r[6] or 0) > 0
-                and not self.fine_meta.get(int(r[0]), (False, "", "", ""))[0]
+                and not self._lookup_meta(self.fine_meta, r[0], (False, "", "", ""))[0]
             ]
             unpaid_total = sum(float(r[6] or 0) for r in unpaid_fine_rows)
 
@@ -2160,7 +2186,7 @@ class CirculationView(QWidget):
                 QMessageBox.information(
                     self,
                     "Book Issued",
-                    "Book successfully issued."
+                    str(msg or "Book successfully issued.")
                 )
                 self.load_circulation()
 
@@ -2260,7 +2286,7 @@ class CirculationView(QWidget):
         note, ok = QInputDialog.getText(
             self,
             label,
-            f"Optional reference / note for transaction #{log_id}:",
+            f"Optional reference / note for transaction {format_log_id_display(log_id)}:",
         )
         if not ok:
             return
@@ -2308,7 +2334,7 @@ class CirculationView(QWidget):
             if ok_ren:
                 succeeded += 1
             else:
-                failed.append(f"#{row[0]} ({row[1]}): {msg}")
+                failed.append(f"{format_log_id_display(row[0])} ({row[1]}): {msg}")
 
         self.load_circulation()
         summary = f"Renewed: {succeeded}\nFailed: {len(failed)}"
@@ -2338,7 +2364,7 @@ class CirculationView(QWidget):
                 succeeded += 1
                 total_fines += float(fine or 0)
             else:
-                failed.append(f"#{row[0]} ({row[1]}): {msg}")
+                failed.append(f"{format_log_id_display(row[0])} ({row[1]}): {msg}")
 
         self.load_circulation()
         summary = (
@@ -2373,7 +2399,7 @@ class CirculationView(QWidget):
             if ok_settle:
                 succeeded += 1
             else:
-                failed.append(f"#{row[0]}: {msg}")
+                failed.append(f"{format_log_id_display(row[0])}: {msg}")
 
         self.load_circulation()
         summary = f"Settled: {succeeded}\nFailed: {len(failed)}"
@@ -2417,7 +2443,9 @@ class CirculationView(QWidget):
             )
 
         fine_val = float(row_data[6] or 0)
-        settled = self.fine_meta.get(int(row_data[0]), (False, "", "", ""))[0]
+        settled = self._lookup_meta(
+            self.fine_meta, row_data[0], (False, "", "", "")
+        )[0]
         if fine_val > 0 and not settled:
             pay_action = menu.addAction("💳 Mark Fine Paid")
             waive_action = menu.addAction("Waive Fine")
@@ -2493,10 +2521,12 @@ class CirculationView(QWidget):
                 )
 
                 for row in self.filtered_logs:
-                    lid = int(row[0])
-                    r_count, last_r = self.renewal_meta.get(lid, (0, ""))
-                    settled, f_action, _, _ = self.fine_meta.get(
-                        lid, (False, "", "", "")
+                    lid = row[0]
+                    r_count, last_r = self._lookup_meta(
+                        self.renewal_meta, lid, (0, "")
+                    )
+                    settled, f_action, _, _ = self._lookup_meta(
+                        self.fine_meta, lid, (False, "", "", "")
                     )
                     fine_val = float(row[6] or 0)
                     if fine_val <= 0:
@@ -2533,3 +2563,8 @@ class CirculationView(QWidget):
                 "Export Error",
                 f"Unable to export CSV:\n{exc}"
             )
+
+    def closeEvent(self, event):
+        self._closing = True
+        self._disconnect_theme_manager()
+        super().closeEvent(event)

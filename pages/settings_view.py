@@ -828,16 +828,16 @@ class SettingsView(QWidget):
         self.tab_layouts = []
 
         _s0, _c0, tab_policies_layout = self._add_settings_tab(
-            "Policies & Theme", "SettingsPoliciesScroll"
+            "Policies && Theme", "SettingsPoliciesScroll"
         )
         _s1, _c1, tab_academic_layout = self._add_settings_tab(
-            "Academic & Rollover", "SettingsAcademicScroll"
+            "Academic && Rollover", "SettingsAcademicScroll"
         )
         _s2, _c2, tab_comms_layout = self._add_settings_tab(
-            "Email & Updates", "SettingsCommsScroll"
+            "Email && Updates", "SettingsCommsScroll"
         )
         _s3, _c3, tab_backup_layout = self._add_settings_tab(
-            "Backup & Security", "SettingsSecurityScroll"
+            "Backup && Security", "SettingsSecurityScroll"
         )
 
         self.content_layout = tab_policies_layout

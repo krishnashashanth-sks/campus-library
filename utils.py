@@ -88,6 +88,38 @@ def is_valid_user_id(user_id, role):
     return False
 
 
+def format_log_id_display(log_id) -> str:
+    """Return a clean human-readable circulation log/transaction identifier.
+
+    Structured codes such as ``CIR-261112-0001`` are returned without any
+    leading ``#`` (normalizing ``#CIR-...`` if supplied), while legacy
+    numeric identifiers are formatted with a leading ``#``.
+    """
+    text = str(log_id or "").strip()
+    if not text:
+        return "—"
+    stripped = text.lstrip("#").strip()
+    if not stripped:
+        return "—"
+    if stripped.isdigit():
+        return f"#{stripped}"
+    if is_structured_log_id(stripped):
+        return stripped.upper()
+    return stripped if text.startswith("#") else text
+
+
+def is_structured_log_id(log_id) -> bool:
+    """Return True when ``log_id`` matches ``CIR-YYMMDD-NNNN`` (4+ sequence digits)."""
+    return (
+        re.fullmatch(
+            r"CIR-[0-9]{6}-[0-9]{4,}",
+            str(log_id or "").strip(),
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
 def get_resource_path(relative_path: str) -> str:
     """Returns the absolute path to project assets for both IDE execution and PyInstaller builds."""
     if hasattr(sys, "_MEIPASS"):

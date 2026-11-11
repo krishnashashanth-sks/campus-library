@@ -1563,9 +1563,17 @@ class ReportsView(QWidget):
                 fine_meta = self.db.get_loan_fine_settlement_meta(log_ids)
 
                 for row in self.filtered_rows:
-                    lid = int(row[0])
-                    r_count = renewal_meta.get(lid, (0, ""))[0]
-                    settled, f_act, _, _ = fine_meta.get(lid, (False, "", "", ""))
+                    lid = row[0]
+                    r_count = (
+                        renewal_meta.get(lid)
+                        if lid in renewal_meta
+                        else renewal_meta.get(str(lid), (0, ""))
+                    )[0]
+                    settled, f_act, _, _ = (
+                        fine_meta.get(lid)
+                        if lid in fine_meta
+                        else fine_meta.get(str(lid), (False, "", "", ""))
+                    )
                     f_val = float(row[6] or 0)
                     if f_val <= 0:
                         f_status = "No Fine"

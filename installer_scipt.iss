@@ -1,9 +1,9 @@
 ; Inno Setup script for Campus Library Management System (LibCore)
 ; Override version from CLI/CI using:
-;   ISCC.exe /DAppVersion=2.0 installer_scipt.iss
+;   ISCC.exe /DAppVersion=1.0 installer_scipt.iss
 
 #ifndef AppVersion
-  #define AppVersion "2.0"
+  #define AppVersion "1.0"
 #endif
 
 #define AppName "Library"

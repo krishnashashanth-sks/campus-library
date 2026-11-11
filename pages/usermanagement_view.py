@@ -792,7 +792,7 @@ class UserManagementView(QWidget):
             }}
 
             QTableWidget::item {{
-                padding: 7px 9px;
+                padding: 6px 6px;
                 border-bottom: 1px solid {c["border"]};
             }}
 
@@ -803,7 +803,7 @@ class UserManagementView(QWidget):
                 font-size: 11px;
                 border: none;
                 border-bottom: 2px solid {c["border_bright"]};
-                padding: 10px 6px;
+                padding: 9px 5px;
             }}
 
             QTabWidget::pane {{
@@ -1272,11 +1272,11 @@ class UserManagementView(QWidget):
 
         header.setStretchLastSection(False)
         fixed_widths = {
-            0: 98,   # PIN / ID
-            2: 98,   # Phone Number
-            3: 76,   # Role
-            4: 106,  # Year of Study
-            6: 88,   # Created At
+            0: 108,  # PIN / ID
+            2: 94,   # Phone Number
+            3: 82,   # Role
+            4: 108,  # Year of Study
+            6: 94,   # Created At
         }
         for col_idx in range(len(self.HEADERS)):
             if col_idx in fixed_widths:
@@ -1639,7 +1639,7 @@ class UserManagementView(QWidget):
         filters_host = QWidget()
         filters_host.setObjectName("FilterButtonsHost")
         filters_host.setMinimumWidth(0)
-        filters_host.setStyleSheet("background: transparent; border: none;")
+        filters_host.setStyleSheet("QWidget#FilterButtonsHost { background: transparent; border: none; }")
         filters_host.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,

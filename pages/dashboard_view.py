@@ -36,7 +36,7 @@ from ui_responsive import (
     configure_wrapped_label,
     wrap_in_scroll_area,
 )
-from utils import rgba_color
+from utils import format_log_id_display, rgba_color
 
 
 PRIMARY = "#2563eb"
@@ -45,18 +45,18 @@ WARNING = "#f59e0b"
 DANGER = "#ef4444"
 INFO = "#6366f1"
 STATUS_BADGE_COLORS = {
-    "ISSUED": ("rgba(59, 130, 246, 0.22)", "#93C5FD", "#3B82F6"),
-    "DUE TODAY": ("rgba(245, 158, 11, 0.22)", "#FCD34D", "#F59E0B"),
-    "OVERDUE": ("rgba(244, 63, 94, 0.24)", "#FDA4AF", "#F43F5E"),
-    "RETURNED": ("rgba(16, 185, 129, 0.22)", "#6EE7B7", "#10B981"),
-    "RENEWED": ("rgba(34, 211, 238, 0.22)", "#67E8F9", "#06B6D4"),
+    "ISSUED": ("#17294F", "#93C5FD", "#3B82F6"),
+    "DUE TODAY": ("#33240C", "#FCD34D", "#F59E0B"),
+    "OVERDUE": ("#3A1424", "#FDA4AF", "#F43F5E"),
+    "RETURNED": ("#103028", "#6EE7B7", "#10B981"),
+    "RENEWED": ("#0F2D3A", "#67E8F9", "#06B6D4"),
 }
 STATUS_BADGE_COLORS_LIGHT = {
-    "ISSUED": ("rgba(29, 78, 216, 0.20)", "#1E3A8A", "#1D4ED8"),
-    "DUE TODAY": ("rgba(180, 83, 9, 0.22)", "#92400E", "#B45309"),
-    "OVERDUE": ("rgba(190, 18, 60, 0.20)", "#9F1239", "#BE123C"),
-    "RETURNED": ("rgba(4, 120, 87, 0.20)", "#065F46", "#047857"),
-    "RENEWED": ("rgba(3, 105, 161, 0.20)", "#075985", "#0369A1"),
+    "ISSUED": ("#DBEAFE", "#1E3A8A", "#1D4ED8"),
+    "DUE TODAY": ("#FEF3C7", "#92400E", "#B45309"),
+    "OVERDUE": ("#FFE4E6", "#9F1239", "#BE123C"),
+    "RETURNED": ("#DCFCE7", "#065F46", "#047857"),
+    "RENEWED": ("#E0F2FE", "#075985", "#0369A1"),
 }
 
 
@@ -1880,7 +1880,7 @@ class ActivityHistoryDialog(QDialog):
         header = self.table.horizontalHeader()
         if compact:
             header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-            for col, width in enumerate((68, 95, 190, 145, 78, 130)):
+            for col, width in enumerate((122, 95, 190, 145, 78, 130)):
                 self.table.setColumnWidth(col, width)
         else:
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -1969,7 +1969,7 @@ class ActivityHistoryDialog(QDialog):
         for row, entry in enumerate(self.filtered_logs):
             ren_count = int(entry.get("renewal_count", 0) or 0)
             values = [
-                f"#{entry['log_id']}",
+                format_log_id_display(entry["log_id"]),
                 entry["status"],
                 entry["book_label"],
                 entry["user_label"],
@@ -2090,7 +2090,7 @@ class ActivityHistoryDialog(QDialog):
         r_count = int(full.get("renewal_count") or 0)
         ren_text = f"{r_count} / {max_r}" if max_r > 0 else f"{r_count} (Unlimited)"
         details = [
-            ("TRANSACTION ID", f"#{full['log_id']}"),
+            ("TRANSACTION ID", format_log_id_display(full["log_id"])),
             ("STATUS", full["status"]),
             ("BOOK", f"{full['book_title']} ({full['book_id']})"),
             ("MEMBER", f"{full['user_name']} ({full['user_id']} · {full['user_role']})"),
@@ -2118,7 +2118,7 @@ class ActivityHistoryDialog(QDialog):
             entry["timestamp"],
             self,
             details=details,
-            dialog_title=f"Transaction #{full['log_id']}",
+            dialog_title=f"Transaction {format_log_id_display(full['log_id'])}",
             action_label="Renew Loan" if is_active else None,
             action_callback=(
                 self.renew_selected_activity
@@ -2860,7 +2860,7 @@ class DashboardView(QWidget):
             }}
 
             QTableWidget#ActivityTable::item {{
-                padding: 7px 9px;
+                padding: 5px 6px;
                 border-bottom: 1px solid {c['border']};
             }}
 
@@ -2870,8 +2870,8 @@ class DashboardView(QWidget):
 
             QLabel#StatusBadge {{
                 border-radius: 9px;
-                padding: 2px 8px;
-                margin: 4px 2px;
+                padding: 1px 6px;
+                margin: 5px 2px;
                 font-size: 10px;
                 font-weight: 800;
             }}
@@ -2881,7 +2881,7 @@ class DashboardView(QWidget):
                 color: {c['text']};
                 border: none;
                 border-bottom: 2px solid {border_bright};
-                padding: 7px 8px;
+                padding: 7px 6px;
                 font-size: 10px;
                 font-weight: 700;
             }}
@@ -3064,7 +3064,7 @@ class DashboardView(QWidget):
         if compact:
             table_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
             for column, width in (
-                (0, 114), (1, 60), (2, 165), (3, 155), (4, 88), (5, 118), (6, 200)
+                (0, 118), (1, 60), (2, 165), (3, 155), (4, 94), (5, 126), (6, 200)
             ):
                 self.activity_table.setColumnWidth(column, width)
         else:
@@ -3072,7 +3072,7 @@ class DashboardView(QWidget):
             table_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
             table_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
             for column, width in (
-                (0, 114), (1, 60), (4, 86), (5, 118), (6, 206)
+                (0, 118), (1, 60), (4, 94), (5, 126), (6, 206)
             ):
                 self.activity_table.setColumnWidth(column, width)
 
@@ -3266,8 +3266,10 @@ class DashboardView(QWidget):
                 ):
                     status = "DUE TODAY"
 
-                renewal_count, last_renewed_at = renewal_meta.get(
-                    int(log_id), (0, "")
+                renewal_count, last_renewed_at = (
+                    renewal_meta.get(log_id)
+                    if log_id in renewal_meta
+                    else renewal_meta.get(str(log_id), (0, ""))
                 )
 
                 self._activity_records.append({
@@ -3385,13 +3387,16 @@ class DashboardView(QWidget):
             badge.setStyleSheet(
                 f"color: {status_color}; background: {badge_background};"
                 f" border: 1px solid {badge_border}; border-radius: 9px;"
-                f" padding: 1px 6px; margin: 6px 2px;"
+                f" padding: 1px 6px; margin: 5px 2px;"
                 f" font-size: 10px; font-weight: 800;"
             )
             self.activity_table.setCellWidget(row_index, 4, badge)
 
             actions = QWidget()
-            actions.setStyleSheet("background: transparent;")
+            actions.setObjectName("ActivityRowActions")
+            actions.setStyleSheet(
+                "QWidget#ActivityRowActions { background: transparent; border: none; }"
+            )
             actions_layout = QHBoxLayout(actions)
             actions_layout.setContentsMargins(3, 0, 3, 0)
             actions_layout.setSpacing(4)
@@ -3447,7 +3452,7 @@ class DashboardView(QWidget):
                     else "Unlimited"
                 )
                 renew_button.setToolTip(
-                    f"Renew loan #{item['log_id']} ({remaining})"
+                    f"Renew loan {format_log_id_display(item['log_id'])} ({remaining})"
                 )
             renew_button.clicked.connect(
                 lambda _checked=False, selected=item:
@@ -3590,7 +3595,10 @@ class DashboardView(QWidget):
                 else "No copies available"
             )
             if active_loan_id is not None:
-                availability_text += f" · Active loan #{active_loan_id} ready to renew/return"
+                availability_text += (
+                    f" · Active loan {format_log_id_display(active_loan_id)} "
+                    "ready to renew/return"
+                )
             self.express_book_preview.setText(
                 f"{safe_text(book[1])} · {availability_text}"
             )
@@ -3812,7 +3820,7 @@ class DashboardView(QWidget):
         dialog = RenewLoanDialog(self.db, loan_id, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._set_express_status(
-                dialog.result_message or f"Loan #{loan_id} renewed.",
+                dialog.result_message or f"Loan {format_log_id_display(loan_id)} renewed.",
                 success=True,
             )
             self.refresh_dashboard()
@@ -3933,7 +3941,7 @@ class DashboardView(QWidget):
                     "Transaction",
                     log_id,
                     book_title,
-                    f"Transaction · #{log_id} · {member_name} · "
+                    f"Transaction · {format_log_id_display(log_id)} · {member_name} · "
                     f"{safe_text(status).title()}",
                     3,
                 )
@@ -3987,10 +3995,11 @@ class DashboardView(QWidget):
             history_lines = "None"
 
         fine_val = float(item["fine"] or 0)
+        fine_meta = self.db.get_loan_fine_settlement_meta([item["log_id"]])
         settled, fine_action, settled_at, _fine_note = (
-            self.db.get_loan_fine_settlement_meta([item["log_id"]]).get(
-                int(item["log_id"]), (False, "", "", "")
-            )
+            fine_meta.get(item["log_id"])
+            if item["log_id"] in fine_meta
+            else fine_meta.get(str(item["log_id"]), (False, "", "", ""))
         )
         if fine_val <= 0:
             fine_text = "₹0.00"
@@ -4001,7 +4010,7 @@ class DashboardView(QWidget):
             fine_text = f"₹{fine_val:.2f} (Pending)"
 
         details = [
-            ("Transaction ID", item["log_id"]),
+            ("Transaction ID", format_log_id_display(item["log_id"])),
             ("Book ID", item["book_id"]),
             ("Book Title", item["book_title"]),
             (
@@ -4025,7 +4034,7 @@ class DashboardView(QWidget):
             item["display_date"],
             self,
             details=details,
-            dialog_title=f"Transaction #{item['log_id']}",
+            dialog_title=f"Transaction {format_log_id_display(item['log_id'])}",
             action_label="🔄 Renew Loan" if is_active else None,
             action_callback=(
                 (lambda selected=item: self.renew_activity_record(selected))

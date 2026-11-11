@@ -505,7 +505,7 @@ class CatalogView(QWidget):
         filters_host = QWidget()
         filters_host.setObjectName("FilterButtonsHost")
         filters_host.setMinimumWidth(0)
-        filters_host.setStyleSheet("background: transparent; border: none;")
+        filters_host.setStyleSheet("QWidget#FilterButtonsHost { background: transparent; border: none; }")
         filters_host.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
@@ -760,7 +760,7 @@ class CatalogView(QWidget):
                 header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
                 self.table.setColumnWidth(col, width)
         else:
-            for col, width in ((0, 72), (4, 108), (5, 62), (6, 76)):
+            for col, width in ((0, 70), (4, 90), (5, 80), (6, 96)):
                 header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
                 self.table.setColumnWidth(col, width)
             for col in (1, 2, 3):
@@ -1177,7 +1177,7 @@ class CatalogView(QWidget):
             }}
 
             QTableWidget#CatalogTable::item {{
-                padding: 7px 9px;
+                padding: 6px 6px;
                 border-bottom: 1px solid {c["border"]};
             }}
 
@@ -1186,7 +1186,7 @@ class CatalogView(QWidget):
                 color: {c["text"]};
                 border: none;
                 border-bottom: 2px solid {c["border_bright"]};
-                padding: 10px 10px;
+                padding: 9px 6px;
                 font-size: 11px;
                 font-weight: 700;
             }}

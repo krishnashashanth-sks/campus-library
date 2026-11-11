@@ -29,6 +29,7 @@ from PyQt6.QtGui import (
 
 from utils import (
     clear_layout,
+    format_log_id_display,
     is_valid_book_id,
     is_valid_phone_number,
     is_valid_user_id,
@@ -1702,7 +1703,7 @@ class ViewBooksDialog(QDialog):
                 self.user_id
             ) or []
             self._loan_extras = self.db.conn.execute("""
-                SELECT c.id,
+                SELECT COALESCE(NULLIF(c.log_code, ''), CAST(c.id AS TEXT)),
                        COALESCE(c.renewal_count, 0),
                        COALESCE(c.last_renewed_at, ''),
                        COALESCE(c.fine_settled, 0),
@@ -1997,7 +1998,7 @@ class ViewBooksDialog(QDialog):
         confirm = QMessageBox.question(
             self,
             "Confirm Fine Settlement",
-            f"Do you want to {verb} for transaction #{loan_id}?",
+            f"Do you want to {verb} for transaction {format_log_id_display(loan_id)}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirm != QMessageBox.StandardButton.Yes:
@@ -2477,7 +2478,7 @@ class QuickScanDialog(QDialog):
                 )
                 if active_loan_id:
                     self.lbl_user_policy.setText(
-                        f"{user[1]} ({role}) · Active loan #{active_loan_id} detected for {code}"
+                        f"{user[1]} ({role}) · Active loan {format_log_id_display(active_loan_id)} detected for {code}"
                     )
                     self.lbl_user_policy.setStyleSheet(
                         f"background: {c['cyan_soft']}; color: {c['cyan']}; "
@@ -3298,7 +3299,7 @@ class BookHistoryDialog(QDialog):
             cursor.execute(
                 """
                 SELECT
-                    id,
+                    COALESCE(NULLIF(log_code, ''), CAST(id AS TEXT)),
                     user_id,
                     checkout_date,
                     due_date,
@@ -3476,7 +3477,7 @@ class BookHistoryDialog(QDialog):
             fine_status = "Unpaid Balance"
 
         details = [
-            ("Log ID:", f"#{log_id}"),
+            ("Log ID:", format_log_id_display(log_id)),
             ("Book ID:", self.book_id),
             ("Borrower ID:", user_id),
             ("Status:", "OVERDUE" if is_overdue else status),
@@ -3556,7 +3557,7 @@ class BookHistoryDialog(QDialog):
         confirm = QMessageBox.question(
             self,
             "Confirm Fine Settlement",
-            f"Do you want to {verb} for transaction #{log_id}?",
+            f"Do you want to {verb} for transaction {format_log_id_display(log_id)}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirm != QMessageBox.StandardButton.Yes:
@@ -4435,13 +4436,14 @@ class RenewLoanDialog(QDialog):
 
         self.db = db
         self.loan_id = loan_id
+        display_loan_id = format_log_id_display(loan_id)
         self.preview = {}
         self.result_details = {}
         self.result_message = ""
 
         configure_dialog(
             self,
-            f"Renew Loan — Transaction #{loan_id}",
+            f"Renew Loan — Transaction {display_loan_id}",
             760,
             765,
             min_width=460,
@@ -4453,7 +4455,7 @@ class RenewLoanDialog(QDialog):
         main_layout.setSpacing(10)
 
         main_layout.addWidget(
-            create_heading(f"🔄 Advanced Loan Renewal — #{loan_id}")
+            create_heading(f"🔄 Advanced Loan Renewal — {display_loan_id}")
         )
 
         scroll_area = QScrollArea()
@@ -5039,7 +5041,7 @@ class PendingFinesDialog(QDialog):
         if compact:
             fines_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
             for col, width in (
-                (0, 62),
+                (0, 122),
                 (1, 102),
                 (2, 140),
                 (3, 64),
@@ -5109,7 +5111,7 @@ class PendingFinesDialog(QDialog):
             date_ref = return_date or due_date or "—"
             raw_status = str(status or "").upper()
             vals = [
-                f"#{log_id}",
+                format_log_id_display(log_id),
                 safe_text(user_id),
                 safe_text(user_name),
                 safe_text(book_id),
@@ -5178,7 +5180,7 @@ class PendingFinesDialog(QDialog):
             self,
             "Confirm Fine Settlement",
             f"Do you want to {verb} {money(fine_amount)} for {user_name} ({user_id}) "
-            f"on book {book_id} (Transaction #{log_id})?",
+            f"on book {book_id} (Transaction {format_log_id_display(log_id)})?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:

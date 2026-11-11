@@ -15,6 +15,7 @@ from utils import (
     COLLEGE_BRANCH_NAMES,
     FACULTY_ADDITIONAL_DEPARTMENTS,
     FACULTY_ADDITIONAL_DEPARTMENT_NAMES,
+    format_log_id_display,
     get_appdata_db_path,
 )
 
@@ -136,6 +137,7 @@ class LocalDatabase:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS circulation_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    log_code TEXT,
                     book_id TEXT COLLATE NOCASE,
                     user_id TEXT COLLATE NOCASE,
                     checkout_date TIMESTAMP,
@@ -252,6 +254,7 @@ class LocalDatabase:
 
             # Lightweight additive migrations for databases created by earlier versions.
             self._ensure_column("books", "isbn", "TEXT")
+            self._ensure_column("circulation_logs", "log_code", "TEXT")
             self._ensure_column("circulation_logs", "status", "TEXT DEFAULT 'ISSUED'")
             self._ensure_column("circulation_logs", "fine_amount", "DECIMAL(10, 2) DEFAULT 0.00")
             self._ensure_column("circulation_logs", "renewal_count", "INTEGER NOT NULL DEFAULT 0")
@@ -262,10 +265,13 @@ class LocalDatabase:
             self._ensure_column("circulation_logs", "fine_settlement_note", "TEXT")
             self._ensure_column("users", "email", "TEXT")
 
+            self._backfill_circulation_log_codes(cur)
+
             cur.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
                 CREATE INDEX IF NOT EXISTS idx_users_department ON users(department);
                 CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_logs_log_code ON circulation_logs(log_code COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_logs_user_status ON circulation_logs(user_id, status);
                 CREATE INDEX IF NOT EXISTS idx_logs_book_status ON circulation_logs(book_id, status);
                 CREATE INDEX IF NOT EXISTS idx_logs_due_status ON circulation_logs(due_date, status);
@@ -330,6 +336,168 @@ class LocalDatabase:
         existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    _LOG_CODE_PATTERN = re.compile(r"^CIR-(\d{6})-(\d+)$", re.IGNORECASE)
+    _LOG_CODE_SQL = "COALESCE(NULLIF(log_code, ''), CAST(id AS TEXT))"
+    _C_LOG_CODE_SQL = "COALESCE(NULLIF(c.log_code, ''), CAST(c.id AS TEXT))"
+
+    @classmethod
+    def _parse_loan_ref(cls, loan_ref):
+        """Parse a user-facing log code ('CIR-...') or legacy integer PK."""
+        if loan_ref is None or isinstance(loan_ref, bool):
+            return None, None
+        if isinstance(loan_ref, int):
+            return ("PK", loan_ref) if loan_ref > 0 else (None, None)
+        text = cls._clean(loan_ref)
+        if text.startswith("#"):
+            text = cls._clean(text[1:])
+        if not text:
+            return None, None
+        if text.isdigit():
+            pk = int(text)
+            return ("PK", pk) if pk > 0 else (None, None)
+        if cls._LOG_CODE_PATTERN.match(text):
+            return "CODE", text.upper()
+        return None, None
+
+    def _resolve_loan_pk(self, loan_ref) -> Optional[int]:
+        kind, val = self._parse_loan_ref(loan_ref)
+        if kind == "PK":
+            row = self.conn.execute(
+                "SELECT id FROM circulation_logs WHERE id = ?",
+                (val,),
+            ).fetchone()
+            return int(row[0]) if row else None
+        if kind == "CODE":
+            row = self.conn.execute(
+                "SELECT id FROM circulation_logs WHERE log_code = ? COLLATE NOCASE",
+                (val,),
+            ).fetchone()
+            return int(row[0]) if row else None
+        return None
+
+    def _backfill_circulation_log_codes(self, cur=None):
+        """Assign structured CIR-YYMMDD-NNNN codes to any legacy rows lacking log_code."""
+        cursor = cur or self.conn.cursor()
+        rows = cursor.execute(
+            "SELECT id, checkout_date, COALESCE(log_code, '') FROM circulation_logs ORDER BY id ASC"
+        ).fetchall()
+        if not rows:
+            return
+
+        used_codes = set()
+        daily_max = {}
+        pending = []
+        for row_id, checkout_date, existing_code in rows:
+            clean_code = self._clean(existing_code).upper()
+            if clean_code:
+                used_codes.add(clean_code)
+                match = self._LOG_CODE_PATTERN.match(clean_code)
+                if match:
+                    date_key, seq_text = match.groups()
+                    daily_max[date_key] = max(daily_max.get(date_key, 0), int(seq_text))
+            else:
+                pending.append((int(row_id), checkout_date))
+
+        if not pending:
+            return
+
+        fallback_dt = datetime.datetime.now()
+        updates = []
+        for row_id, checkout_date in pending:
+            ref_dt = self._parse_circulation_datetime(checkout_date) or fallback_dt
+            date_key = ref_dt.strftime("%y%m%d")
+            seq = daily_max.get(date_key, 0) + 1
+            candidate = f"CIR-{date_key}-{seq:04d}"
+            while candidate in used_codes:
+                seq += 1
+                candidate = f"CIR-{date_key}-{seq:04d}"
+            daily_max[date_key] = seq
+            used_codes.add(candidate)
+            updates.append((candidate, row_id))
+
+        cursor.executemany(
+            "UPDATE circulation_logs SET log_code = ? WHERE id = ?",
+            updates,
+        )
+
+    def _generate_next_log_code(self, ref_dt=None) -> str:
+        """Generate the next unique CIR-YYMMDD-NNNN identifier for ref_dt."""
+        ref = ref_dt or datetime.datetime.now()
+        date_key = ref.strftime("%y%m%d")
+        prefix = f"CIR-{date_key}-"
+        rows = self.conn.execute(
+            "SELECT log_code FROM circulation_logs WHERE log_code LIKE ?",
+            (f"{prefix}%",),
+        ).fetchall()
+        max_seq = 0
+        used_codes = set()
+        pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$", re.IGNORECASE)
+        for (code,) in rows:
+            clean_code = self._clean(code).upper()
+            if not clean_code:
+                continue
+            used_codes.add(clean_code)
+            match = pattern.match(clean_code)
+            if match:
+                max_seq = max(max_seq, int(match.group(1)))
+        seq = max_seq + 1
+        candidate = f"{prefix}{seq:04d}"
+        while candidate in used_codes:
+            seq += 1
+            candidate = f"{prefix}{seq:04d}"
+        return candidate
+
+    def _query_loan_columns_by_refs(self, columns_sql: str, log_ids=None):
+        """Fetch columns from circulation_logs for None (all) or mixed PK/log_code refs."""
+        if self.conn is None:
+            return []
+        if log_ids is None:
+            rows = self.conn.execute(
+                f"SELECT {self._LOG_CODE_SQL}, {columns_sql} FROM circulation_logs"
+            ).fetchall()
+            return [(str(row[0]), row[1:]) for row in rows]
+
+        pk_map = {}
+        code_map = {}
+        for raw_ref in log_ids:
+            kind, val = self._parse_loan_ref(raw_ref)
+            if kind == "PK":
+                pk_map.setdefault(val, []).append(raw_ref)
+            elif kind == "CODE":
+                code_map.setdefault(val, []).append(raw_ref)
+
+        matched = []
+        pk_list = list(pk_map.keys())
+        for offset in range(0, len(pk_list), 500):
+            batch = pk_list[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"SELECT id, {columns_sql} FROM circulation_logs WHERE id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                pk = int(row[0])
+                payload = row[1:]
+                for orig_ref in pk_map.get(pk, ()):
+                    matched.append((orig_ref, payload))
+
+        code_list = list(code_map.keys())
+        for offset in range(0, len(code_list), 500):
+            batch = code_list[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"SELECT log_code, {columns_sql} FROM circulation_logs "
+                f"WHERE log_code COLLATE NOCASE IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                code_key = self._clean(row[0]).upper()
+                payload = row[1:]
+                for orig_ref in code_map.get(code_key, ()):
+                    matched.append((orig_ref, payload))
+
+        return matched
 
     # SETTINGS
     def get_setting(self, key, default=None):
@@ -1162,11 +1330,13 @@ class LocalDatabase:
                 due = now + datetime.timedelta(days=days)
                 checkout_text = now.strftime("%Y-%m-%d %H:%M")
                 due_text = due.strftime("%Y-%m-%d %H:%M")
-                cursor = self.conn.execute("""
-                    INSERT INTO circulation_logs(book_id, user_id, checkout_date, due_date, status)
-                    VALUES (?, ?, ?, ?, 'ISSUED')
-                """, (bid, uid, checkout_text, due_text))
-                loan_id = cursor.lastrowid
+                log_code = self._generate_next_log_code(now)
+                self.conn.execute("""
+                    INSERT INTO circulation_logs(
+                        log_code, book_id, user_id, checkout_date, due_date, status
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'ISSUED')
+                """, (log_code, bid, uid, checkout_text, due_text))
                 self.conn.execute("""
                     UPDATE books SET available_copies = available_copies - 1
                     WHERE id = ? AND available_copies > 0
@@ -1185,13 +1355,13 @@ class LocalDatabase:
                         (
                             f"Hello {full_name},\n\n"
                             f"Book '{title}' (Book ID: {bid}) has been "
-                            f"issued to your account. It is due on "
-                            f"{due_text}.\n\nLibrary"
+                            f"issued to your account (Transaction ID: {log_code}). "
+                            f"It is due on {due_text}.\n\nLibrary"
                         ),
                         "ISSUE",
-                        dedupe_key=f"issue:{loan_id}",
+                        dedupe_key=f"issue:{log_code}",
                     )
-            return True, f"Book issued successfully! Due Date: {due_text}"
+            return True, f"Book issued successfully! Transaction ID: {log_code} · Due Date: {due_text}"
         except Exception as exc:
             return False, self._parse_db_error(exc, "book issue")
 
@@ -1235,47 +1405,38 @@ class LocalDatabase:
 
     def get_loan_renewal_meta(self, log_ids=None):
         try:
-            if log_ids is None:
-                rows = self.conn.execute("""
-                    SELECT id, COALESCE(renewal_count, 0), COALESCE(last_renewed_at, '')
-                    FROM circulation_logs
-                """).fetchall()
-                return {
-                    int(row[0]): (int(row[1] or 0), str(row[2] or ""))
-                    for row in rows
-                }
-
-            clean_ids = sorted({int(loan_id) for loan_id in log_ids if loan_id is not None})
-            result = {}
-            for offset in range(0, len(clean_ids), 500):
-                batch = clean_ids[offset:offset + 500]
-                placeholders = ",".join("?" for _ in batch)
-                rows = self.conn.execute(f"""
-                    SELECT id, COALESCE(renewal_count, 0), COALESCE(last_renewed_at, '')
-                    FROM circulation_logs
-                    WHERE id IN ({placeholders})
-                """, batch).fetchall()
-                for row in rows:
-                    result[int(row[0])] = (int(row[1] or 0), str(row[2] or ""))
-            return result
+            matched = self._query_loan_columns_by_refs(
+                "COALESCE(renewal_count, 0), COALESCE(last_renewed_at, '')",
+                log_ids=log_ids,
+            )
+            return {
+                key: (int(vals[0] or 0), str(vals[1] or ""))
+                for key, vals in matched
+            }
         except (sqlite3.Error, ValueError, TypeError):
             logging.exception("Could not fetch loan renewal metadata")
             return {}
 
     def get_renewal_history(self, loan_id):
         try:
+            pk = self._resolve_loan_pk(loan_id)
+            if pk is None:
+                return []
             rows = self.conn.execute("""
-                SELECT id, loan_id, book_id, user_id, previous_due_date, new_due_date,
-                       extended_days, base_mode, fine_assessed, fine_action, notes, renewed_at
-                FROM renewal_logs
-                WHERE loan_id = ?
-                ORDER BY id DESC
-            """, (int(loan_id),)).fetchall()
+                SELECT r.id,
+                       COALESCE(NULLIF(c.log_code, ''), CAST(r.loan_id AS TEXT)),
+                       r.book_id, r.user_id, r.previous_due_date, r.new_due_date,
+                       r.extended_days, r.base_mode, r.fine_assessed, r.fine_action, r.notes, r.renewed_at
+                FROM renewal_logs r
+                LEFT JOIN circulation_logs c ON c.id = r.loan_id
+                WHERE r.loan_id = ?
+                ORDER BY r.id DESC
+            """, (pk,)).fetchall()
             history = []
             for row in rows:
                 history.append({
                     "id": int(row[0]),
-                    "loan_id": int(row[1]),
+                    "loan_id": str(row[1] or ""),
                     "book_id": str(row[2] or ""),
                     "user_id": str(row[3] or ""),
                     "previous_due_date": str(row[4] or ""),
@@ -1295,12 +1456,12 @@ class LocalDatabase:
     def get_active_loan_id(self, book_id, user_id):
         bid, uid = self._clean(book_id), self._clean(user_id)
         try:
-            row = self.conn.execute("""
-                SELECT id FROM circulation_logs
+            row = self.conn.execute(f"""
+                SELECT {self._LOG_CODE_SQL} FROM circulation_logs
                 WHERE book_id = ? AND user_id = ? AND status = 'ISSUED'
                 ORDER BY id DESC LIMIT 1
             """, (bid, uid)).fetchone()
-            return int(row[0]) if row else None
+            return str(row[0]) if row else None
         except (sqlite3.Error, ValueError, TypeError):
             return None
 
@@ -1313,13 +1474,19 @@ class LocalDatabase:
         now=None,
     ):
         now_dt = (now or datetime.datetime.now()).replace(second=0, microsecond=0)
-        try:
-            lid = int(loan_id)
-        except (ValueError, TypeError):
+        kind, _ = self._parse_loan_ref(loan_id)
+        if kind is None:
             return {"found": False, "eligible": False, "block_reason": "Invalid transaction ID."}
+        lid = self._resolve_loan_pk(loan_id)
+        if lid is None:
+            return {
+                "found": False,
+                "eligible": False,
+                "block_reason": f"Transaction {format_log_id_display(loan_id)} was not found.",
+            }
 
-        row = self.conn.execute("""
-            SELECT c.id, c.book_id, c.user_id, c.checkout_date, c.due_date, c.return_date,
+        row = self.conn.execute(f"""
+            SELECT c.id, {self._C_LOG_CODE_SQL}, c.book_id, c.user_id, c.checkout_date, c.due_date, c.return_date,
                    COALESCE(c.fine_amount, 0), UPPER(COALESCE(c.status, 'ISSUED')),
                    COALESCE(c.renewal_count, 0), COALESCE(c.last_renewed_at, ''),
                    COALESCE(b.title, 'Unknown Book'), COALESCE(b.author, ''),
@@ -1332,10 +1499,14 @@ class LocalDatabase:
             WHERE c.id = ?
         """, (lid,)).fetchone()
         if not row:
-            return {"found": False, "eligible": False, "block_reason": f"Transaction #{lid} was not found."}
+            return {
+                "found": False,
+                "eligible": False,
+                "block_reason": f"Transaction {format_log_id_display(loan_id)} was not found.",
+            }
 
         (
-            _id, book_id, user_id, checkout_date, due_date, return_date,
+            _id, display_id, book_id, user_id, checkout_date, due_date, return_date,
             carried_fine, status, renewal_count, last_renewed_at,
             book_title, book_author, total_copies, available_copies,
             user_name, user_role, user_department, user_email,
@@ -1446,7 +1617,8 @@ class LocalDatabase:
 
         return {
             "found": True,
-            "loan_id": int(_id),
+            "loan_id": str(display_id or _id),
+            "internal_id": int(_id),
             "book_id": str(book_id or ""),
             "book_title": str(book_title or "Unknown Book"),
             "book_author": str(book_author or ""),
@@ -1500,10 +1672,12 @@ class LocalDatabase:
         notes="",
         allow_limit_override=False,
     ):
-        try:
-            lid = int(loan_id)
-        except (ValueError, TypeError):
+        kind, _ = self._parse_loan_ref(loan_id)
+        if kind is None:
             return False, {}, "Invalid transaction ID."
+        lid = self._resolve_loan_pk(loan_id)
+        if lid is None:
+            return False, {}, f"Transaction {format_log_id_display(loan_id)} was not found."
 
         fine_action_key = self._clean(fine_action or "CARRY").upper()
         if fine_action_key not in ("CARRY", "COLLECTED", "WAIVED", "NONE"):
@@ -1606,6 +1780,7 @@ class LocalDatabase:
                     (lid,),
                 )
 
+                display_id = str(preview["loan_id"])
                 email = preview.get("user_email", "")
                 if email:
                     fine_line = ""
@@ -1629,17 +1804,19 @@ class LocalDatabase:
                         f"Book renewed: {preview['book_title']}",
                         (
                             f"Hello {preview['user_name']},\n\n"
-                            f"Book '{preview['book_title']}' (Book ID: {preview['book_id']}) "
+                            f"Book '{preview['book_title']}' (Book ID: {preview['book_id']}, "
+                            f"Transaction ID: {display_id}) "
                             f"has been renewed for +{days} day(s). Previous due date: {previous_due}. "
                             f"New due date: {new_due}.{fine_line}\n\n"
                             "Library"
                         ),
                         "ISSUE",
-                        dedupe_key=f"renew:{lid}:{new_renewal_count}",
+                        dedupe_key=f"renew:{display_id}:{new_renewal_count}",
                     )
 
             details = {
-                "loan_id": lid,
+                "loan_id": display_id,
+                "internal_id": lid,
                 "book_id": preview["book_id"],
                 "book_title": preview["book_title"],
                 "user_id": preview["user_id"],
@@ -1656,7 +1833,7 @@ class LocalDatabase:
                 "notes": final_notes,
                 "renewed_at": renewed_at,
             }
-            return True, details, f"Loan #{lid} renewed successfully! New Due Date: {new_due}"
+            return True, details, f"Loan {format_log_id_display(display_id)} renewed successfully! New Due Date: {new_due}"
         except Exception as exc:
             return False, {}, self._parse_db_error(exc, "loan renewal")
 
@@ -1699,8 +1876,9 @@ class LocalDatabase:
                     return False, 0.0, f"User ID '{uid}' was not found in the library database."
 
                 policy = self.get_loan_policy(user[0])
-                record = self.conn.execute("""
-                    SELECT id, due_date, COALESCE(fine_amount, 0) FROM circulation_logs
+                record = self.conn.execute(f"""
+                    SELECT id, {self._LOG_CODE_SQL}, due_date, COALESCE(fine_amount, 0)
+                    FROM circulation_logs
                     WHERE book_id = ? AND user_id = ? AND status = 'ISSUED'
                     ORDER BY id DESC LIMIT 1
                 """, (bid, uid)).fetchone()
@@ -1709,7 +1887,7 @@ class LocalDatabase:
                         f"No active issue record found matching Book ID '{bid}' and User ID '{uid}'."
                     )
 
-                log_id, due_text, carried_fine = record
+                log_id, log_code, due_text, carried_fine = record
                 now = datetime.datetime.now().replace(second=0, microsecond=0)
                 fine_rate = self._money(policy.get("fine_rate", 2.0), 2.0)
                 overdue_fine = 0.0
@@ -1755,21 +1933,22 @@ class LocalDatabase:
                         f"Book returned: {title}",
                         (
                             f"Hello {full_name},\n\n"
-                            f"Book '{title}' (Book ID: {bid}) was "
+                            f"Book '{title}' (Book ID: {bid}, Transaction ID: {log_code}) was "
                             f"returned on {returned_text}. {fine_status}\n\n"
                             "Library"
                         ),
                         "RETURN",
-                        dedupe_key=f"return:{log_id}",
+                        dedupe_key=f"return:{log_code}",
                     )
-            return True, fine, "Book returned successfully."
+            return True, fine, f"Book returned successfully. Transaction ID: {log_code}"
         except Exception as exc:
             return False, 0.0, self._parse_db_error(exc, "book return")
 
     def get_logs(self):
         try:
-            rows = self.conn.execute("""
-                SELECT id, book_id, user_id, checkout_date, due_date, return_date, fine_amount, status
+            rows = self.conn.execute(f"""
+                SELECT {self._LOG_CODE_SQL}, book_id, user_id, checkout_date, due_date,
+                       return_date, fine_amount, status
                 FROM circulation_logs ORDER BY id DESC
             """).fetchall()
             return True, rows
@@ -1907,6 +2086,10 @@ class LocalDatabase:
         if reminder_type not in ("due_today", "overdue"):
             raise ValueError("Invalid due-date reminder type.")
 
+        pk = self._resolve_loan_pk(loan_id)
+        if pk is None:
+            raise ValueError("Invalid transaction ID.")
+
         sent_at = sent_at or datetime.datetime.now().isoformat(timespec="seconds")
         with self._transaction(immediate=True):
             self.conn.execute("""
@@ -1914,7 +2097,7 @@ class LocalDatabase:
                     loan_id, reminder_type, sent_at
                 )
                 VALUES (?, ?, ?)
-            """, (int(loan_id), reminder_type, sent_at))
+            """, (pk, reminder_type, sent_at))
         return True
 
     def create_complaint(self, user_id, subject, body):
@@ -2030,8 +2213,8 @@ class LocalDatabase:
         """)
 
     def get_pending_fines_detailed(self):
-        return self._report_query("""
-            SELECT c.id,
+        return self._report_query(f"""
+            SELECT {self._C_LOG_CODE_SQL},
                    c.user_id,
                    COALESCE(u.full_name, 'Unknown User'),
                    c.book_id,
@@ -2052,47 +2235,24 @@ class LocalDatabase:
 
     def get_loan_fine_settlement_meta(self, log_ids=None):
         try:
-            if log_ids is None:
-                rows = self.conn.execute("""
-                    SELECT id,
-                           COALESCE(fine_settled, 0),
-                           COALESCE(fine_settlement_action, ''),
-                           COALESCE(fine_settled_at, ''),
-                           COALESCE(fine_settlement_note, '')
-                    FROM circulation_logs
-                """).fetchall()
-                return {
-                    int(row[0]): (
-                        int(row[1] or 0),
-                        str(row[2] or ""),
-                        str(row[3] or ""),
-                        str(row[4] or ""),
-                    )
-                    for row in rows
-                }
-
-            clean_ids = sorted({int(lid) for lid in log_ids if lid is not None})
-            result = {}
-            for offset in range(0, len(clean_ids), 500):
-                batch = clean_ids[offset:offset + 500]
-                placeholders = ",".join("?" for _ in batch)
-                rows = self.conn.execute(f"""
-                    SELECT id,
-                           COALESCE(fine_settled, 0),
-                           COALESCE(fine_settlement_action, ''),
-                           COALESCE(fine_settled_at, ''),
-                           COALESCE(fine_settlement_note, '')
-                    FROM circulation_logs
-                    WHERE id IN ({placeholders})
-                """, batch).fetchall()
-                for row in rows:
-                    result[int(row[0])] = (
-                        int(row[1] or 0),
-                        str(row[2] or ""),
-                        str(row[3] or ""),
-                        str(row[4] or ""),
-                    )
-            return result
+            matched = self._query_loan_columns_by_refs(
+                """
+                COALESCE(fine_settled, 0),
+                COALESCE(fine_settlement_action, ''),
+                COALESCE(fine_settled_at, ''),
+                COALESCE(fine_settlement_note, '')
+                """,
+                log_ids=log_ids,
+            )
+            return {
+                key: (
+                    int(vals[0] or 0),
+                    str(vals[1] or ""),
+                    str(vals[2] or ""),
+                    str(vals[3] or ""),
+                )
+                for key, vals in matched
+            }
         except (sqlite3.Error, ValueError, TypeError):
             logging.exception("Could not fetch fine settlement metadata")
             return {}
@@ -2113,10 +2273,12 @@ class LocalDatabase:
             return 0.0
 
     def settle_loan_fine(self, loan_id, action="PAID", note=""):
-        try:
-            lid = int(loan_id)
-        except (ValueError, TypeError):
+        kind, _ = self._parse_loan_ref(loan_id)
+        if kind is None:
             return False, "Invalid transaction ID."
+        lid = self._resolve_loan_pk(loan_id)
+        if lid is None:
+            return False, f"Transaction {format_log_id_display(loan_id)} was not found."
 
         action_key = self._clean(action or "PAID").upper()
         if action_key not in ("PAID", "WAIVED"):
@@ -2127,21 +2289,23 @@ class LocalDatabase:
 
         try:
             with self._transaction(immediate=True):
-                row = self.conn.execute("""
-                    SELECT id, book_id, user_id, COALESCE(fine_amount, 0),
+                row = self.conn.execute(f"""
+                    SELECT id, {self._LOG_CODE_SQL}, book_id, user_id, COALESCE(fine_amount, 0),
                            COALESCE(fine_settled, 0), UPPER(COALESCE(status, ''))
                     FROM circulation_logs
                     WHERE id = ?
                 """, (lid,)).fetchone()
                 if not row:
-                    return False, f"Transaction #{lid} was not found."
+                    return False, f"Transaction {format_log_id_display(loan_id)} was not found."
 
-                amount = round(float(row[3] or 0.0), 2)
-                already_settled = int(row[4] or 0) == 1 or row[5] == "PAID"
+                display_id = str(row[1] or lid)
+                label = format_log_id_display(display_id)
+                amount = round(float(row[4] or 0.0), 2)
+                already_settled = int(row[5] or 0) == 1 or row[6] == "PAID"
                 if amount <= 0:
-                    return False, f"Transaction #{lid} has no recorded fine balance."
+                    return False, f"Transaction {label} has no recorded fine balance."
                 if already_settled:
-                    return False, f"Transaction #{lid} fine has already been settled."
+                    return False, f"Transaction {label} fine has already been settled."
 
                 self.conn.execute("""
                     UPDATE circulation_logs
@@ -2157,10 +2321,10 @@ class LocalDatabase:
                         loan_id, book_id, user_id, amount, action, note, settled_at
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (lid, row[1], row[2], amount, action_key, clean_note, now_text))
+                """, (lid, row[2], row[3], amount, action_key, clean_note, now_text))
 
             verb = "collected" if action_key == "PAID" else "waived"
-            return True, f"Fine of ₹{amount:.2f} marked as {verb} for transaction #{lid}."
+            return True, f"Fine of ₹{amount:.2f} marked as {verb} for transaction {label}."
         except Exception as exc:
             return False, self._parse_db_error(exc, "fine settlement")
 
@@ -2218,22 +2382,31 @@ class LocalDatabase:
         try:
             limit = max(1, min(int(limit), 1000))
             if loan_id is not None:
+                pk = self._resolve_loan_pk(loan_id)
+                if pk is None:
+                    return []
                 rows = self.conn.execute("""
-                    SELECT id, loan_id, book_id, user_id, amount, action, COALESCE(note, ''), settled_at
-                    FROM fine_payments
-                    WHERE loan_id = ?
-                    ORDER BY id DESC LIMIT ?
-                """, (int(loan_id), limit)).fetchall()
+                    SELECT f.id,
+                           COALESCE(NULLIF(c.log_code, ''), CAST(f.loan_id AS TEXT)),
+                           f.book_id, f.user_id, f.amount, f.action, COALESCE(f.note, ''), f.settled_at
+                    FROM fine_payments f
+                    LEFT JOIN circulation_logs c ON c.id = f.loan_id
+                    WHERE f.loan_id = ?
+                    ORDER BY f.id DESC LIMIT ?
+                """, (pk, limit)).fetchall()
             else:
                 rows = self.conn.execute("""
-                    SELECT id, loan_id, book_id, user_id, amount, action, COALESCE(note, ''), settled_at
-                    FROM fine_payments
-                    ORDER BY id DESC LIMIT ?
+                    SELECT f.id,
+                           COALESCE(NULLIF(c.log_code, ''), CAST(f.loan_id AS TEXT)),
+                           f.book_id, f.user_id, f.amount, f.action, COALESCE(f.note, ''), f.settled_at
+                    FROM fine_payments f
+                    LEFT JOIN circulation_logs c ON c.id = f.loan_id
+                    ORDER BY f.id DESC LIMIT ?
                 """, (limit,)).fetchall()
             return [
                 {
                     "id": int(r[0]),
-                    "loan_id": int(r[1]),
+                    "loan_id": str(r[1] or ""),
                     "book_id": str(r[2] or ""),
                     "user_id": str(r[3] or ""),
                     "amount": round(float(r[4] or 0.0), 2),
@@ -2343,14 +2516,14 @@ class LocalDatabase:
             return analytics
 
     def get_circulation_log_details(self, loan_id):
-        try:
-            lid = int(loan_id)
-        except (ValueError, TypeError):
+        lid = self._resolve_loan_pk(loan_id)
+        if lid is None:
             return None
 
         try:
-            row = self.conn.execute("""
+            row = self.conn.execute(f"""
                 SELECT c.id,
+                       {self._C_LOG_CODE_SQL},
                        c.book_id,
                        COALESCE(b.title, 'Unknown Book'),
                        COALESCE(b.author, ''),
@@ -2378,7 +2551,7 @@ class LocalDatabase:
                 return None
 
             (
-                _id, book_id, book_title, book_author,
+                _id, display_id, book_id, book_title, book_author,
                 user_id, user_name, user_role, user_department,
                 checkout_date, due_date, return_date,
                 fine_amount, raw_status,
@@ -2396,7 +2569,8 @@ class LocalDatabase:
                 display_status = raw_status
 
             return {
-                "log_id": int(_id),
+                "log_id": str(display_id or _id),
+                "internal_id": int(_id),
                 "book_id": str(book_id or ""),
                 "book_title": str(book_title or "Unknown Book"),
                 "book_author": str(book_author or ""),
@@ -2428,8 +2602,8 @@ class LocalDatabase:
         try:
             limit = max(1, min(int(limit), 10000))
             today = datetime.date.today().isoformat()
-            rows = self.conn.execute("""
-                SELECT c.id,
+            rows = self.conn.execute(f"""
+                SELECT {self._C_LOG_CODE_SQL},
                        UPPER(COALESCE(c.status, 'ISSUED')),
                        COALESCE(b.title, 'Unknown Book') || ' [ID: ' ||
                            COALESCE(c.book_id, 'N/A') || ']',
@@ -2471,7 +2645,7 @@ class LocalDatabase:
                     status_label = raw_status
 
                 entries.append({
-                    "log_id": int(lid),
+                    "log_id": str(lid),
                     "raw_status": raw_status,
                     "status": status_label,
                     "book_label": str(book_label or ""),

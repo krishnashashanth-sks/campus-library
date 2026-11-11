@@ -2430,6 +2430,13 @@ class MainWindow(QMainWindow):
             except (RuntimeError, AttributeError):
                 pass
 
+        for view in getattr(self, "page_views", ()):
+            if view is not None:
+                try:
+                    view.close()
+                except (RuntimeError, AttributeError):
+                    pass
+
     def closeEvent(self, event):
         self._shutdown_background_workers()
         super().closeEvent(event)
