@@ -1,6 +1,6 @@
 PyQt6>=6.6
 PyQt6-Charts>=6.6
-pillow>=10.0
+pillow>=13.0.0
 opencv-python>=4.8
 python-barcode>=0.15
 openpyxl>=3.1
