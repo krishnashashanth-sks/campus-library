@@ -1,9 +1,9 @@
 ; Inno Setup script for Library Management System
 ; Override version from CLI/CI using:
-;   ISCC.exe /DAppVersion=1.1 installer_scipt.iss
+;   ISCC.exe /DAppVersion=1.2 installer_scipt.iss
 
 #ifndef AppVersion
-  #define AppVersion "1.1"
+  #define AppVersion "1.2"
 #endif
 
 #define AppName "Library Management System"

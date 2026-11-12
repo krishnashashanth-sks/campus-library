@@ -32,8 +32,8 @@ from dialogs import (
     EmailQueueManagementDialog,
     ReassignDepartmentDialog,
     RecoveryCodeSetupDialog,
+    UpdateConfirmationDialog,
     VersionManagerDialog,
-    markdown_to_plain_text,
 )
 from email_queue import EmailTestWorker
 from email_service import SMTP_CREDENTIAL_TARGET
@@ -2041,36 +2041,22 @@ class SettingsView(QWidget):
             return
 
         notes = result.get("release_notes", "").strip()
-        if result.get("version_selection"):
-            action = (
-                "upgrade to"
-                if is_newer_version(latest_version, current_version)
-                else "roll back to"
-            )
-            message = (
-                f"Version {latest_version} is selected. Do you want to "
-                f"{action} this release? The application will close and "
-                "restart."
-            )
-        else:
-            message = (
-                f"Version {latest_version} is available.\n\n"
-                "Install it now? The application will close and restart."
-            )
-        if notes:
-            clean_notes = markdown_to_plain_text(notes)[:2500]
-            if clean_notes:
-                message += f"\n\nRelease notes:\n{clean_notes}"
+        is_upgrade = True
+        try:
+            is_upgrade = is_newer_version(latest_version, current_version)
+        except ValueError:
+            is_upgrade = True
 
-        answer = QMessageBox.question(
-            self,
-            "Application Update Available",
-            message,
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        confirm_dialog = UpdateConfirmationDialog(
+            latest_version=latest_version,
+            current_version=current_version,
+            release_notes=notes,
+            version_selection=bool(result.get("version_selection")),
+            is_upgrade=is_upgrade,
+            release_url=result.get("release_url", ""),
+            parent=self,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        if confirm_dialog.exec() != QDialog.DialogCode.Accepted:
             self.update_status_label.setText(
                 f"Update available: v{latest_version}"
             )

@@ -249,9 +249,11 @@ def markdown_to_plain_text(markdown_text):
     raw = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not raw:
         return ""
+    # Strip optional fence language tags (e.g. ```text) so plain text output never merges them cleanly.
+    cleaned = re.sub(r"^```[a-zA-Z0-9_-]+\s*$", "```", raw, flags=re.MULTILINE)
     doc = QTextDocument()
-    doc.setMarkdown(raw, QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
-    return doc.toPlainText().strip()
+    doc.setMarkdown(cleaned, QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
+    return re.sub(r"\n{3,}", "\n\n", doc.toPlainText()).strip()
 
 
 def markdown_to_themed_html(markdown_text, colors=None, title="", subtitle=""):
@@ -2289,6 +2291,113 @@ class VersionManagerDialog(QDialog):
             "size": release["size"],
         }
         self.accept()
+
+
+class UpdateConfirmationDialog(QDialog):
+    """Themed update prompt that renders GitHub release notes Markdown cleanly as HTML."""
+
+    def __init__(
+        self,
+        latest_version,
+        current_version,
+        release_notes="",
+        version_selection=False,
+        is_upgrade=True,
+        release_url="",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.release_url = str(release_url or "").strip()
+        ver_tag = f"v{str(latest_version or '').lstrip('vV')}"
+        cur_tag = f"v{str(current_version or '').lstrip('vV')}"
+
+        configure_dialog(
+            self,
+            "Application Update Available",
+            720,
+            520,
+            min_width=420,
+            min_height=300,
+        )
+
+        c = get_dialog_colors(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(10)
+
+        if version_selection:
+            action_word = "upgrade to" if is_upgrade else "roll back to"
+            heading_text = f"Confirm Release Install — {ver_tag}"
+            intro_text = (
+                f"Version {ver_tag} is selected (installed: {cur_tag}). "
+                f"Do you want to {action_word} this release? "
+                "The application will close and restart."
+            )
+            install_label = f"Install {ver_tag}" if is_upgrade else f"Roll Back to {ver_tag}"
+        else:
+            heading_text = f"Update Available — {ver_tag}"
+            intro_text = (
+                f"Version {ver_tag} is available (currently {cur_tag}). "
+                "Install it now? The application will close and restart."
+            )
+            install_label = f"Install {ver_tag}"
+
+        layout.addWidget(create_heading(heading_text))
+        intro_label = QLabel(intro_text)
+        intro_label.setWordWrap(True)
+        layout.addWidget(intro_label)
+
+        notes = str(release_notes or "").strip()
+        self.notes_browser = QTextBrowser()
+        self.notes_browser.setObjectName("UpdateReleaseNotesBrowser")
+        self.notes_browser.setReadOnly(True)
+        self.notes_browser.setOpenExternalLinks(True)
+        self.notes_browser.setMinimumHeight(180)
+        self.notes_browser.setStyleSheet(
+            f"QTextBrowser#UpdateReleaseNotesBrowser {{"
+            f" background-color: {c['input']};"
+            f" color: {c['text']};"
+            f" border: 1.5px solid {c['border']};"
+            f" border-radius: 8px;"
+            f" padding: 8px 10px;"
+            f"}}"
+        )
+        self.notes_browser.setHtml(
+            markdown_to_themed_html(
+                notes or "No release notes were provided for this version.",
+                colors=c,
+                title=f"Release {ver_tag}",
+                subtitle="Upgrade" if is_upgrade else "Selected Version",
+            )
+        )
+        layout.addWidget(self.notes_browser, 1)
+
+        self.install_button = create_button(
+            install_label,
+            self.accept,
+            variant="PrimaryButton",
+        )
+        self.github_button = None
+        if self.release_url:
+            self.github_button = create_button(
+                "View on GitHub",
+                lambda: QDesktopServices.openUrl(QUrl(self.release_url)),
+                variant="InfoButton",
+            )
+        self.later_button = create_button(
+            "Later",
+            self.reject,
+            variant="SecondaryButton",
+        )
+        self.later_button.setDefault(True)
+
+        actions_host = QWidget()
+        actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
+        actions.addWidget(self.install_button)
+        if self.github_button is not None:
+            actions.addWidget(self.github_button)
+        actions.addWidget(self.later_button)
+        layout.addWidget(actions_host)
 
 
 class UserDialog(QDialog):

@@ -540,4 +540,4 @@ For issues or questions about the application, please check the troubleshooting 
 
 ---
 
-**Library Management System v1.1** — Developed by Govt Polytechnic College Hyderabad
+**Library Management System v1.2** — Developed by Govt Polytechnic College Hyderabad

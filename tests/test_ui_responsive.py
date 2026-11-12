@@ -45,6 +45,7 @@ from dialogs import (
     RecoveryCodeSetupDialog,
     RenewLoanDialog,
     ReturnBookDialog,
+    UpdateConfirmationDialog,
     UserDialog,
     VersionManagerDialog,
     ViewBooksDialog,
@@ -989,6 +990,46 @@ class VersionManagerAndFirstRunFeedbackTests(unittest.TestCase):
             self.assertTrue(dlg_pkg.selected_release["version_selection"])
             dlg_pkg.close()
             dlg_pkg.deleteLater()
+
+            # UpdateConfirmationDialog renders Markdown notes cleanly (no raw ### / ** / ```)
+            confirm_dlg = UpdateConfirmationDialog(
+                latest_version="1.1",
+                current_version="1.0",
+                release_notes=releases[0]["release_notes"],
+                release_url=releases[0]["release_url"],
+                parent=settings_view,
+            )
+            confirm_dlg.show()
+            _pump(2)
+            confirm_plain = confirm_dlg.notes_browser.toPlainText()
+            confirm_html = confirm_dlg.notes_browser.toHtml()
+            self.assertNotIn("###", confirm_plain)
+            self.assertNotIn("**", confirm_plain)
+            self.assertNotIn("```", confirm_plain)
+            self.assertIn("<h3", confirm_html)
+            self.assertIn("monospace", confirm_html)
+            self.assertIn("<a href=", confirm_html)
+            self.assertIn("Install v1.1", confirm_dlg.install_button.text())
+            confirm_dlg.close()
+            confirm_dlg.deleteLater()
+
+            # Verify SettingsView update check uses UpdateConfirmationDialog (never raw Markdown QMessageBox)
+            with (
+                mock.patch("pages.settings_view.is_packaged_application", return_value=True),
+                mock.patch("pages.settings_view.can_replace_application", return_value=True),
+                mock.patch("pages.settings_view.UpdateConfirmationDialog.exec", return_value=0) as spy_confirm,
+                mock.patch.object(QMessageBox, "question") as spy_qmsg,
+            ):
+                settings_view._on_update_check_finished(
+                    {
+                        "available": True,
+                        "latest_version": "1.1",
+                        "release_notes": releases[0]["release_notes"],
+                        "release_url": releases[0]["release_url"],
+                    }
+                )
+                self.assertEqual(spy_confirm.call_count, 1)
+                spy_qmsg.assert_not_called()
         finally:
             settings_view._closing = True
             settings_view.close()
