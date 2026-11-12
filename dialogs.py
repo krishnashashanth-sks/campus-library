@@ -7,6 +7,7 @@ import re
 import secrets
 import threading
 import time
+from typing import Optional
 import cv2
 import numpy as np
 import barcode

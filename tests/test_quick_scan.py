@@ -12,7 +12,6 @@ from barcode.writer import ImageWriter
 import cv2
 import numpy as np
 from PIL import Image
-import qrcode
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QMessageBox
@@ -112,10 +111,12 @@ class BarcodeDecoderTests(unittest.TestCase):
         self.assertEqual(res.code, "10001")
 
     def test_decodes_qr_and_image_file(self):
-        qr_img = cv2.cvtColor(
-            np.array(qrcode.make("BOOK:10002").convert("RGB")),
-            cv2.COLOR_RGB2BGR,
+        qr_raw = cv2.QRCodeEncoder_create().encode("BOOK:10002")
+        qr_scaled = cv2.resize(qr_raw, (250, 250), interpolation=cv2.INTER_NEAREST)
+        qr_padded = cv2.copyMakeBorder(
+            qr_scaled, 24, 24, 24, 24, cv2.BORDER_CONSTANT, value=255
         )
+        qr_img = cv2.cvtColor(qr_padded, cv2.COLOR_GRAY2BGR)
         res = self.decoder.decode(qr_img)
         self.assertIsNotNone(res)
         self.assertEqual(res.code, "10002")
