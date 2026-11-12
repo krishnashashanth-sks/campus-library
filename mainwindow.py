@@ -157,9 +157,11 @@ class MainWindow(QMainWindow):
                 saved_theme = "Dark"
 
             if self.theme_manager:
-                self.theme_manager.set_theme(
-                    saved_theme
-                )
+                if (
+                    saved_theme != self.theme_manager.get_theme()
+                    or saved_theme == "System"
+                ):
+                    self.theme_manager.set_theme(saved_theme)
 
         except Exception as error:
 

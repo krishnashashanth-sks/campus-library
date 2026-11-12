@@ -216,6 +216,7 @@ def main():
             splash = None
 
         app.setQuitOnLastWindowClosed(False)
+        loading_splash = None
         try:
             login_dialog = LoginDialog(db)
 
@@ -223,12 +224,46 @@ def main():
                 close_database()
                 return 0
 
-            window = MainWindow(db)
+            loading_splash = CustomSplashScreen(
+                get_resource_path("assets/library_icon.png")
+            )
+            loading_splash.set_status(
+                "Opening Library Management Workspace..."
+            )
+            loading_splash.show()
+            app.processEvents()
+
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                window = MainWindow(db)
+            except Exception as error:
+                if loading_splash:
+                    loading_splash.close()
+                    loading_splash = None
+                from PyQt6.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    None,
+                    "Application Startup Failed",
+                    f"Unable to open the {APP_NAME} workspace.\n\n{error}",
+                )
+                close_database()
+                return 1
+            finally:
+                QApplication.restoreOverrideCursor()
             window_ref["window"] = window
             window.theme_manager = theme_manager
             window.setWindowTitle(f"{APP_NAME} v{get_app_version()}")
             window.showMaximized()
+            app.processEvents()
+            if loading_splash:
+                loading_splash.finish(window)
+                loading_splash = None
+            window.raise_()
+            window.activateWindow()
         finally:
+            if loading_splash:
+                loading_splash.close()
             app.setQuitOnLastWindowClosed(True)
 
     reminder_lock = threading.Lock()

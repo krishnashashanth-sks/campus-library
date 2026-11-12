@@ -1117,6 +1117,18 @@ class CatalogView(QWidget):
                 border-color: {c["danger"]};
             }}
 
+            QPushButton#PrimaryButton:disabled,
+            QPushButton#SuccessButton:disabled,
+            QPushButton#InfoButton:disabled,
+            QPushButton#WarningButton:disabled,
+            QPushButton#SecondaryButton:disabled,
+            QPushButton#DangerButton:disabled {{
+                background: {c["input"]};
+                background-color: {c["input"]};
+                color: {c["muted"]};
+                border: 1px solid {c["border"]};
+            }}
+
             QPushButton#FilterButton {{
                 background: {c["surface_alt"]};
                 color: {c["text"]};

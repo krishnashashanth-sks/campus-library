@@ -1,7 +1,9 @@
 import csv
 import datetime
+import html
 import io
 import os
+import re
 import secrets
 import cv2
 import barcode
@@ -9,25 +11,27 @@ import barcode
 from barcode.writer import ImageWriter
 from PIL import Image
 
+from PyQt6 import sip
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QPushButton, QLineEdit, QMessageBox, QVBoxLayout,
     QComboBox, QLabel, QSpinBox, QFileDialog, QHBoxLayout,
     QCheckBox, QFrame, QTableWidget, QWidget, QSizePolicy,
     QHeaderView, QFormLayout, QTableWidgetItem, QAbstractItemView,
     QDialogButtonBox, QGridLayout, QGroupBox, QPlainTextEdit, QScrollArea,
-    QSplitter,
+    QSplitter, QTextBrowser,
 )
 
 from PyQt6.QtCore import (
-    pyqtSignal, Qt, QTimer, QRegularExpression
+    pyqtSignal, Qt, QTimer, QRegularExpression, QUrl
 )
 
 from PyQt6.QtGui import (
     QPixmap, QImage, QFont, QRegularExpressionValidator,
-    QIntValidator, QColor
+    QIntValidator, QColor, QDesktopServices, QTextDocument
 )
 
 from app_version import APP_DEVELOPER_CREDIT, APP_NAME
+from update_service import RELEASES_PAGE_URL, is_newer_version
 from utils import (
     clear_layout,
     format_log_id_display,
@@ -92,7 +96,20 @@ def configure_table(table, alternating=True):
 def create_heading(text):
     label = QLabel(text)
     label.setWordWrap(True)
+    label.setObjectName("DialogHeading")
     label.setProperty("class", "dialog-heading")
+    c = get_dialog_colors(label)
+    label.setStyleSheet(
+        f"QLabel#DialogHeading {{"
+        f" color: {c['text']};"
+        f" font-size: 17px;"
+        f" font-weight: 800;"
+        f" background: {c['primary_soft']};"
+        f" border-left: 4px solid {c['primary']};"
+        f" border-radius: 7px;"
+        f" padding: 7px 12px;"
+        f"}}"
+    )
     return label
 
 
@@ -112,7 +129,11 @@ def create_button(text, callback=None, enabled=True, variant=None):
 def get_dialog_colors(widget=None):
     """Return active ThemeManager tokens, falling back by palette lightness."""
     app = QApplication.instance()
-    tm = app.property("theme_manager") if app is not None else None
+    tm = (
+        app.property("theme_manager") or getattr(app, "theme_manager", None)
+        if app is not None
+        else None
+    )
     if tm is not None and hasattr(tm, "COLORS"):
         try:
             active = (
@@ -140,6 +161,8 @@ def get_dialog_colors(widget=None):
             "window": "#090E1A",
             "surface": "#111A2E",
             "surface_alt": "#182542",
+            "surface_elevated": "#1F2F52",
+            "input": "#0C1426",
             "border": "#28385C",
             "border_bright": "#384F82",
             "text": "#F8FAFC",
@@ -165,6 +188,7 @@ def get_dialog_colors(widget=None):
         "surface": "#E3ECF9",
         "surface_alt": "#CFDDF3",
         "surface_elevated": "#BED0EC",
+        "input": "#DAE6F7",
         "border": "#88A4CE",
         "border_bright": "#5A7CB2",
         "text": "#0A1628",
@@ -217,6 +241,119 @@ def set_status_property(label, status):
     label.setProperty("status", str(status).lower())
     label.style().unpolish(label)
     label.style().polish(label)
+
+
+def markdown_to_plain_text(markdown_text):
+    """Convert Markdown release notes to readable plain text for simple prompts."""
+    raw = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return ""
+    doc = QTextDocument()
+    doc.setMarkdown(raw, QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
+    return doc.toPlainText().strip()
+
+
+def markdown_to_themed_html(markdown_text, colors=None, title="", subtitle=""):
+    """Render GitHub-style Markdown (headings, lists, code, links) into themed HTML."""
+    c = colors or get_dialog_colors()
+    is_dark = QColor(c["window"]).lightness() < 128
+    link_color = c["cyan"] if is_dark else c["primary"]
+    code_bg = c["surface_alt"]
+    pre_bg = c["window"] if is_dark else c["surface"]
+
+    raw = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    body_html = ""
+    if raw:
+        doc = QTextDocument()
+        doc.setMarkdown(raw, QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
+        qt_html = doc.toHtml()
+        body_match = re.search(
+            r"<body[^>]*>(.*)</body>",
+            qt_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        body_html = body_match.group(1) if body_match else html.escape(raw)
+        body_html = re.sub(
+            r'(<a\b[^>]*>\s*<span\s+style="[^"]*?)color\s*:\s*#[0-9a-fA-F]{3,8}\s*;?',
+            rf'\1color:{link_color}; text-decoration:underline;',
+            body_html,
+            flags=re.IGNORECASE,
+        )
+        body_html = re.sub(
+            r'<a\b(?![^>]*style=)([^>]*)>',
+            rf'<a\1 style="color:{link_color}; text-decoration:underline;">',
+            body_html,
+            flags=re.IGNORECASE,
+        )
+        body_html = re.sub(
+            r'<span\s+style="([^"]*monospace[^"]*)"',
+            lambda m: (
+                f'<span style="{m.group(1)}; background-color:{code_bg}; '
+                f'color:{c["text"]}; padding:1px 4px;"'
+            ),
+            body_html,
+        )
+        body_html = re.sub(
+            r"<pre\b[^>]*>",
+            (
+                f'<pre style="background-color:{pre_bg}; color:{c["text"]}; '
+                f'border:1px solid {c["border"]}; padding:8px 10px; '
+                f'margin:6px 0px; white-space: pre-wrap; '
+                f'font-family:\'Consolas\',\'Courier New\',monospace; '
+                f'font-size:11px;">'
+            ),
+            body_html,
+            flags=re.IGNORECASE,
+        )
+        body_html = re.sub(
+            r"<h([1-4])\b[^>]*>",
+            lambda m: (
+                f'<h{m.group(1)} style="color:{c["primary"]}; '
+                f'margin:10px 0px 4px 0px; font-weight:700;">'
+            ),
+            body_html,
+            flags=re.IGNORECASE,
+        )
+        body_html = re.sub(
+            r"<table\b[^>]*>",
+            (
+                f'<table border="1" cellspacing="0" cellpadding="5" '
+                f'style="border-collapse:collapse; border:1px solid {c["border"]}; '
+                f'margin:6px 0px;">'
+            ),
+            body_html,
+            flags=re.IGNORECASE,
+        )
+        body_html = re.sub(
+            r"<hr\b[^>]*>",
+            f'<hr style="border:none; border-top:1px solid {c["border"]}; margin:8px 0px;">',
+            body_html,
+            flags=re.IGNORECASE,
+        )
+
+    header_parts = []
+    if title:
+        badge_html = ""
+        if subtitle:
+            badge_html = (
+                f' <span style="background-color:{c["primary_soft"]}; '
+                f'color:{link_color}; padding:2px 8px; font-size:11px; '
+                f'font-weight:700;">{html.escape(subtitle)}</span>'
+            )
+        header_parts.append(
+            f'<div style="margin-bottom:8px; padding-bottom:6px; '
+            f'border-bottom:1px solid {c["border"]};">'
+            f'<span style="font-size:14px; font-weight:800; color:{c["text"]};">'
+            f'{html.escape(title)}</span>{badge_html}</div>'
+        )
+
+    return (
+        f"<html><body style=\"color:{c['text']}; font-family:'Segoe UI',sans-serif; "
+        f"font-size:12px; line-height:1.45;\">"
+        + "".join(header_parts)
+        + body_html
+        + "</body></html>"
+    )
 
 
 # ============================================================
@@ -1056,28 +1193,32 @@ class VersionManagerDialog(QDialog):
         current_version,
         can_install,
         parent=None,
+        install_reason="",
     ):
         super().__init__(parent)
         self.releases = list(releases)
         self.current_version = current_version
         self.can_install = can_install
+        self.install_reason = str(install_reason or "").strip()
         self.selected_release = None
         configure_dialog(
             self,
             "Application Version Manager",
             980,
-            620,
+            640,
             min_width=460,
-            min_height=360,
+            min_height=380,
         )
 
+        c = get_dialog_colors(self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 16)
         layout.setSpacing(10)
         layout.addWidget(create_heading("Published application versions"))
         version_intro = QLabel(
-            f"Installed version: {current_version}. Select a published "
-            "release to install it or roll back to it."
+            f"Installed version: v{str(current_version).lstrip('vV')}. "
+            "Select a published release below to read its release notes, "
+            "install or roll back, or open it on GitHub."
         )
         version_intro.setWordWrap(True)
         layout.addWidget(version_intro)
@@ -1088,7 +1229,7 @@ class VersionManagerDialog(QDialog):
             "Version", "Published", "Package", "Availability",
         ])
         configure_table(self.table)
-        self.table.setMinimumHeight(140)
+        self.table.setMinimumHeight(110)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
@@ -1097,39 +1238,82 @@ class VersionManagerDialog(QDialog):
             QHeaderView.ResizeMode.Stretch,
         )
         self.table.itemSelectionChanged.connect(self.show_release_details)
-        self.table.cellDoubleClicked.connect(
-            lambda _row, _column: self.install_selected()
-        )
-        layout.addWidget(self.table, 1)
+        self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
 
-        self.details = QPlainTextEdit()
+        self.details = QTextBrowser()
+        self.details.setObjectName("ReleaseNotesBrowser")
         self.details.setReadOnly(True)
-        self.details.setMaximumHeight(140)
-        layout.addWidget(self.details)
+        self.details.setOpenExternalLinks(True)
+        self.details.setMinimumHeight(140)
+        self.details.setStyleSheet(
+            f"QTextBrowser#ReleaseNotesBrowser {{"
+            f" background-color: {c['input']};"
+            f" color: {c['text']};"
+            f" border: 1.5px solid {c['border']};"
+            f" border-radius: 8px;"
+            f" padding: 8px 10px;"
+            f"}}"
+        )
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.table)
+        splitter.addWidget(self.details)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([200, 260])
+        layout.addWidget(splitter, 1)
+
+        self.install_status_label = QLabel(
+            "Only stable releases with a verified Library-Windows.zip can "
+            "be installed."
+        )
+        configure_wrapped_label(self.install_status_label)
+        self.install_status_label.setStyleSheet(
+            f"color: {c['muted']}; font-size: 12px;"
+        )
+        layout.addWidget(self.install_status_label)
 
         self.install_button = create_button(
             "Install / Roll Back to Selected",
             self.install_selected,
             enabled=False,
-            variant="PrimaryButton",
+            variant="PrimaryButton" if can_install else "SecondaryButton",
         )
-        if not can_install:
-            self.install_button.setText(
-                "Install Requires Packaged Windows App"
-            )
-        refresh_note = QLabel(
-            "Only stable releases with a verified Library-Windows.zip can "
-            "be installed."
+        self.open_release_button = create_button(
+            "Download Installer on GitHub",
+            self.open_selected_release,
+            enabled=True,
+            variant="PrimaryButton" if not can_install else "InfoButton",
         )
-        refresh_note.setWordWrap(True)
         close_button = create_button("Close", self.reject, variant="SecondaryButton")
-        layout.addWidget(refresh_note)
+
         actions_host = QWidget()
         actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
         actions.addWidget(self.install_button)
+        actions.addWidget(self.open_release_button)
         actions.addWidget(close_button)
         layout.addWidget(actions_host)
         self._populate()
+
+    def _selected_release_record(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        index = item.data(Qt.ItemDataRole.UserRole)
+        if index is None or index < 0 or index >= len(self.releases):
+            return None
+        return self.releases[index]
+
+    def _sync_action_button_cursor(self, enabled):
+        self.install_button.setEnabled(enabled)
+        self.install_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if enabled
+            else Qt.CursorShape.ArrowCursor
+        )
 
     def _populate(self):
         c = get_dialog_colors(self)
@@ -1183,42 +1367,186 @@ class VersionManagerDialog(QDialog):
         if self.releases:
             self.table.selectRow(0)
         else:
-            self.details.setPlainText(
-                "No stable numeric releases were found."
+            self.details.setHtml(
+                markdown_to_themed_html(
+                    "No stable numeric releases were found on GitHub.",
+                    colors=c,
+                    title="No Published Releases",
+                )
+            )
+            self._sync_action_button_cursor(False)
+            self.install_button.setText("Install Unavailable")
+            self.install_status_label.setText(
+                self.install_reason
+                or "No published stable releases were found. You can still open GitHub Releases."
             )
 
     def show_release_details(self):
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
+        c = get_dialog_colors(self)
+        release = self._selected_release_record()
+        if not release:
             self.details.clear()
-            self.install_button.setEnabled(False)
+            self._sync_action_button_cursor(False)
+            self.install_button.setText("Install / Roll Back to Selected")
+            self.install_status_label.setText(
+                self.install_reason
+                or "Select a published release from the table above."
+            )
             return
-        index = self.table.item(
-            rows[0].row(),
-            0,
-        ).data(Qt.ItemDataRole.UserRole)
-        release = self.releases[index]
+
+        is_current = bool(release.get("current"))
+        installable = bool(release.get("installable"))
+        tag = release["tag_name"]
         notes = release.get("release_notes", "").strip()
-        self.details.setPlainText(
-            f"{release['tag_name']} — "
-            f"{'Currently installed' if release.get('current') else 'Published release'}\n\n"
-            f"{notes or release.get('reason') or 'No release notes.'}"
-        )
-        self.install_button.setEnabled(
-            self.can_install
-            and release.get("installable", False)
-            and not release.get("current", False)
+        subtitle = "Currently Installed" if is_current else "Published Release"
+        self.details.setHtml(
+            markdown_to_themed_html(
+                notes or release.get("reason") or "No release notes provided.",
+                colors=c,
+                title=tag,
+                subtitle=subtitle,
+            )
         )
 
-    def install_selected(self):
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
+        can_apply_now = self.can_install and installable and not is_current
+        self._sync_action_button_cursor(can_apply_now)
+        self.install_button.setObjectName(
+            "PrimaryButton" if can_apply_now else "SecondaryButton"
+        )
+        self.install_button.style().unpolish(self.install_button)
+        self.install_button.style().polish(self.install_button)
+
+        if is_current:
+            self.install_button.setText(f"Installed ({tag})")
+            self.install_button.setToolTip(
+                f"{tag} is currently installed. Select a different version to upgrade or roll back."
+            )
+            self.install_status_label.setStyleSheet(
+                f"color: {c['muted']}; font-size: 12px;"
+            )
+            self.install_status_label.setText(
+                f"{tag} is currently installed. Select another release to install or roll back, "
+                "or click 'Download Installer on GitHub' to view/download the installer."
+            )
+        elif not self.can_install:
+            self.install_button.setText("In-App Install (EXE Only)")
+            self.install_button.setToolTip(
+                self.install_reason
+                or "In-app installation works only in the packaged Windows app (Library.exe)."
+            )
+            self.install_status_label.setStyleSheet(
+                f"color: {c['warning']}; font-size: 12px; font-weight: 600;"
+            )
+            self.install_status_label.setText(
+                self.install_reason
+                or "Running from Python source or a read-only folder — in-app replacement requires "
+                "the installed Windows app (Library.exe). Click 'Download Installer on GitHub' to install this version."
+            )
+        elif not installable:
+            self.install_button.setText("Package Unavailable")
+            self.install_button.setToolTip(
+                release.get("reason")
+                or f"Release {tag} cannot be installed automatically."
+            )
+            self.install_status_label.setStyleSheet(
+                f"color: {c['warning']}; font-size: 12px; font-weight: 600;"
+            )
+            self.install_status_label.setText(
+                release.get("reason")
+                or f"Release {tag} cannot be installed automatically."
+            )
+        else:
+            try:
+                newer = is_newer_version(tag, self.current_version)
+            except ValueError:
+                newer = True
+            self.install_button.setText(
+                f"Install Update ({tag})" if newer else f"Roll Back to {tag}"
+            )
+            self.install_button.setToolTip(
+                f"Download and install {tag} and restart the application."
+            )
+            size_mb = float(release.get("size", 0) or 0) / (1024 * 1024)
+            self.install_status_label.setStyleSheet(
+                f"color: {c['success']}; font-size: 12px; font-weight: 600;"
+            )
+            self.install_status_label.setText(
+                f"Ready to {'upgrade' if newer else 'roll back'} to {tag} "
+                f"({size_mb:.1f} MB verified package). Click '{self.install_button.text()}' to begin."
+            )
+
+    def _on_row_double_clicked(self, _row, _column):
+        release = self._selected_release_record()
+        if not release:
             return
-        index = self.table.item(
-            rows[0].row(),
-            0,
-        ).data(Qt.ItemDataRole.UserRole)
-        release = self.releases[index]
+        if (
+            self.can_install
+            and release.get("installable")
+            and not release.get("current")
+        ):
+            self.install_selected()
+            return
+        tag = release.get("tag_name", "this version")
+        if release.get("current"):
+            show_success(
+                self,
+                "Already Installed",
+                f"{tag} is currently installed.\n\n"
+                "Select a different published version to upgrade or roll back, or "
+                "click 'Download Installer on GitHub' to view release files.",
+            )
+            return
+        if not self.can_install:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Packaged Windows App Required")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setText(
+                self.install_reason
+                or "Automatic in-app replacement works only when running the installed Windows application (Library.exe)."
+            )
+            open_btn = msg.addButton(
+                "Download Installer on GitHub",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            msg.addButton(QMessageBox.StandardButton.Close)
+            msg.exec()
+            if msg.clickedButton() is open_btn:
+                self.open_selected_release()
+            return
+        show_warning(
+            self,
+            "Release Unavailable",
+            release.get("reason")
+            or f"Release {tag} cannot be installed automatically.",
+        )
+
+    def open_selected_release(self):
+        release = self._selected_release_record()
+        target_url = (
+            (release or {}).get("release_url")
+            or RELEASES_PAGE_URL
+        )
+        opened = QDesktopServices.openUrl(QUrl(target_url))
+        c = get_dialog_colors(self)
+        if opened:
+            self.install_status_label.setStyleSheet(
+                f"color: {c['cyan']}; font-size: 12px; font-weight: 600;"
+            )
+            self.install_status_label.setText(
+                f"Opened GitHub release page in your browser ({target_url})."
+            )
+        else:
+            QApplication.clipboard().setText(target_url)
+            show_warning(
+                self,
+                "Could Not Open Browser",
+                f"Could not launch browser automatically. URL copied to clipboard:\n{target_url}",
+            )
+
+    def install_selected(self):
+        release = self._selected_release_record()
+        if not release:
+            return
         if (
             not self.can_install
             or not release.get("installable")
@@ -2878,20 +3206,20 @@ class RecoveryCodeSetupDialog(QDialog):
         configure_dialog(
             self,
             "Save Administrator Recovery Code",
-            500,
-            330,
-            min_width=340,
-            min_height=260,
+            640,
+            470,
+            min_width=360,
+            min_height=340,
         )
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(20, 18, 20, 18)
-        outer.setSpacing(12)
+        outer.setSpacing(10)
 
         body = QWidget()
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 4, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         layout.addWidget(
             create_heading("Save this recovery code")
@@ -2905,32 +3233,67 @@ class RecoveryCodeSetupDialog(QDialog):
         layout.addWidget(description)
 
         c = get_dialog_colors(self)
+        self._colors = c
         self.code_input = QLineEdit(self.recovery_code)
         self.code_input.setReadOnly(True)
         self.code_input.setMinimumWidth(0)
+        self.code_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         self.code_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.code_input.setStyleSheet(
             f"background: {c['primary_soft']}; color: {c['primary']}; "
             f"border: 1.5px solid {c['primary']}; border-radius: 8px; "
-            "font-size: 14px; font-weight: 700; letter-spacing: 1px;"
+            "font-family: 'Consolas', 'Courier New', monospace; "
+            "font-size: 13px; font-weight: 700; letter-spacing: 0.5px; "
+            "padding: 6px 10px;"
         )
         self.code_input.setMinimumHeight(42)
         layout.addWidget(self.code_input)
 
-        copy_button = create_button(
+        code_actions_host = QWidget()
+        code_actions_host.setMinimumWidth(0)
+        code_actions = FlowLayout(
+            code_actions_host,
+            margin=0,
+            h_spacing=8,
+            v_spacing=6,
+        )
+        self.copy_button = create_button(
             "Copy Recovery Code",
-            lambda: QApplication.clipboard().setText(self.recovery_code),
+            self.copy_recovery_code,
             variant="InfoButton",
         )
-        layout.addWidget(copy_button)
+        self.save_button = create_button(
+            "Save .txt File...",
+            self.save_recovery_code_to_file,
+            variant="SecondaryButton",
+        )
+        self.copy_button.setMinimumWidth(0)
+        self.save_button.setMinimumWidth(0)
+        code_actions.addWidget(self.copy_button)
+        code_actions.addWidget(self.save_button)
+        layout.addWidget(code_actions_host)
+
+        self.copy_feedback_label = QLabel(
+            "Click 'Copy Recovery Code' or 'Save .txt File...', then check the confirmation box below."
+        )
+        configure_wrapped_label(self.copy_feedback_label)
+        self.copy_feedback_label.setStyleSheet(
+            f"background: {c['surface_alt']}; color: {c['muted']}; "
+            f"border: 1px solid {c['border']}; border-radius: 8px; "
+            "padding: 8px 10px; font-size: 12px;"
+        )
+        layout.addWidget(self.copy_feedback_label)
+        layout.addStretch()
+
+        outer.addWidget(wrap_in_scroll_area(body, object_name="RecoverySetupScroll"), 1)
 
         self.saved_checkbox = QCheckBox(
             "I have saved this code somewhere secure."
         )
-        layout.addWidget(self.saved_checkbox)
-        layout.addStretch()
-
-        outer.addWidget(wrap_in_scroll_area(body, object_name="RecoverySetupScroll"), 1)
+        outer.addWidget(self.saved_checkbox)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
@@ -2950,6 +3313,63 @@ class RecoveryCodeSetupDialog(QDialog):
         self.saved_checkbox.toggled.connect(
             self.confirm_button.setEnabled
         )
+
+    def copy_recovery_code(self):
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(self.recovery_code)
+        self.code_input.selectAll()
+        c = self._colors
+        self.copy_button.setText("Copied to Clipboard")
+        self.copy_feedback_label.setStyleSheet(
+            f"background: {c['success_soft']}; color: {c['success']}; "
+            f"border: 1px solid {c['success']}; border-radius: 8px; "
+            "padding: 8px 10px; font-size: 12px; font-weight: 700;"
+        )
+        self.copy_feedback_label.setText(
+            "Recovery code copied to clipboard! Paste it in a safe place, "
+            "check 'I have saved this code somewhere secure', and click Continue."
+        )
+        self.saved_checkbox.setFocus()
+        QTimer.singleShot(2800, self._restore_copy_button_text)
+
+    def _restore_copy_button_text(self):
+        if not sip.isdeleted(self) and not sip.isdeleted(self.copy_button):
+            self.copy_button.setText("Copy Recovery Code")
+
+    def save_recovery_code_to_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Administrator Recovery Code",
+            "library-recovery-code.txt",
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            content = (
+                f"{APP_NAME} — Administrator Recovery Code\n"
+                f"Generated: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
+                f"Recovery Code: {self.recovery_code}\n\n"
+                "Keep this file in a secure location separate from the computer.\n"
+            )
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        except OSError as error:
+            show_error(self, "Save Recovery Code Failed", error)
+            return
+
+        c = self._colors
+        self.copy_feedback_label.setStyleSheet(
+            f"background: {c['success_soft']}; color: {c['success']}; "
+            f"border: 1px solid {c['success']}; border-radius: 8px; "
+            "padding: 8px 10px; font-size: 12px; font-weight: 700;"
+        )
+        self.copy_feedback_label.setText(
+            f"Saved recovery code to {os.path.basename(path)}. "
+            "Check 'I have saved this code somewhere secure' and click Continue."
+        )
+        self.saved_checkbox.setFocus()
 
 
 class AdminPasswordRecoveryDialog(QDialog):

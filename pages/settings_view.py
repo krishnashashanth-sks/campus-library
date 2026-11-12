@@ -29,6 +29,7 @@ from dialogs import (
     EmailQueueManagementDialog,
     RecoveryCodeSetupDialog,
     VersionManagerDialog,
+    markdown_to_plain_text,
 )
 from email_queue import EmailTestWorker
 from email_service import SMTP_CREDENTIAL_TARGET
@@ -559,6 +560,19 @@ class SettingsView(QWidget):
                 background-color: {c["danger"]};
                 color: #FFFFFF;
                 border-color: {c["danger"]};
+            }}
+
+            QPushButton#PrimaryButton:disabled,
+            QPushButton#SuccessButton:disabled,
+            QPushButton#InfoButton:disabled,
+            QPushButton#WarningButton:disabled,
+            QPushButton#SecondaryButton:disabled,
+            QPushButton#SmallButton:disabled,
+            QPushButton#DangerButton:disabled {{
+                background: {c["input"]};
+                background-color: {c["input"]};
+                color: {c["muted"]};
+                border: 1px solid {c["border"]};
             }}
 
             QLineEdit,
@@ -1580,6 +1594,7 @@ class SettingsView(QWidget):
             return
 
         self.update_button.setEnabled(False)
+        self.manage_versions_button.setEnabled(False)
         self.update_status_label.setText("Checking for updates...")
         worker = UpdateCheckWorker()
         worker.signals.finished.connect(
@@ -1625,14 +1640,30 @@ class SettingsView(QWidget):
             )
             return
 
-        can_install = is_packaged_application() and can_replace_application(
+        packaged = is_packaged_application()
+        writable = packaged and can_replace_application(
             Path(sys.executable).resolve().parent
         )
+        can_install = packaged and writable
+        if not packaged:
+            install_reason = (
+                "Running from Python source — automatic in-app replacement works only "
+                "in the installed Windows app (Library.exe). Click 'Download Installer on GitHub' "
+                "to download LibraryInstaller.exe."
+            )
+        elif not writable:
+            install_reason = (
+                "This installation folder is read-only for your Windows account. "
+                "Click 'Download Installer on GitHub' to reinstall into your user folder."
+            )
+        else:
+            install_reason = ""
         dialog = VersionManagerDialog(
             result.get("releases", []),
             result.get("current_version", get_app_version()),
             can_install,
             self,
+            install_reason=install_reason,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self.update_status_label.setText(
@@ -1650,6 +1681,7 @@ class SettingsView(QWidget):
             return
         self._update_worker = None
         self.update_button.setEnabled(True)
+        self.manage_versions_button.setEnabled(True)
 
         if result.get("error"):
             self.update_status_label.setText("Update check failed")
@@ -1743,7 +1775,9 @@ class SettingsView(QWidget):
                 "Install it now? The application will close and restart."
             )
         if notes:
-            message += f"\n\nRelease notes:\n{notes[:2500]}"
+            clean_notes = markdown_to_plain_text(notes)[:2500]
+            if clean_notes:
+                message += f"\n\nRelease notes:\n{clean_notes}"
 
         answer = QMessageBox.question(
             self,
@@ -1761,6 +1795,7 @@ class SettingsView(QWidget):
 
         self._pending_update = result
         self.update_button.setEnabled(False)
+        self.manage_versions_button.setEnabled(False)
         self.update_status_label.setText("Downloading update...")
         self.update_progress_bar.setRange(0, 0)
         self.update_progress_bar.show()
@@ -1790,6 +1825,7 @@ class SettingsView(QWidget):
         self._update_worker = None
         self.update_progress_bar.hide()
         self.update_button.setEnabled(True)
+        self.manage_versions_button.setEnabled(True)
 
         if result.get("error"):
             self._pending_update = None
@@ -2905,8 +2941,13 @@ class SettingsView(QWidget):
         if not self._has_loaded_once:
             self._has_loaded_once = True
             manager = self._theme_manager or self.get_theme_manager()
-            if manager is None or manager.get_theme() == self.DEFAULTS["theme_mode"]:
-                self.apply_selected_theme(self.combo_theme.currentText())
+            selected_theme = self.combo_theme.currentText()
+            if (
+                manager is None
+                or selected_theme != manager.get_theme()
+                or selected_theme == "System"
+            ):
+                self.apply_selected_theme(selected_theme)
 
     # =========================================================
     # ADMINISTRATOR AUTHORIZATION

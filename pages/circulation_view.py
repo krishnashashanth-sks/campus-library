@@ -467,6 +467,18 @@ class CirculationView(QWidget):
                 color: {c['primary']};
             }}
 
+            QPushButton#PrimaryButton:disabled,
+            QPushButton#SuccessButton:disabled,
+            QPushButton#InfoButton:disabled,
+            QPushButton#WarningButton:disabled,
+            QPushButton#SecondaryButton:disabled,
+            QPushButton#DangerButton:disabled {{
+                background: {c['input']};
+                background-color: {c['input']};
+                color: {c['muted']};
+                border: 1px solid {c['border']};
+            }}
+
             QPushButton#FilterButton {{
                 background-color: {c['surface_alt']};
                 color: {c['text']};

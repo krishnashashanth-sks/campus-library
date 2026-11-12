@@ -274,9 +274,18 @@ class ThemeManager(QObject):
             QPalette.ColorRole.HighlightedText,
             QColor("#FFFFFF")
         )
+        is_dark = QColor(c["window"]).lightness() < 128
         palette.setColor(
             QPalette.ColorRole.PlaceholderText,
             QColor(c["muted"])
+        )
+        palette.setColor(
+            QPalette.ColorRole.Link,
+            QColor(c["cyan"] if is_dark else c["primary"])
+        )
+        palette.setColor(
+            QPalette.ColorRole.LinkVisited,
+            QColor(c["purple"])
         )
 
         return palette
@@ -387,7 +396,8 @@ class ThemeManager(QObject):
         }}
 
         QPushButton#PrimaryButton:disabled {{
-            background: {c["surface_alt"]};
+            background: {c["input"]};
+            background-color: {c["input"]};
             color: {c["muted"]};
             border: 1px solid {c["border"]};
         }}
@@ -408,7 +418,8 @@ class ThemeManager(QObject):
         }}
 
         QPushButton#SuccessButton:disabled {{
-            background: {c["surface_alt"]};
+            background: {c["input"]};
+            background-color: {c["input"]};
             color: {c["muted"]};
             border: 1px solid {c["border"]};
         }}
@@ -429,7 +440,8 @@ class ThemeManager(QObject):
         }}
 
         QPushButton#WarningButton:disabled {{
-            background: {c["surface_alt"]};
+            background: {c["input"]};
+            background-color: {c["input"]};
             color: {c["muted"]};
             border: 1px solid {c["border"]};
         }}
@@ -450,7 +462,8 @@ class ThemeManager(QObject):
         }}
 
         QPushButton#InfoButton:disabled {{
-            background: {c["surface_alt"]};
+            background: {c["input"]};
+            background-color: {c["input"]};
             color: {c["muted"]};
             border: 1px solid {c["border"]};
         }}
@@ -466,6 +479,13 @@ class ThemeManager(QObject):
             background-color: {c["primary_soft"]};
             color: {c["text"]};
             border-color: {c["primary"]};
+        }}
+
+        QPushButton#SecondaryButton:disabled {{
+            background: {c["input"]};
+            background-color: {c["input"]};
+            color: {c["muted"]};
+            border: 1px solid {c["border"]};
         }}
 
         QPushButton#DangerButton {{
@@ -484,7 +504,8 @@ class ThemeManager(QObject):
         }}
 
         QPushButton#DangerButton:disabled {{
-            background: {c["surface_alt"]};
+            background: {c["input"]};
+            background-color: {c["input"]};
             color: {c["muted"]};
             border: 1px solid {c["border"]};
         }}

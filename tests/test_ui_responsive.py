@@ -13,8 +13,10 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QApplication,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +46,8 @@ from dialogs import (
     UserDialog,
     VersionManagerDialog,
     ViewBooksDialog,
+    markdown_to_plain_text,
+    markdown_to_themed_html,
 )
 from help_dialog import HelpDialog
 from mainwindow import MainWindow
@@ -53,6 +57,7 @@ from pages.dashboard_view import (
     CirculationAnalyticsWidget,
     MetricDetailDialog,
 )
+from pages.settings_view import SettingsView
 from theme_manager import ThemeManager
 
 
@@ -849,6 +854,204 @@ class ResponsiveDialogsTests(unittest.TestCase):
             for name, dlg in dialogs:
                 with self.subTest(dialog=name):
                     self._check_dialog_fits_screen(dlg, name)
+
+
+class VersionManagerAndFirstRunFeedbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _ensure_app()
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db = _create_populated_db(cls.tmp.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        _pump(2)
+        cls.db.close()
+        cls.tmp.cleanup()
+
+    def _sample_releases(self):
+        return [
+            {
+                "tag_name": "v1.0",
+                "published_at": "2026-11-12",
+                "installable": True,
+                "current": True,
+                "reason": "Installed version",
+                "release_notes": (
+                    "### Installation (Windows)\n"
+                    "- **New installs & manual upgrades:** Download and run `LibraryInstaller.exe`.\n"
+                    "- **Existing packaged installations:** Open **Settings -> Application Updates**.\n\n"
+                    "| File | Purpose |\n|---|---|\n| `LibraryInstaller.exe` | Installer |\n\n"
+                    "### SHA-256 Checksums\n"
+                    "```text\nabcd1234 *LibraryInstaller.exe\n```\n\n"
+                    "**Full Changelog**: https://github.com/krishnashashanth-sks/campus-library/commits/v1.0"
+                ),
+                "release_url": "https://github.com/krishnashashanth-sks/campus-library/releases/tag/v1.0",
+                "download_url": "https://github.com/krishnashashanth-sks/campus-library/releases/download/v1.0/Library-Windows.zip",
+                "digest": "sha256:" + ("a" * 64),
+                "size": 95 * 1024 * 1024,
+            },
+            {
+                "tag_name": "v1.1",
+                "published_at": "2026-11-15",
+                "installable": True,
+                "current": False,
+                "reason": "",
+                "release_notes": "### Highlights\n- Faster navigation and **Markdown** notes.",
+                "release_url": "https://github.com/krishnashashanth-sks/campus-library/releases/tag/v1.1",
+                "download_url": "https://github.com/krishnashashanth-sks/campus-library/releases/download/v1.1/Library-Windows.zip",
+                "digest": "sha256:" + ("b" * 64),
+                "size": 98 * 1024 * 1024,
+            },
+        ]
+
+    def test_version_manager_markdown_and_button_states_across_modes(self):
+        releases = self._sample_releases()
+        plain = markdown_to_plain_text(releases[0]["release_notes"])
+        self.assertNotIn("###", plain)
+        self.assertNotIn("**", plain)
+        self.assertNotIn("```", plain)
+        rendered_html = markdown_to_themed_html(
+            releases[0]["release_notes"],
+            title="v1.0",
+            subtitle="Currently Installed",
+        )
+        self.assertIn("<h3", rendered_html)
+        self.assertIn("<pre", rendered_html)
+        self.assertIn("<a ", rendered_html)
+
+        settings_view = SettingsView(self.db)
+        try:
+            # Verify SettingsView stylesheet defines explicit disabled styling for buttons
+            self.assertIn("QPushButton#PrimaryButton:disabled", settings_view.styleSheet())
+
+            # Source / non-packaged mode: install_button is clearly disabled SecondaryButton; GitHub download is active PrimaryButton
+            dlg_src = VersionManagerDialog(
+                releases,
+                "1.0",
+                can_install=False,
+                parent=settings_view,
+                install_reason="Running from Python source — use GitHub installer.",
+            )
+            dlg_src.show()
+            _pump(2)
+            self.assertIsInstance(dlg_src.details, QTextBrowser)
+            details_plain = dlg_src.details.toPlainText()
+            self.assertNotIn("###", details_plain)
+            self.assertNotIn("**", details_plain)
+            self.assertNotIn("```", details_plain)
+            self.assertIn("<a href=", dlg_src.details.toHtml())
+            self.assertFalse(dlg_src.install_button.isEnabled())
+            self.assertEqual(dlg_src.install_button.objectName(), "SecondaryButton")
+            self.assertTrue(dlg_src.open_release_button.isEnabled())
+            self.assertEqual(dlg_src.open_release_button.objectName(), "PrimaryButton")
+
+            with mock.patch("dialogs.QDesktopServices.openUrl", return_value=True) as spy_open:
+                dlg_src.open_release_button.click()
+                self.assertEqual(spy_open.call_count, 1)
+                self.assertEqual(spy_open.call_args[0][0].toString(), releases[0]["release_url"])
+
+            # Switching to v1.1 in source mode explains requirement clearly & double-click prompts action dialog
+            dlg_src.table.selectRow(1)
+            _pump(2)
+            self.assertFalse(dlg_src.install_button.isEnabled())
+            self.assertIn("GitHub", dlg_src.install_status_label.text())
+            with mock.patch.object(QMessageBox, "exec", return_value=0) as spy_msg:
+                dlg_src._on_row_double_clicked(1, 0)
+                self.assertEqual(spy_msg.call_count, 1)
+
+            dlg_src.close()
+            dlg_src.deleteLater()
+
+            # Packaged mode: selecting current row disables install; selecting v1.1 enables install & sets selected_release
+            dlg_pkg = VersionManagerDialog(releases, "1.0", can_install=True, parent=settings_view)
+            dlg_pkg.show()
+            _pump(2)
+            self.assertFalse(dlg_pkg.install_button.isEnabled())
+            self.assertIn("Installed", dlg_pkg.install_button.text())
+
+            dlg_pkg.table.selectRow(1)
+            _pump(2)
+            self.assertTrue(dlg_pkg.install_button.isEnabled())
+            self.assertEqual(dlg_pkg.install_button.objectName(), "PrimaryButton")
+            self.assertIn("Install Update", dlg_pkg.install_button.text())
+
+            dlg_pkg.install_button.click()
+            _pump(1)
+            self.assertEqual(dlg_pkg.result(), int(dlg_pkg.DialogCode.Accepted))
+            self.assertIsNotNone(dlg_pkg.selected_release)
+            self.assertEqual(dlg_pkg.selected_release["latest_version"], "v1.1")
+            self.assertTrue(dlg_pkg.selected_release["version_selection"])
+            dlg_pkg.close()
+            dlg_pkg.deleteLater()
+        finally:
+            settings_view._closing = True
+            settings_view.close()
+            settings_view.deleteLater()
+            _pump(2)
+
+    def test_recovery_code_copy_and_save_feedback_visible_and_unclipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_txt = Path(td) / "recovery-code.txt"
+            dlg = RecoveryCodeSetupDialog()
+            dlg.show()
+            _pump(3)
+
+            scroll = dlg.findChild(QScrollArea, "RecoverySetupScroll")
+            self.assertIsNotNone(scroll)
+            self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+            self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
+            self.assertTrue(dlg.saved_checkbox.isVisible())
+            self.assertTrue(dlg.confirm_button.isVisible())
+            self.assertFalse(dlg.confirm_button.isEnabled())
+
+            # Clicking Copy gives immediate clipboard copy + visual feedback without hiding Continue
+            QApplication.clipboard().clear()
+            dlg.copy_button.click()
+            _pump(2)
+            self.assertEqual(QApplication.clipboard().text(), dlg.recovery_code)
+            self.assertIn("Copied", dlg.copy_button.text())
+            self.assertIn("copied", dlg.copy_feedback_label.text().lower())
+            self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+            self.assertTrue(dlg.saved_checkbox.isVisible())
+            self.assertTrue(dlg.confirm_button.isVisible())
+
+            # Saving as .txt writes the exact recovery code cleanly
+            with mock.patch("dialogs.QFileDialog.getSaveFileName", return_value=(str(out_txt), "Text Files (*.txt)")):
+                dlg.save_button.click()
+                _pump(2)
+            self.assertTrue(out_txt.exists())
+            saved_body = out_txt.read_text(encoding="utf-8")
+            self.assertIn(dlg.recovery_code, saved_body)
+            self.assertIn(out_txt.name, dlg.copy_feedback_label.text())
+
+            # Narrow window still keeps checkbox and Continue completely visible outside scroll area
+            dlg.resize(400, 380)
+            _pump(2)
+            self.assertTrue(dlg.saved_checkbox.isVisible())
+            self.assertTrue(dlg.confirm_button.isVisible())
+            self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+
+            dlg.saved_checkbox.setChecked(True)
+            _pump(1)
+            self.assertTrue(dlg.confirm_button.isEnabled())
+
+            dlg.close()
+            dlg.deleteLater()
+            _pump(2)
+
+    def test_theme_manager_defines_disabled_button_styles(self):
+        app = _ensure_app()
+        qss = ThemeManager._create_stylesheet(ThemeManager.COLORS["Dark"])
+        for btn_id in (
+            "PrimaryButton",
+            "SuccessButton",
+            "WarningButton",
+            "InfoButton",
+            "SecondaryButton",
+            "DangerButton",
+        ):
+            self.assertIn(f"QPushButton#{btn_id}:disabled", qss)
 
 
 if __name__ == "__main__":
