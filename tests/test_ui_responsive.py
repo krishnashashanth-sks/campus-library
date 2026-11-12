@@ -1053,6 +1053,58 @@ class VersionManagerAndFirstRunFeedbackTests(unittest.TestCase):
         ):
             self.assertIn(f"QPushButton#{btn_id}:disabled", qss)
 
+    def test_custom_splash_finish_and_main_startup_handoff(self):
+        import main as app_main
+
+        icon_path = str(REPO_ROOT / "assets" / "library_icon.png")
+        splash = CustomSplashScreen(icon_path)
+        splash.set_status("Opening Library Management Workspace...")
+        splash.show()
+        _pump(1)
+        splash.finish(None)
+        _pump(1)
+        self.assertFalse(splash.isVisible())
+
+        # Exercise main.main() handoff from accepted LoginDialog -> loading splash -> MainWindow
+        # Re-use the existing QApplication instance safely.
+        existing_app = _ensure_app()
+        with tempfile.TemporaryDirectory() as td:
+            db = database.LocalDatabase(os.path.join(td, "startup_handoff.db"))
+            created_windows = []
+            orig_quit_flag = existing_app.quitOnLastWindowClosed()
+
+            class _FakeMainWindow(MainWindow):
+                def __init__(self, database_conn):
+                    super().__init__(database_conn)
+                    created_windows.append(self)
+
+            with (
+                mock.patch.object(app_main, "SPLASH_DURATION", 0),
+                mock.patch.object(app_main, "QApplication", return_value=existing_app),
+                mock.patch.object(app_main, "initialize_database", return_value=db),
+                mock.patch.object(app_main, "MainWindow", _FakeMainWindow),
+                mock.patch.object(app_main.LoginDialog, "exec", return_value=int(app_main.QDialog.DialogCode.Accepted)),
+                mock.patch.object(existing_app, "exec", return_value=0),
+            ):
+                app_main.QApplication.setHighDpiScaleFactorRoundingPolicy = QApplication.setHighDpiScaleFactorRoundingPolicy
+                app_main.QApplication.setOverrideCursor = QApplication.setOverrideCursor
+                app_main.QApplication.restoreOverrideCursor = QApplication.restoreOverrideCursor
+                app_main.QApplication.activeModalWidget = QApplication.activeModalWidget
+                app_main.QApplication.widgetAt = QApplication.widgetAt
+                rc = app_main.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(created_windows), 1)
+            win = created_windows[0]
+            try:
+                win._shutdown_background_workers()
+                win.close()
+                win.deleteLater()
+                _pump(2)
+            finally:
+                existing_app.setQuitOnLastWindowClosed(orig_quit_flag)
+                db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

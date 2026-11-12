@@ -3588,6 +3588,10 @@ class CustomSplashScreen(QDialog):
     def set_status(self, message):
         self.sub_label.setText(str(message))
 
+    def finish(self, _main_window=None):
+        self.close()
+        self.deleteLater()
+
 
 # ============================================================
 # BOOK CIRCULATION AUDIT HISTORY
