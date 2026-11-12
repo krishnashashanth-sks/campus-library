@@ -127,12 +127,29 @@ class ReleaseReadinessTests(unittest.TestCase):
             "requirements-dev.txt",
             "requirements-services.txt",
             "scripts/build_windows.ps1",
+            "scripts/setup_code_signing.ps1",
         )
         for rel_path in required:
             self.assertTrue(
                 (REPO_ROOT / rel_path).is_file(),
                 f"Missing required packaging file: {rel_path}",
             )
+
+    def test_windows_pe_metadata_and_signing_hooks(self):
+        spec_text = (REPO_ROOT / "main.spec").read_text(encoding="utf-8")
+        self.assertIn("VSVersionInfo", spec_text)
+        self.assertIn('StringStruct("CompanyName", app_version.APP_DEVELOPER)', spec_text)
+        self.assertIn("uac_admin=False", spec_text)
+        self.assertIn("version=_win_version_info", spec_text)
+
+        iss_text = (REPO_ROOT / "installer_scipt.iss").read_text(encoding="utf-8")
+        self.assertIn("SignTool=LibrarySignTool", iss_text)
+        self.assertIn("SignedUninstaller=yes", iss_text)
+        self.assertIn("VersionInfoDescription={#AppName} Installer", iss_text)
+
+        gitignore_text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("certs/", gitignore_text)
+        self.assertIn("*.pfx", gitignore_text)
 
     def test_branding_and_attribution(self):
         self.assertEqual(app_version.APP_NAME, "Library Management System")

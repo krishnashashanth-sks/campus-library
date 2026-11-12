@@ -7,7 +7,7 @@ from pathlib import Path
 APP_NAME = "Library Management System"
 APP_DEVELOPER = "Govt Polytechnic College Hyderabad"
 APP_DEVELOPER_CREDIT = f"Developed by {APP_DEVELOPER}"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 INSTALLED_VERSION_FILE = "library_version.txt"
 _VERSION_PATTERN = re.compile(
     r"v?(\d+(?:\.\d+){1,3})",

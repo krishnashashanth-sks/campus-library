@@ -1,9 +1,9 @@
 ; Inno Setup script for Library Management System
 ; Override version from CLI/CI using:
-;   ISCC.exe /DAppVersion=1.2 installer_scipt.iss
+;   ISCC.exe /DAppVersion=1.3 installer_scipt.iss
 
 #ifndef AppVersion
-  #define AppVersion "1.2"
+  #define AppVersion "1.3"
 #endif
 
 #define AppName "Library Management System"
@@ -21,6 +21,9 @@ AppVersion={#AppVersion}
 VersionInfoVersion={#AppVersion}
 VersionInfoProductName={#AppName}
 VersionInfoCompany={#AppPublisher}
+VersionInfoDescription={#AppName} Installer
+VersionInfoCopyright=Copyright (C) {#AppPublisher}
+VersionInfoOriginalFileName=LibraryInstaller.exe
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}/issues
@@ -38,6 +41,10 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=assets\library_icon.ico
+#ifdef UseSignTool
+  SignTool=LibrarySignTool
+  SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

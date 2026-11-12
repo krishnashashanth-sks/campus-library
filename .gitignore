@@ -29,4 +29,11 @@ client_secret*.json
 assets/google_drive_client.json
 assets/*client_secret*.json
 
+# Local code-signing certificates & private keys (never commit private keys)
+certs/
+*.pfx
+*.p12
+*.pvk
+*.key
+
 .vscode/

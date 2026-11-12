@@ -6,7 +6,9 @@ import os
 import re
 import secrets
 import threading
+import time
 import cv2
+import numpy as np
 import barcode
 
 from barcode.writer import ImageWriter
@@ -19,19 +21,22 @@ from PyQt6.QtWidgets import (
     QCheckBox, QFrame, QTableWidget, QWidget, QSizePolicy,
     QHeaderView, QFormLayout, QTableWidgetItem, QAbstractItemView,
     QDialogButtonBox, QGridLayout, QGroupBox, QPlainTextEdit, QScrollArea,
-    QSplitter, QTextBrowser,
+    QSplitter, QTextBrowser, QCompleter,
 )
 
 from PyQt6.QtCore import (
-    pyqtSignal, Qt, QTimer, QRegularExpression, QThreadPool, QUrl
+    pyqtSignal, Qt, QTimer, QRegularExpression, QThreadPool, QUrl,
+    QSize, QStringListModel,
 )
 
 from PyQt6.QtGui import (
     QPixmap, QImage, QFont, QRegularExpressionValidator,
-    QIntValidator, QColor, QDesktopServices, QTextDocument
+    QIntValidator, QColor, QDesktopServices, QTextDocument,
+    QPainter, QPen,
 )
 
 from app_version import APP_DEVELOPER_CREDIT, APP_NAME
+from barcode_scanner import BarcodeDecoder, BarcodeScanResult, decode_image_file
 from update_service import RELEASES_PAGE_URL, is_newer_version
 from utils import (
     clear_layout,
@@ -3458,8 +3463,101 @@ class BarcodeGeneratorDialog(QDialog):
 # QUICK BARCODE SCANNER
 # ============================================================
 
+class _CameraViewfinderLabel(QLabel):
+    """Fixed-footprint camera preview that never auto-resizes from incoming frames."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._badge_text = ""
+        self._badge_color = "#3B82F6"
+        self._show_reticle = False
+        self._locked = False
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.setFixedHeight(204)
+        self.setMinimumWidth(200)
+
+    def sizeHint(self):
+        return QSize(420, 204)
+
+    def minimumSizeHint(self):
+        return QSize(200, 170)
+
+    def set_overlay_state(self, show_reticle=False, badge_text="", badge_color="#3B82F6", locked=False):
+        self._show_reticle = bool(show_reticle)
+        self._badge_text = str(badge_text or "")
+        self._badge_color = str(badge_color or "#3B82F6")
+        self._locked = bool(locked)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._show_reticle and not self._badge_text:
+            return
+
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            cr = self.contentsRect()
+            if cr.width() < 40 or cr.height() < 40:
+                return
+
+            if self._show_reticle:
+                accent = QColor("#10B981" if self._locked else "#22D3EE")
+                pen = QPen(accent, 2.2)
+                painter.setPen(pen)
+                box_w = int(cr.width() * 0.68)
+                box_h = int(cr.height() * 0.56)
+                rx = cr.x() + (cr.width() - box_w) // 2
+                ry = cr.y() + (cr.height() - box_h) // 2
+                corner = max(12, min(22, box_w // 8))
+
+                # Four crisp viewfinder corner brackets
+                painter.drawLine(rx, ry, rx + corner, ry)
+                painter.drawLine(rx, ry, rx, ry + corner)
+                painter.drawLine(rx + box_w, ry, rx + box_w - corner, ry)
+                painter.drawLine(rx + box_w, ry, rx + box_w, ry + corner)
+                painter.drawLine(rx, ry + box_h, rx + corner, ry + box_h)
+                painter.drawLine(rx, ry + box_h, rx, ry + box_h - corner)
+                painter.drawLine(rx + box_w, ry + box_h, rx + box_w - corner, ry + box_h)
+                painter.drawLine(rx + box_w, ry + box_h, rx + box_w, ry + box_h - corner)
+
+                if not self._locked:
+                    mid_y = ry + box_h // 2
+                    guide_pen = QPen(QColor(34, 211, 238, 120), 1.2, Qt.PenStyle.DashLine)
+                    painter.setPen(guide_pen)
+                    painter.drawLine(rx + 10, mid_y, rx + box_w - 10, mid_y)
+
+            if self._badge_text:
+                font = painter.font()
+                font.setPointSize(8)
+                font.setBold(True)
+                painter.setFont(font)
+                fm = painter.fontMetrics()
+                pad_x = 8
+                pad_y = 3
+                bw = fm.horizontalAdvance(self._badge_text) + pad_x * 2
+                bh = fm.height() + pad_y * 2
+                bx = cr.x() + 8
+                by = cr.y() + 8
+                bg = QColor(15, 23, 42, 195)
+                border_col = QColor(self._badge_color)
+                painter.setBrush(bg)
+                painter.setPen(QPen(border_col, 1.2))
+                painter.drawRoundedRect(bx, by, bw, bh, 6, 6)
+                painter.setPen(QColor("#F8FAFC"))
+                painter.drawText(bx + pad_x, by + pad_y + fm.ascent(), self._badge_text)
+        finally:
+            painter.end()
+
+
 class QuickScanDialog(QDialog):
     data_updated = pyqtSignal()
+    _decoded_signal = pyqtSignal(object, object)
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
@@ -3467,20 +3565,43 @@ class QuickScanDialog(QDialog):
         self.db = db
         self.book_id = None
         self.cap = None
-        self.barcode_detector = None
+        self._camera_index = 0
+        self._decoder = BarcodeDecoder()
+        self.barcode_detector = self._decoder
         self._user_edited_days = False
+        self._paused = False
+        self._mirror_preview = False
+        self._scan_target = "book"  # "book" or "user"
+        self._closing = False
+        self._last_frame = None
+        self._last_scan_code = None
+        self._last_scan_ts = 0.0
+        self._frame_seq = 0
+        self._active_loans = []
+        self._session_entries = []
+
+        # Background non-blocking decode worker state
+        self._decode_lock = threading.Lock()
+        self._pending_frame = None
+        self._pending_thorough = False
+        self._decode_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._decode_thread = None
+
+        self._decoded_signal.connect(self._on_background_decoded)
 
         configure_dialog(
             self,
             "Quick Barcode Scanner",
-            480,
-            680,
+            560,
+            730,
             min_width=380,
             min_height=380,
         )
 
+        c_scan = get_dialog_colors(self)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         layout.addWidget(create_heading("📷 Quick Barcode Scanner"))
@@ -3488,33 +3609,87 @@ class QuickScanDialog(QDialog):
         scan_host = QWidget()
         scan_layout = QVBoxLayout(scan_host)
         scan_layout.setContentsMargins(0, 0, 4, 0)
-        scan_layout.setSpacing(10)
+        scan_layout.setSpacing(8)
 
-        self.lbl_capture = QLabel(
-            "Initializing camera..."
+        # Camera control toolbar (compact wrapping row)
+        cam_toolbar_host = QWidget()
+        cam_toolbar = FlowLayout(cam_toolbar_host, margin=0, h_spacing=6, v_spacing=6)
+
+        self.camera_combo = QComboBox()
+        self.camera_combo.setMinimumWidth(125)
+        self.camera_combo.addItem("Camera 0 (Default)", 0)
+        self.camera_combo.currentIndexChanged.connect(self._on_camera_changed)
+        cam_toolbar.addWidget(self.camera_combo)
+
+        self.btn_detect_cams = create_button(
+            "🔄 Detect",
+            self._detect_cameras,
+            variant="SecondaryButton",
         )
-        self.lbl_capture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_capture.setMinimumHeight(140)
-        self.lbl_capture.setProperty("class", "camera-preview")
+        self.btn_detect_cams.setToolTip("Scan for connected webcams and USB cameras")
+        cam_toolbar.addWidget(self.btn_detect_cams)
 
+        self.btn_toggle_scan = create_button(
+            "⏸ Pause",
+            self.toggle_scan_pause,
+            enabled=False,
+            variant="SecondaryButton",
+        )
+        cam_toolbar.addWidget(self.btn_toggle_scan)
+
+        self.btn_mirror = QPushButton("⇄ Mirror")
+        self.btn_mirror.setCheckable(True)
+        self.btn_mirror.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_mirror.setObjectName("SecondaryButton")
+        self.btn_mirror.toggled.connect(self._on_mirror_toggled)
+        cam_toolbar.addWidget(self.btn_mirror)
+
+        self.btn_scan_image = create_button(
+            "🖼 Scan Image",
+            self.scan_from_image_file,
+            variant="SecondaryButton",
+        )
+        self.btn_scan_image.setToolTip("Decode a barcode or QR image file (PNG/JPG)")
+        cam_toolbar.addWidget(self.btn_scan_image)
+
+        self.btn_scan_target = create_button(
+            "🎯 Target: Book ID",
+            self._toggle_scan_target,
+            variant="SecondaryButton",
+        )
+        self.btn_scan_target.setToolTip(
+            "Switch whether camera/barcode detections fill Book ID or User ID"
+        )
+        cam_toolbar.addWidget(self.btn_scan_target)
+
+        scan_layout.addWidget(cam_toolbar_host)
+
+        # Fixed-footprint viewfinder label (zero frame-driven layout expansion)
+        self.lbl_capture = _CameraViewfinderLabel("Initializing camera...")
+        self.lbl_capture.setProperty("class", "camera-preview")
         scan_layout.addWidget(self.lbl_capture)
 
-        scan_layout.addWidget(QLabel("Book ID — USB Scanner or Manual"))
+        # Book ID field + autocomplete
+        book_label_row = QHBoxLayout()
+        book_label_row.setContentsMargins(0, 2, 0, 0)
+        book_label_row.addWidget(QLabel("Book ID — Camera, USB Scanner, or Search"))
+        book_label_row.addStretch()
+        self.lbl_symbology_hint = QLabel("Code128 · Code39 · QR · EAN/UPC")
+        self.lbl_symbology_hint.setStyleSheet(
+            f"color: {c_scan['muted']}; font-size: 11px; font-weight: 600;"
+        )
+        book_label_row.addWidget(self.lbl_symbology_hint)
+        scan_layout.addLayout(book_label_row)
 
         self.input_book_id = QLineEdit()
+        self.input_book_id.setClearButtonEnabled(True)
         self.input_book_id.setPlaceholderText(
-            "Scan barcode or enter Book ID"
+            "Scan barcode/QR or search Book ID / title..."
         )
-        self.input_book_id.returnPressed.connect(
-            self.on_physical_scan
-        )
-        self.input_book_id.textChanged.connect(
-            self.on_manual_text_change
-        )
-
+        self.input_book_id.returnPressed.connect(self.on_physical_scan)
+        self.input_book_id.textChanged.connect(self.on_manual_text_change)
         scan_layout.addWidget(self.input_book_id)
 
-        c_scan = get_dialog_colors(self)
         self.lbl_status = QLabel("Waiting for barcode...")
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setStyleSheet(
@@ -3522,10 +3697,35 @@ class QuickScanDialog(QDialog):
         )
         scan_layout.addWidget(self.lbl_status)
 
-        scan_layout.addWidget(QLabel("User ID / PIN"))
+        # Active borrower quick-pick bar (shown when book has active loans)
+        self.active_borrower_widget = QFrame()
+        self.active_borrower_widget.setVisible(False)
+        ab_layout = QHBoxLayout(self.active_borrower_widget)
+        ab_layout.setContentsMargins(8, 6, 8, 6)
+        ab_layout.setSpacing(8)
+        self.lbl_active_borrower = QLabel("")
+        self.lbl_active_borrower.setWordWrap(True)
+        ab_layout.addWidget(self.lbl_active_borrower, 1)
+        self.combo_active_borrowers = QComboBox()
+        self.combo_active_borrowers.setVisible(False)
+        self.combo_active_borrowers.setMinimumWidth(140)
+        ab_layout.addWidget(self.combo_active_borrowers)
+        self.btn_use_borrower = create_button(
+            "Use Borrower",
+            self._apply_selected_active_borrower,
+            variant="InfoButton",
+        )
+        ab_layout.addWidget(self.btn_use_borrower)
+        scan_layout.addWidget(self.active_borrower_widget)
+
+        scan_layout.addWidget(QLabel("User ID / Member Search"))
 
         self.input_user_id = QLineEdit()
-        self.input_user_id.setPlaceholderText("Enter User ID")
+        self.input_user_id.setClearButtonEnabled(True)
+        self.input_user_id.setPlaceholderText(
+            "Enter or scan User ID / search member name..."
+        )
+        self.input_user_id.returnPressed.connect(self._on_user_return_pressed)
         self.input_user_id.textChanged.connect(self._update_scan_context)
         scan_layout.addWidget(self.input_user_id)
 
@@ -3536,7 +3736,9 @@ class QuickScanDialog(QDialog):
         )
         scan_layout.addWidget(self.lbl_user_policy)
 
-        scan_layout.addWidget(QLabel("Loan Duration"))
+        options_row = QHBoxLayout()
+        options_row.setSpacing(10)
+        options_row.addWidget(QLabel("Loan Duration:"))
 
         try:
             days = int(self.db.get_setting("default_days", 14))
@@ -3548,11 +3750,31 @@ class QuickScanDialog(QDialog):
         self.spin_days.setValue(max(1, min(days, 365)))
         self.spin_days.setSuffix(" days")
         self.spin_days.valueChanged.connect(self._on_spin_days_edited)
+        options_row.addWidget(self.spin_days)
 
-        scan_layout.addWidget(self.spin_days)
+        self.chk_batch_mode = QCheckBox("Batch mode (keep open)")
+        self.chk_batch_mode.setToolTip(
+            "Keep scanner open and auto-resume camera after each transaction"
+        )
+        options_row.addWidget(self.chk_batch_mode)
+        options_row.addStretch()
+        scan_layout.addLayout(options_row)
+
+        self.lbl_session_log = QLabel("")
+        self.lbl_session_log.setWordWrap(True)
+        self.lbl_session_log.setVisible(False)
+        self.lbl_session_log.setStyleSheet(
+            f"background: {c_scan['surface_alt']}; color: {c_scan['text']}; "
+            f"border: 1px solid {c_scan['border']}; border-radius: 7px; "
+            "padding: 6px 9px; font-size: 11px;"
+        )
+        scan_layout.addWidget(self.lbl_session_log)
         scan_layout.addStretch()
 
-        layout.addWidget(wrap_in_scroll_area(scan_host, object_name="QuickScanDialogScroll"), 1)
+        layout.addWidget(
+            wrap_in_scroll_area(scan_host, object_name="QuickScanDialogScroll"),
+            1,
+        )
 
         buttons_host = QWidget()
         buttons = FlowLayout(buttons_host, margin=0, h_spacing=8, v_spacing=6)
@@ -3578,11 +3800,21 @@ class QuickScanDialog(QDialog):
             variant="SuccessButton",
         )
 
+        self.clear_btn = create_button(
+            "🧹 Next Scan",
+            self.reset_for_retry,
+            True,
+            variant="SecondaryButton",
+        )
+
         buttons.addWidget(self.issue_btn)
         buttons.addWidget(self.renew_btn)
         buttons.addWidget(self.return_btn)
+        buttons.addWidget(self.clear_btn)
 
         layout.addWidget(buttons_host)
+
+        self._setup_completers()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
@@ -3590,31 +3822,190 @@ class QuickScanDialog(QDialog):
         self._init_camera()
         self.input_book_id.setFocus()
 
-    def _init_camera(self):
+    def _setup_completers(self):
         try:
-            backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
+            ok_b, books = self.db.get_books()
+            book_entries = [
+                f"{b[0]} — {b[1]}" for b in (books if ok_b and books else [])
+            ]
+        except Exception:
+            book_entries = []
 
-            self.cap = cv2.VideoCapture(0, backend)
+        self._book_completer = QCompleter(book_entries, self)
+        self._book_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._book_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._book_completer.activated[str].connect(
+            lambda txt: self._apply_completer_id(self.input_book_id, txt)
+        )
+        self.input_book_id.setCompleter(self._book_completer)
 
-            if hasattr(cv2, "barcode"):
-                self.barcode_detector = cv2.barcode.BarcodeDetector()
+        try:
+            ok_u, users = self.db.get_users()
+            user_entries = [
+                f"{u[0]} — {u[1]}" for u in (users if ok_u and users else [])
+            ]
+        except Exception:
+            user_entries = []
+
+        self._user_completer = QCompleter(user_entries, self)
+        self._user_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._user_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._user_completer.activated[str].connect(
+            lambda txt: self._apply_completer_id(self.input_user_id, txt)
+        )
+        self.input_user_id.setCompleter(self._user_completer)
+
+    @staticmethod
+    def _extract_id_value(raw_text: str) -> str:
+        text = str(raw_text or "").strip()
+        if " — " in text:
+            text = text.split(" — ", 1)[0].strip()
+        upper = text.upper()
+        for prefix in ("BOOK:", "BOOK_ID:", "BOOKID:", "USER:", "ID:"):
+            if upper.startswith(prefix):
+                candidate = text[len(prefix):].strip()
+                if candidate:
+                    return candidate
+        return text
+
+    def _apply_completer_id(self, line_edit: QLineEdit, selected_text: str):
+        clean_id = self._extract_id_value(selected_text)
+        QTimer.singleShot(0, lambda: line_edit.setText(clean_id))
+
+    def _ensure_decode_worker(self):
+        if self._decode_thread is not None and self._decode_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._decode_thread = threading.Thread(
+            target=self._decode_worker_loop,
+            name="QuickScanDecodeWorker",
+            daemon=True,
+        )
+        self._decode_thread.start()
+
+    def _decode_worker_loop(self):
+        while not self._stop_event.is_set():
+            if not self._decode_event.wait(0.2):
+                continue
+            self._decode_event.clear()
+            if self._stop_event.is_set():
+                break
+
+            with self._decode_lock:
+                frame = self._pending_frame
+                thorough = self._pending_thorough
+                self._pending_frame = None
+
+            if frame is None:
+                continue
+
+            try:
+                result = self._decoder.decode(frame, thorough=thorough)
+            except Exception:
+                result = None
+
+            if result is not None and not self._stop_event.is_set() and not self._closing:
+                self._decoded_signal.emit(result, frame)
+
+    @staticmethod
+    def _open_camera_capture(camera_index: int):
+        """Open a VideoCapture safely across backends without noisy OpenCV WARN logs."""
+        if os.name == "nt":
+            backends = [
+                getattr(cv2, "CAP_DSHOW", 700),
+                getattr(cv2, "CAP_MSMF", 1400),
+                getattr(cv2, "CAP_ANY", 0),
+            ]
+        else:
+            backends = [getattr(cv2, "CAP_ANY", 0)]
+
+        cv_logging = getattr(getattr(cv2, "utils", None), "logging", None)
+        prev_level = None
+        if cv_logging is not None:
+            try:
+                prev_level = cv_logging.getLogLevel()
+                silent_level = getattr(
+                    cv_logging,
+                    "LOG_LEVEL_ERROR",
+                    getattr(cv_logging, "LOG_LEVEL_SILENT", 0),
+                )
+                cv_logging.setLogLevel(silent_level)
+            except Exception:
+                prev_level = None
+
+        try:
+            for backend in backends:
+                cap = cv2.VideoCapture(int(camera_index), backend)
+                if cap is not None and cap.isOpened():
+                    return cap
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+            return None
+        finally:
+            if cv_logging is not None and prev_level is not None:
+                try:
+                    cv_logging.setLogLevel(prev_level)
+                except Exception:
+                    pass
+
+    def _init_camera(self, camera_index=None):
+        if camera_index is not None:
+            self._camera_index = int(camera_index)
+        try:
+            self.cap = self._open_camera_capture(self._camera_index)
+            self.barcode_detector = self._decoder
 
             if self.cap and self.cap.isOpened():
-                self.timer.start(30)
-            else:
-                self.lbl_capture.setText(
-                    "Camera unavailable\nUse USB scanner or manual input."
+                # Request crisp HD/VGA resolution and continuous autofocus if supported
+                try:
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+                self._paused = False
+                self.btn_toggle_scan.setEnabled(True)
+                self.btn_toggle_scan.setText("⏸ Pause")
+                self.lbl_capture.set_overlay_state(
+                    show_reticle=True,
+                    badge_text=f"LIVE · CAM {self._camera_index}",
+                    badge_color="#22D3EE",
+                    locked=False,
                 )
-
+                self._ensure_decode_worker()
+                self.timer.start(33)
+            else:
+                self._set_camera_unavailable()
         except Exception:
             self.cap = None
-            self.lbl_capture.setText(
-                "Camera unavailable\nUse USB scanner or manual input."
-            )
+            self._set_camera_unavailable()
 
-    def _release_camera(self):
+    def _set_camera_unavailable(self):
+        self.btn_toggle_scan.setEnabled(False)
+        self.lbl_capture.clear()
+        self.lbl_capture.set_overlay_state(show_reticle=False, badge_text="")
+        self.lbl_capture.setText(
+            "Camera unavailable — use USB scanner, manual search, or Scan Image."
+        )
+
+    def _release_camera(self, closing=True):
+        if closing:
+            self._closing = True
         if hasattr(self, "timer") and self.timer.isActive():
             self.timer.stop()
+
+        self._stop_event.set()
+        self._decode_event.set()
+        if self._decode_thread is not None and self._decode_thread.is_alive():
+            try:
+                self._decode_thread.join(timeout=0.35)
+            except Exception:
+                pass
+        self._decode_thread = None
 
         if self.cap is not None:
             try:
@@ -3622,23 +4013,223 @@ class QuickScanDialog(QDialog):
                     self.cap.release()
             except Exception:
                 pass
-
             self.cap = None
+
+    def _detect_cameras(self):
+        available = []
+        # Keep active camera open if checking index == self._camera_index
+        for idx in range(4):
+            if idx == self._camera_index and self.cap is not None and self.cap.isOpened():
+                available.append(idx)
+                continue
+            probe = None
+            try:
+                probe = self._open_camera_capture(idx)
+                if probe and probe.isOpened():
+                    available.append(idx)
+            except Exception:
+                pass
+            finally:
+                if probe is not None:
+                    try:
+                        probe.release()
+                    except Exception:
+                        pass
+
+        self.camera_combo.blockSignals(True)
+        self.camera_combo.clear()
+        if available:
+            for idx in available:
+                label = f"Camera {idx}" + (" (Default)" if idx == 0 else "")
+                self.camera_combo.addItem(label, idx)
+            match_i = self.camera_combo.findData(self._camera_index)
+            self.camera_combo.setCurrentIndex(max(0, match_i))
+        else:
+            self.camera_combo.addItem("No Camera Found", 0)
+        self.camera_combo.blockSignals(False)
+
+        if available and (self.cap is None or not self.cap.isOpened()):
+            self._init_camera(available[0])
+        elif not available:
+            show_warning(
+                self,
+                "No Camera Detected",
+                "No active camera was found. You can still use a USB barcode scanner, "
+                "manual search, or Scan Image.",
+            )
+
+    def _on_camera_changed(self):
+        idx = self.camera_combo.currentData()
+        if idx is None or int(idx) == self._camera_index:
+            return
+        self._release_camera(closing=False)
+        self._init_camera(int(idx))
+
+    def _on_mirror_toggled(self, checked):
+        self._mirror_preview = bool(checked)
+        if self._last_frame is not None:
+            self._display_cv_frame(self._last_frame)
+
+    def _toggle_scan_target(self):
+        if self._scan_target == "book":
+            self._scan_target = "user"
+            self.btn_scan_target.setText("🎯 Target: User ID")
+        else:
+            self._scan_target = "book"
+            self.btn_scan_target.setText("🎯 Target: Book ID")
+
+    def toggle_scan_pause(self):
+        if self.cap is None or not self.cap.isOpened():
+            return
+        if self._paused or not self.timer.isActive():
+            self._paused = False
+            self.btn_toggle_scan.setText("⏸ Pause")
+            self.lbl_capture.set_overlay_state(
+                show_reticle=True,
+                badge_text=f"LIVE · CAM {self._camera_index}",
+                badge_color="#22D3EE",
+                locked=False,
+            )
+            self._ensure_decode_worker()
+            self.timer.start(33)
+        else:
+            self._paused = True
+            if self.timer.isActive():
+                self.timer.stop()
+            self.btn_toggle_scan.setText("▶ Resume")
+            self.lbl_capture.set_overlay_state(
+                show_reticle=True,
+                badge_text="PAUSED",
+                badge_color="#F59E0B",
+                locked=False,
+            )
+
+    def scan_from_image_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Barcode or QR Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp);;All Files (*)",
+        )
+        if not path:
+            return
+        img = cv2.imread(path)
+        result = decode_image_file(path)
+        if img is not None:
+            self._display_cv_frame(img, result=result)
+        if result is None:
+            show_warning(
+                self,
+                "No Barcode Found",
+                "Could not detect a valid Code 128, Code 39, QR, or EAN/UPC code in that image.",
+            )
+            return
+        self._handle_decoded_result(result, source_prefix="Image")
 
     def _on_spin_days_edited(self):
         if not self.spin_days.signalsBlocked():
             self._user_edited_days = True
 
+    def _on_user_return_pressed(self):
+        clean_uid = self._extract_id_value(self.input_user_id.text())
+        if clean_uid != self.input_user_id.text().strip():
+            self.input_user_id.setText(clean_uid)
+        self._update_scan_context()
+
+    def _apply_selected_active_borrower(self):
+        if not self._active_loans:
+            return
+        if len(self._active_loans) == 1:
+            uid = self._active_loans[0]["user_id"]
+        else:
+            uid = self.combo_active_borrowers.currentData()
+        if uid:
+            self.input_user_id.setText(str(uid))
+            self._update_scan_context()
+
+    def _refresh_book_status_ui(self, code: str, source: str = ""):
+        c = get_dialog_colors(self)
+        if not code:
+            self.lbl_status.setText("Waiting for barcode...")
+            self.lbl_status.setStyleSheet(
+                f"color: {c['muted']}; font-weight: 600;"
+            )
+            self._active_loans = []
+            self.active_borrower_widget.setVisible(False)
+            return
+
+        ok, book = self.db.get_book_details(code)
+        src_tag = f"[{source}] · " if source else ""
+        if ok and book:
+            avail = int(book[5] or 0)
+            total = int(book[4] or 0)
+            author = str(book[2] or "").strip()
+            author_note = f" by {author}" if author else ""
+            tone = "success" if avail > 0 else "warning"
+            self.lbl_status.setText(
+                f"{src_tag}📘 {book[1]}{author_note} ({avail}/{total} available)"
+            )
+            self.lbl_status.setStyleSheet(
+                f"background: {c[tone + '_soft']}; color: {c[tone]}; "
+                f"border: 1px solid {c[tone]}; border-radius: 6px; "
+                "padding: 6px 9px; font-weight: 700;"
+            )
+        else:
+            self.lbl_status.setText(
+                f"{src_tag}Book ID '{code}' not found in catalog."
+            )
+            self.lbl_status.setStyleSheet(
+                f"background: {c['warning_soft']}; color: {c['warning']}; "
+                f"border: 1px solid {c['warning']}; border-radius: 6px; "
+                "padding: 6px 9px; font-weight: 600;"
+            )
+
+        self._active_loans = self.db.get_active_loans_for_book(code)
+        if self._active_loans:
+            self.active_borrower_widget.setStyleSheet(
+                f"background: {c['cyan_soft']}; border: 1px solid {c['cyan']}; border-radius: 7px;"
+            )
+            if len(self._active_loans) == 1:
+                loan = self._active_loans[0]
+                self.lbl_active_borrower.setText(
+                    f"Active loan: {loan['user_name']} ({loan['user_id']}) · Due {loan['due_date']}"
+                )
+                self.lbl_active_borrower.setStyleSheet(
+                    f"color: {c['text']}; font-weight: 600; background: transparent; border: none;"
+                )
+                self.combo_active_borrowers.setVisible(False)
+            else:
+                self.lbl_active_borrower.setText(
+                    f"{len(self._active_loans)} active loans:"
+                )
+                self.lbl_active_borrower.setStyleSheet(
+                    f"color: {c['text']}; font-weight: 600; background: transparent; border: none;"
+                )
+                self.combo_active_borrowers.blockSignals(True)
+                self.combo_active_borrowers.clear()
+                for loan in self._active_loans:
+                    self.combo_active_borrowers.addItem(
+                        f"{loan['user_name']} ({loan['user_id']})",
+                        loan["user_id"],
+                    )
+                self.combo_active_borrowers.blockSignals(False)
+                self.combo_active_borrowers.setVisible(True)
+            self.active_borrower_widget.setVisible(True)
+        else:
+            self.active_borrower_widget.setVisible(False)
+
     def _update_scan_context(self, *_):
         c = get_dialog_colors(self)
-        code = self.input_book_id.text().strip()
-        user_id = self.input_user_id.text().strip()
+        code = self._extract_id_value(self.input_book_id.text())
+        user_id = self._extract_id_value(self.input_user_id.text())
         self.book_id = code or None
 
         has_book = bool(code)
         self.issue_btn.setEnabled(has_book)
         self.return_btn.setEnabled(has_book)
-        self.renew_btn.setEnabled(has_book and bool(user_id))
+        self.renew_btn.setEnabled(
+            has_book and (bool(user_id) or len(self._active_loans) == 1)
+        )
 
         if user_id:
             ok, user = self.db.get_user_details(user_id)
@@ -3647,16 +4238,24 @@ class QuickScanDialog(QDialog):
                 policy = self.db.get_loan_policy(role)
                 if not self._user_edited_days:
                     self.spin_days.blockSignals(True)
-                    self.spin_days.setValue(max(1, min(int(policy.get("default_days", 14)), 365)))
+                    self.spin_days.setValue(
+                        max(1, min(int(policy.get("default_days", 14)), 365))
+                    )
                     self.spin_days.blockSignals(False)
                 active_loan_id = (
                     self.db.get_active_loan_id(code, user_id)
                     if has_book
                     else None
                 )
+                pending_fines = self.db.get_user_pending_fines_total(user[0])
+                fine_note = (
+                    f" · Unpaid fines: {money(pending_fines)}"
+                    if pending_fines > 0
+                    else ""
+                )
                 if active_loan_id:
                     self.lbl_user_policy.setText(
-                        f"{user[1]} ({role}) · Active loan {format_log_id_display(active_loan_id)} detected for {code}"
+                        f"{user[1]} ({role}) · Active loan {format_log_id_display(active_loan_id)} detected for {code}{fine_note}"
                     )
                     self.lbl_user_policy.setStyleSheet(
                         f"background: {c['cyan_soft']}; color: {c['cyan']}; "
@@ -3666,11 +4265,12 @@ class QuickScanDialog(QDialog):
                 else:
                     self.lbl_user_policy.setText(
                         f"{user[1]} ({role}) · Policy: {policy.get('default_days', 14)} days, "
-                        f"Max {policy.get('max_books', 3)} books, ₹{policy.get('fine_rate', 2.0):.2f}/day"
+                        f"Max {policy.get('max_books', 3)} books, ₹{policy.get('fine_rate', 2.0):.2f}/day{fine_note}"
                     )
+                    tone = "warning" if pending_fines > 0 else "primary"
                     self.lbl_user_policy.setStyleSheet(
-                        f"background: {c['primary_soft']}; color: {c['primary']}; "
-                        f"border: 1px solid {c['primary']}; border-radius: 6px; "
+                        f"background: {c[tone + '_soft']}; color: {c[tone]}; "
+                        f"border: 1px solid {c[tone]}; border-radius: 6px; "
                         "padding: 5px 8px; font-weight: 600;"
                     )
             else:
@@ -3683,131 +4283,159 @@ class QuickScanDialog(QDialog):
             self.lbl_user_policy.setStyleSheet("")
 
     def on_manual_text_change(self, text):
-        c = get_dialog_colors(self)
-        code = text.strip()
+        code = self._extract_id_value(text)
         self.book_id = code or None
-
-        if code:
-            ok, book = self.db.get_book_details(code)
-            if ok and book:
-                self.lbl_status.setText(
-                    f"Book: {book[1]} ({int(book[5] or 0)}/{int(book[4] or 0)} available)"
-                )
-                self.lbl_status.setStyleSheet(
-                    f"background: {c['success_soft']}; color: {c['success']}; "
-                    f"border: 1px solid {c['success']}; border-radius: 6px; "
-                    "padding: 5px 8px; font-weight: 700;"
-                )
-            else:
-                self.lbl_status.setText(f"Book detected: {code}")
-                self.lbl_status.setStyleSheet(
-                    f"color: {c['primary']}; font-weight: 600;"
-                )
-        else:
-            self.lbl_status.setText("Waiting for barcode...")
-            self.lbl_status.setStyleSheet(
-                f"color: {c['muted']}; font-weight: 600;"
-            )
-
+        self._refresh_book_status_ui(code)
         self._update_scan_context()
 
     def on_physical_scan(self):
-        code = self.input_book_id.text().strip()
-
+        code = self._extract_id_value(self.input_book_id.text())
         if code:
-            self.set_camera_scanned_book_id(
-                code,
-                "USB Scanner"
-            )
+            self.set_camera_scanned_book_id(code, "USB Scanner")
             self.input_user_id.setFocus()
 
-    def update_frame(self):
-        if self.cap is None or not self.cap.isOpened():
+    def _display_cv_frame(self, frame, result: Optional[BarcodeScanResult] = None):
+        if frame is None or sip.isdeleted(self.lbl_capture):
             return
-
-        success, frame = self.cap.read()
-
-        if not success or frame is None:
-            return
-
-        if self.barcode_detector is not None:
-            try:
-                result = self.barcode_detector.detectAndDecode(frame)
-
-                if result and len(result) >= 2:
-                    decoded = result[1]
-
-                    if isinstance(decoded, (list, tuple)):
-                        codes = decoded
-                    else:
-                        codes = [decoded]
-
-                    for code in codes:
-                        if code and str(code).strip():
-                            self.set_camera_scanned_book_id(
-                                str(code).strip(),
-                                "Camera"
-                            )
-                            break
-
-            except Exception:
-                pass
-
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            height, width, channels = rgb.shape
+            disp = frame.copy()
+            h, w = disp.shape[:2]
 
+            if result is not None and result.points is not None and len(result.points) >= 3:
+                pts = result.points.reshape((-1, 1, 2)).astype(np.int32)
+                cv2.polylines(disp, [pts], True, (16, 185, 129), 3, cv2.LINE_AA)
+
+            if self._mirror_preview:
+                disp = cv2.flip(disp, 1)
+
+            rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+            height, width, channels = rgb.shape
             image = QImage(
                 rgb.data,
                 width,
                 height,
                 width * channels,
-                QImage.Format.Format_RGB888
+                QImage.Format.Format_RGB888,
             ).copy()
-
             pixmap = QPixmap.fromImage(image)
 
-            cap_w = max(120, self.lbl_capture.width())
-            cap_h = max(100, self.lbl_capture.height())
+            # Scale strictly to contentsRect() minus safety margin so QLabel never auto-expands
+            cr = self.lbl_capture.contentsRect()
+            cap_w = max(120, cr.width() - 4)
+            cap_h = max(100, cr.height() - 4)
             self.lbl_capture.setPixmap(
                 pixmap.scaled(
                     cap_w,
                     cap_h,
                     Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
+                    Qt.TransformationMode.SmoothTransformation,
                 )
             )
-
         except Exception:
             pass
 
-    def set_camera_scanned_book_id(self, code, source=""):
-        if not code:
+    def update_frame(self):
+        if self._closing or self._paused or self.cap is None or not self.cap.isOpened():
             return
 
-        self.book_id = code
+        success, frame = self.cap.read()
+        if not success or frame is None:
+            return
 
-        self.input_book_id.blockSignals(True)
-        self.input_book_id.setText(code)
-        self.input_book_id.blockSignals(False)
+        self._last_frame = frame
+        self._frame_seq += 1
 
-        self.lbl_status.setText(
-            f"Detected using {source}: {code}"
+        # Push latest frame to background decoder without blocking UI thread
+        with self._decode_lock:
+            if self._pending_frame is None:
+                self._pending_frame = frame.copy()
+                self._pending_thorough = (self._frame_seq % 4) == 0
+                self._decode_event.set()
+
+        self._display_cv_frame(frame)
+
+    def _on_background_decoded(self, result, frame):
+        if self._closing or self._paused or result is None:
+            return
+        now = time.monotonic()
+        if (
+            result.code == self._last_scan_code
+            and (now - self._last_scan_ts) < 1.5
+        ):
+            return
+        self._last_scan_code = result.code
+        self._last_scan_ts = now
+        self._display_cv_frame(frame, result=result)
+        self._handle_decoded_result(result, source_prefix="Camera")
+
+    def _handle_decoded_result(self, result: BarcodeScanResult, source_prefix: str = "Camera"):
+        try:
+            QApplication.beep()
+        except Exception:
+            pass
+
+        source_label = f"{source_prefix} ({result.symbology})"
+        self.lbl_capture.set_overlay_state(
+            show_reticle=True,
+            badge_text=f"DETECTED · {result.symbology}: {result.code}",
+            badge_color="#10B981",
+            locked=True,
         )
 
+        if self._scan_target == "user":
+            self.input_user_id.setText(result.code)
+            self._update_scan_context()
+            if self.timer.isActive():
+                self.timer.stop()
+            self._paused = True
+            self.btn_toggle_scan.setText("▶ Resume")
+            return
+
+        self.set_camera_scanned_book_id(result.code, source_label)
+
+    def set_camera_scanned_book_id(self, code, source=""):
+        clean_code = self._extract_id_value(code)
+        if not clean_code:
+            return
+
+        self.book_id = clean_code
+
+        self.input_book_id.blockSignals(True)
+        self.input_book_id.setText(clean_code)
+        self.input_book_id.blockSignals(False)
+
+        self._refresh_book_status_ui(clean_code, source=source or "Scanner")
         self._update_scan_context()
 
         if self.timer.isActive():
             self.timer.stop()
+        if self.cap and self.cap.isOpened():
+            self._paused = True
+            self.btn_toggle_scan.setText("▶ Resume")
+
+    def _append_session_log(self, entry: str):
+        self._session_entries.insert(0, entry)
+        self._session_entries = self._session_entries[:4]
+        self.lbl_session_log.setText(
+            "Session Log:\n" + "\n".join(self._session_entries)
+        )
+        self.lbl_session_log.setVisible(True)
 
     def process_circulation(self, action):
-        user_id = self.input_user_id.text().strip()
+        book_id = self._extract_id_value(self.input_book_id.text()) or self.book_id
+        self.book_id = book_id or None
+        user_id = self._extract_id_value(self.input_user_id.text())
+
+        # Smart fallback for return/renew if exactly 1 active borrower exists for this book
+        if not user_id and action in ("return", "renew") and len(self._active_loans) == 1:
+            user_id = self._active_loans[0]["user_id"]
+            self.input_user_id.setText(user_id)
 
         if not self.book_id or not user_id:
             show_warning(
                 self,
                 "Missing Information",
-                "Both Book ID and User ID are required."
+                "Both Book ID and User ID are required.",
             )
             return
 
@@ -3817,19 +4445,25 @@ class QuickScanDialog(QDialog):
                 show_warning(
                     self,
                     "Active Loan Not Found",
-                    f"No active loan found matching Book ID '{self.book_id}' and User ID '{user_id}'."
+                    f"No active loan found matching Book ID '{self.book_id}' and User ID '{user_id}'.",
                 )
                 return
             dialog = RenewLoanDialog(self.db, loan_id, self)
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.data_updated.emit()
-                show_success(
-                    self,
-                    "Loan Renewed",
-                    dialog.result_message or "Loan renewed successfully."
-                )
-                self._release_camera()
-                self.accept()
+                if self.chk_batch_mode.isChecked():
+                    self._append_session_log(
+                        f"✓ RENEWED {self.book_id} · {user_id}"
+                    )
+                    self.reset_for_retry()
+                else:
+                    show_success(
+                        self,
+                        "Loan Renewed",
+                        dialog.result_message or "Loan renewed successfully.",
+                    )
+                    self._release_camera()
+                    self.accept()
             return
 
         try:
@@ -3837,32 +4471,37 @@ class QuickScanDialog(QDialog):
                 success, message = self.db.issue_book(
                     self.book_id,
                     user_id,
-                    days_allowed=self.spin_days.value()
+                    days_allowed=self.spin_days.value(),
                 )
-
                 fine = 0
-
             else:
                 success, fine, message = self.db.return_book(
                     self.book_id,
-                    user_id
+                    user_id,
                 )
 
             if success:
                 self.data_updated.emit()
+                if self.chk_batch_mode.isChecked():
+                    verb = "ISSUED" if action == "issue" else "RETURNED"
+                    fine_txt = f" · Fine {money(fine)}" if action == "return" and fine > 0 else ""
+                    self._append_session_log(
+                        f"✓ {verb} {self.book_id} · {user_id}{fine_txt}"
+                    )
+                    self.reset_for_retry()
+                    return
 
                 if action == "return" and fine > 0:
                     show_success(
                         self,
                         "Return Successful",
-                        f"{message}\nFine: {money(fine)}"
+                        f"{message}\nFine: {money(fine)}",
                     )
                 else:
                     show_success(self, "Success", message)
 
                 self._release_camera()
                 self.accept()
-
             else:
                 show_warning(self, "Transaction Failed", message)
                 self.reset_for_retry()
@@ -3873,14 +4512,30 @@ class QuickScanDialog(QDialog):
 
     def reset_for_retry(self):
         self.book_id = None
+        self._last_scan_code = None
+        self._active_loans = []
+        self.active_borrower_widget.setVisible(False)
+        self.input_book_id.blockSignals(True)
         self.input_book_id.clear()
+        self.input_book_id.blockSignals(False)
 
-        self.issue_btn.setEnabled(False)
-        self.renew_btn.setEnabled(False)
-        self.return_btn.setEnabled(False)
+        self._refresh_book_status_ui("")
+        self._update_scan_context()
 
-        if self.cap and self.cap.isOpened() and not self.timer.isActive():
-            self.timer.start(30)
+        if self.cap and self.cap.isOpened():
+            self._paused = False
+            self.btn_toggle_scan.setText("⏸ Pause")
+            self.lbl_capture.set_overlay_state(
+                show_reticle=True,
+                badge_text=f"LIVE · CAM {self._camera_index}",
+                badge_color="#22D3EE",
+                locked=False,
+            )
+            self._ensure_decode_worker()
+            if not self.timer.isActive():
+                self.timer.start(33)
+
+        self.input_book_id.setFocus()
 
     def reject(self):
         self._release_camera()

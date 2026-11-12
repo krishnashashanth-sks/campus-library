@@ -102,6 +102,10 @@ jobs:
 
       - name: Build Windows executable, updater ZIP, and installer
         shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          SIGNING_CERT_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_CERT_THUMBPRINT }}
         run: .\scripts\build_windows.ps1 -Version "${{ steps.meta.outputs.version }}"
 
       - name: Prepare release body with SHA-256 checksums

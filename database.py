@@ -2537,6 +2537,38 @@ class LocalDatabase:
             logging.exception("Could not get book circulation status")
             return None
 
+    def get_active_loans_for_book(self, book_id: str):
+        bid = self._clean(book_id)
+        if not bid:
+            return []
+        try:
+            rows = self.conn.execute("""
+                SELECT COALESCE(NULLIF(c.log_code, ''), CAST(c.id AS TEXT)),
+                       c.user_id,
+                       COALESCE(NULLIF(u.full_name, ''), c.user_id),
+                       COALESCE(NULLIF(u.role, ''), 'Student'),
+                       COALESCE(c.checkout_date, ''),
+                       COALESCE(c.due_date, '')
+                FROM circulation_logs c
+                LEFT JOIN users u ON c.user_id = u.id
+                WHERE c.book_id = ? AND c.status = 'ISSUED'
+                ORDER BY c.id DESC
+            """, (bid,)).fetchall()
+            return [
+                {
+                    "loan_id": str(r[0]),
+                    "user_id": str(r[1]),
+                    "user_name": str(r[2]),
+                    "role": str(r[3]),
+                    "checkout_date": str(r[4] or ""),
+                    "due_date": str(r[5] or ""),
+                }
+                for r in rows
+            ]
+        except sqlite3.Error:
+            logging.exception("Could not get active loans for book %s", bid)
+            return []
+
     def get_due_email_reminders(self, today=None):
         today = today or datetime.date.today().isoformat()
         try:

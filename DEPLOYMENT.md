@@ -59,8 +59,33 @@ Run the same script used by CI:
 ```
 
 Optional flags:
-- `-Version 2.0` — Override the stamped installer and `library_version.txt` version.
+- `-Version 2.0` — Override the stamped PE `VersionInfo`, `library_version.txt`, and installer version.
 - `-SkipInstaller` — Build only the PyInstaller bundle and `Library-Windows.zip` when Inno Setup 6 is not installed locally.
+- `-PfxPath <path> -PfxPassword <pass>` (or `-CertThumbprint <sha1>`) — Digitally sign `Library.exe`, the installer `LibraryInstaller.exe`, and `unins000.exe` using Windows Authenticode (`signtool.exe`).
+
+## Windows Publisher Verification & SmartScreen Signing
+
+Both `Library.exe` (via `main.spec` `VSVersionInfo`) and `LibraryInstaller.exe` (via `installer_scipt.iss`) embed official Windows PE metadata (`CompanyName = Govt Polytechnic College Hyderabad`, `ProductName`, `FileVersion`). However, Windows SmartScreen and UAC show **"Unknown publisher"** or a warning unless the `.exe` binaries carry a trusted **Authenticode digital signature**:
+
+1. **Public / External PCs (Commercial or Cloud Trusted CA):**
+   - Add `WINDOWS_SIGNING_PFX_BASE64` and `WINDOWS_SIGNING_PFX_PASSWORD` (or `WINDOWS_SIGNING_CERT_THUMBPRINT`) in **GitHub Repository → Settings → Secrets and variables → Actions** for `.github/workflows/release.yml`, using a publicly trusted Code Signing certificate (e.g., Microsoft Azure Trusted Signing, SSL.com, DigiCert, Sectigo, or SignPath).
+2. **Campus / College Lab PCs (Zero-Cost Institutional Signing):**
+   - Generate a college signing certificate once (stored in gitignored `certs/`):
+     ```powershell
+     .\scripts\setup_code_signing.ps1 -Action CreateCert -PfxPassword "YourStrongPassword"
+     ```
+   - Trust the public `.cer` on each campus PC (or deploy via Group Policy):
+     ```powershell
+     .\scripts\setup_code_signing.ps1 -Action TrustCert -Scope LocalMachine
+     ```
+   - Build signed binaries:
+     ```powershell
+     .\scripts\build_windows.ps1 -PfxPath certs\library_codesign.pfx -PfxPassword "YourStrongPassword"
+     ```
+   - Verify PE metadata and signature status anytime:
+     ```powershell
+     .\scripts\setup_code_signing.ps1 -Action Verify
+     ```
 
 ## Google Drive Backup Setup (Librarian-Friendly)
 
