@@ -11,7 +11,7 @@ except ImportError:
     openpyxl = None
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QPoint, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor
+from PyQt6.QtGui import QColor, QCursor, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -2098,6 +2098,15 @@ class UserManagementView(QWidget):
 
             rows_to_reselect = []
             c = self.colors
+            primary_color = QColor(c["primary"])
+            warning_color = QColor(c["warning"])
+            cyan_color = QColor(c["cyan"])
+            success_color = QColor(c["success"])
+            muted_color = QColor(c["muted"])
+            purple_color = QColor(c["purple"])
+            indigo_color = QColor(c["indigo"])
+            bold_font = QFont(self.table.font())
+            bold_font.setBold(True)
 
             for row_index, row_data in enumerate(rows):
 
@@ -2153,24 +2162,20 @@ class UserManagementView(QWidget):
                             Qt.ItemDataRole.UserRole,
                             str(user_id),
                         )
-                        font = item.font()
-                        font.setBold(True)
-                        item.setFont(font)
-                        item.setForeground(QColor(c["primary"]))
+                        item.setFont(bold_font)
+                        item.setForeground(primary_color)
 
                     elif column == 3:
 
                         role_text = str(
                             role or ""
                         ).lower()
-                        font = item.font()
-                        font.setBold(True)
-                        item.setFont(font)
+                        item.setFont(bold_font)
 
                         if "guest" in role_text:
 
                             item.setForeground(
-                                QColor(c["warning"])
+                                warning_color
                             )
 
                         elif (
@@ -2179,29 +2184,27 @@ class UserManagementView(QWidget):
                         ):
 
                             item.setForeground(
-                                QColor(c["cyan"])
+                                cyan_color
                             )
 
                         else:
 
                             item.setForeground(
-                                QColor(c["success"])
+                                success_color
                             )
 
                     elif column == 4:
 
                         year_str = str(value or "").strip()
                         if year_str.startswith("N/A"):
-                            item.setForeground(QColor(c["muted"]))
+                            item.setForeground(muted_color)
                         elif "(Final)" in year_str:
-                            font = item.font()
-                            font.setBold(True)
-                            item.setFont(font)
-                            item.setForeground(QColor(c["cyan"]))
+                            item.setFont(bold_font)
+                            item.setForeground(cyan_color)
                         elif "(Graduated)" in year_str:
-                            item.setForeground(QColor(c["purple"]))
+                            item.setForeground(purple_color)
                         else:
-                            item.setForeground(QColor(c["indigo"]))
+                            item.setForeground(indigo_color)
 
                     self.table.setItem(
                         row_index,

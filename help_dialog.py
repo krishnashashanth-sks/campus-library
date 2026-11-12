@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from app_version import APP_DEVELOPER_CREDIT, APP_NAME, get_app_version
 from ui_responsive import clamp_widget_to_screen
 
 
@@ -147,14 +148,14 @@ class HelpDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Library Management System Help")
+        self.setWindowTitle(f"{APP_NAME} Help")
         clamp_widget_to_screen(self, 920, 560, min_width=460, min_height=340)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 14)
         layout.setSpacing(12)
 
-        heading = QLabel("📖  Library Management System Guide")
+        heading = QLabel(f"📖  {APP_NAME} Guide")
         heading.setWordWrap(True)
         heading.setProperty("class", "dialog-heading")
         layout.addWidget(heading)
@@ -165,10 +166,6 @@ class HelpDialog(QDialog):
         introduction.setWordWrap(True)
         layout.addWidget(introduction)
 
-        tabs = QTabWidget()
-        tabs.setObjectName("HelpTabs")
-        tabs.tabBar().setExpanding(False)
-        tabs.tabBar().setUsesScrollButtons(True)
         app = QApplication.instance()
         tm = app.property("theme_manager") if app is not None else None
         colors = None
@@ -185,6 +182,20 @@ class HelpDialog(QDialog):
                 "primary_soft": "rgba(29, 78, 216, 0.20)",
                 "text": "#0A1628",
             }
+
+        credit = QLabel(
+            f"{APP_NAME} v{get_app_version()}  •  {APP_DEVELOPER_CREDIT}"
+        )
+        credit.setWordWrap(True)
+        credit.setStyleSheet(
+            f"color: {colors['muted']}; font-size: 11px; font-weight: 600;"
+        )
+        layout.addWidget(credit)
+
+        tabs = QTabWidget()
+        tabs.setObjectName("HelpTabs")
+        tabs.tabBar().setExpanding(False)
+        tabs.tabBar().setUsesScrollButtons(True)
         tabs.setStyleSheet(
             f"QTabWidget#HelpTabs QTabBar::tab {{"
             f" background-color: {colors['surface_alt']};"

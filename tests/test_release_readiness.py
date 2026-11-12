@@ -1,5 +1,6 @@
 import ast
 import os
+import re
 import tempfile
 import unittest
 import zipfile
@@ -132,6 +133,54 @@ class ReleaseReadinessTests(unittest.TestCase):
                 (REPO_ROOT / rel_path).is_file(),
                 f"Missing required packaging file: {rel_path}",
             )
+
+    def test_branding_and_attribution(self):
+        self.assertEqual(app_version.APP_NAME, "Library Management System")
+        self.assertEqual(
+            app_version.APP_DEVELOPER,
+            "Govt Polytechnic College Masab Tank Hyderabad Students",
+        )
+        self.assertEqual(
+            app_version.APP_DEVELOPER_CREDIT,
+            "Developed by Govt Polytechnic College Masab Tank Hyderabad Students",
+        )
+
+        legacy_pattern = re.compile(r"lib" r"[\s_-]*" r"core", re.IGNORECASE)
+        checked_files = (
+            "README.md",
+            "DEPLOYMENT.md",
+            "installer_scipt.iss",
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+            "app_version.py",
+            "main.py",
+            "dialogs.py",
+            "help_dialog.py",
+            "mainwindow.py",
+            "pages/settings_view.py",
+        )
+        for rel_path in checked_files:
+            content = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+            self.assertIsNone(
+                legacy_pattern.search(content),
+                f"Legacy branding found in {rel_path}",
+            )
+
+        iss_text = (REPO_ROOT / "installer_scipt.iss").read_text(encoding="utf-8")
+        self.assertIn('#define AppName "Library Management System"', iss_text)
+        self.assertIn(
+            '#define AppPublisher "Govt Polytechnic College Masab Tank Hyderabad Students"',
+            iss_text,
+        )
+        self.assertIn('#define AppExeName "Library.exe"', iss_text)
+
+        release_yml = (
+            REPO_ROOT / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "name: Library Management System ${{ steps.meta.outputs.tag }}",
+            release_yml,
+        )
 
 
 if __name__ == "__main__":

@@ -2623,6 +2623,25 @@ class DashboardView(QWidget):
         row_disabled_fg = "#7D93B2" if is_dark else "#64748B"
         row_disabled_border = "#28385C" if is_dark else "#9DB3D6"
 
+        badge_palette = (
+            STATUS_BADGE_COLORS if is_dark else STATUS_BADGE_COLORS_LIGHT
+        )
+        badge_rules = "\n".join(
+            f"""
+            QLabel#StatusBadge[statusRole="{role_key}"] {{
+                color: {fg};
+                background: {bg};
+                border: 1px solid {border_c};
+            }}"""
+            for role_key, (bg, fg, border_c) in (
+                ("issued", badge_palette["ISSUED"]),
+                ("due_today", badge_palette["DUE TODAY"]),
+                ("overdue", badge_palette["OVERDUE"]),
+                ("returned", badge_palette["RETURNED"]),
+                ("renewed", badge_palette["RENEWED"]),
+            )
+        )
+
         self.setStyleSheet(f"""
             QWidget#DashboardView {{
                 background: {c['window']};
@@ -2875,6 +2894,12 @@ class DashboardView(QWidget):
                 font-size: 10px;
                 font-weight: 800;
             }}
+{badge_rules}
+
+            QWidget#ActivityRowActions {{
+                background: transparent;
+                border: none;
+            }}
 
             QHeaderView::section {{
                 background: {c['header_bg']};
@@ -2971,8 +2996,6 @@ class DashboardView(QWidget):
         for card in self.metric_widgets.values():
             card.apply_style()
         self.analytics_widget.update()
-        if hasattr(self, "_activity_records") and self._activity_records:
-            self._render_activity_table()
 
     # --------------------------------------------------------
     # METRIC CARDS
@@ -3237,7 +3260,23 @@ class DashboardView(QWidget):
                         self._current_books_by_user.get(user_key, 0) + 1
                     )
 
-            recent_logs = list(logs or [])[:300]
+            all_logs = list(logs or [])
+            today = datetime.date.today().isoformat()
+            if len(all_logs) <= 80:
+                recent_logs = all_logs
+            else:
+                recent_logs = list(all_logs[:80])
+                urgent_added = 0
+                for record in all_logs[80:]:
+                    if not record or len(record) < 8:
+                        continue
+                    raw_status = safe_text(record[7]).upper()
+                    due_text = safe_text(record[4])
+                    if raw_status == "ISSUED" and due_text and due_text[:10] <= today:
+                        recent_logs.append(record)
+                        urgent_added += 1
+                        if urgent_added >= 40:
+                            break
             log_ids = [
                 record[0] for record in recent_logs
                 if record and len(record) >= 8
@@ -3246,7 +3285,6 @@ class DashboardView(QWidget):
             max_renewals = self.db.get_max_renewals()
 
             self._activity_records = []
-            today = datetime.date.today().isoformat()
             for record in recent_logs:
                 if len(record) < 8:
                     continue
@@ -3333,151 +3371,151 @@ class DashboardView(QWidget):
         else:
             records = self._activity_records
 
-        self.activity_table.setRowCount(len(records))
-        self.activity_empty_hint.setVisible(len(records) == 0)
-        for row_index, item in enumerate(records):
-            renewal_count = int(item.get("renewal_count", 0))
-            max_renewals = int(item.get("max_renewals", 0))
-            due_display = item["due_date"] or "—"
-            if renewal_count > 0 and item["due_date"]:
-                due_display = f"{item['due_date']}  (↻{renewal_count})"
+        status_role_map = {
+            "ISSUED": "issued",
+            "DUE TODAY": "due_today",
+            "OVERDUE": "overdue",
+            "RETURNED": "returned",
+            "RENEWED": "renewed",
+        }
 
-            values = (
-                item["display_date"],
-                item["book_id"],
-                item["book_title"],
-                f"{item['user_name']} ({item['user_id']})",
-                due_display,
-            )
-            for column, value in enumerate(values):
-                actual_column = column if column < 4 else column + 1
-                table_item = QTableWidgetItem(safe_text(value) or "—")
-                if actual_column == 5 and renewal_count > 0:
-                    last_r = item.get("last_renewed_at") or "Recorded"
-                    table_item.setToolTip(
-                        f"Due Date: {item['due_date'] or '—'}\n"
-                        f"Renewals Used: {renewal_count}"
-                        + (f" / {max_renewals}" if max_renewals > 0 else " (Unlimited)")
-                        + f"\nLast Renewed: {last_r}"
+        self.activity_empty_hint.setVisible(len(records) == 0)
+        self.activity_table.blockSignals(True)
+        self.activity_table.setUpdatesEnabled(False)
+        try:
+            self.activity_table.clearContents()
+            self.activity_table.setRowCount(len(records))
+            for row_index, item in enumerate(records):
+                renewal_count = int(item.get("renewal_count", 0))
+                max_renewals = int(item.get("max_renewals", 0))
+                due_display = item["due_date"] or "—"
+                if renewal_count > 0 and item["due_date"]:
+                    due_display = f"{item['due_date']}  (↻{renewal_count})"
+
+                values = (
+                    item["display_date"],
+                    item["book_id"],
+                    item["book_title"],
+                    f"{item['user_name']} ({item['user_id']})",
+                    due_display,
+                )
+                for column, value in enumerate(values):
+                    actual_column = column if column < 4 else column + 1
+                    table_item = QTableWidgetItem(safe_text(value) or "—")
+                    if actual_column == 5 and renewal_count > 0:
+                        last_r = item.get("last_renewed_at") or "Recorded"
+                        table_item.setToolTip(
+                            f"Due Date: {item['due_date'] or '—'}\n"
+                            f"Renewals Used: {renewal_count}"
+                            + (f" / {max_renewals}" if max_renewals > 0 else " (Unlimited)")
+                            + f"\nLast Renewed: {last_r}"
+                        )
+                    else:
+                        table_item.setToolTip(safe_text(value) or "—")
+                    if actual_column == 0:
+                        table_item.setData(
+                            Qt.ItemDataRole.UserRole,
+                            item["record"],
+                        )
+                    self.activity_table.setItem(
+                        row_index, actual_column, table_item
+                    )
+
+                badge = QLabel(item["status"].title())
+                badge.setObjectName("StatusBadge")
+                badge.setProperty(
+                    "statusRole",
+                    status_role_map.get(item["status"], "issued"),
+                )
+                badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.activity_table.setCellWidget(row_index, 4, badge)
+
+                actions = QWidget()
+                actions.setObjectName("ActivityRowActions")
+                actions_layout = QHBoxLayout(actions)
+                actions_layout.setContentsMargins(3, 0, 3, 0)
+                actions_layout.setSpacing(4)
+
+                is_active = item["status"] in ("ISSUED", "DUE TODAY", "OVERDUE")
+
+                return_button = QPushButton("Return")
+                return_button.setObjectName("RowAction")
+                return_button.setProperty("actionRole", "return")
+                return_button.setSizePolicy(
+                    QSizePolicy.Policy.Ignored,
+                    QSizePolicy.Policy.Fixed,
+                )
+                return_button.setFixedHeight(24)
+                return_button.setCursor(Qt.CursorShape.PointingHandCursor)
+                return_button.setEnabled(is_active)
+                return_button.clicked.connect(
+                    lambda _checked=False, selected=item:
+                    self.return_activity_record(selected)
+                )
+                actions_layout.addWidget(return_button, 10, Qt.AlignmentFlag.AlignVCenter)
+
+                renew_label = "Renew"
+                if renewal_count > 0:
+                    renew_label = (
+                        f"Renew ({renewal_count}/{max_renewals})"
+                        if max_renewals > 0
+                        else f"Renew ({renewal_count})"
+                    )
+                renew_button = QPushButton(renew_label)
+                renew_button.setObjectName("RowAction")
+                renew_button.setProperty("actionRole", "renew")
+                renew_button.setSizePolicy(
+                    QSizePolicy.Policy.Ignored,
+                    QSizePolicy.Policy.Fixed,
+                )
+                renew_button.setFixedHeight(24)
+                renew_button.setCursor(Qt.CursorShape.PointingHandCursor)
+                renew_button.setEnabled(is_active)
+                if not is_active:
+                    renew_button.setToolTip(
+                        "Returned loans cannot be renewed."
+                    )
+                elif max_renewals > 0 and renewal_count >= max_renewals:
+                    renew_button.setToolTip(
+                        f"Renewal quota reached ({renewal_count}/{max_renewals}). "
+                        "Click to inspect details or apply Librarian Override."
                     )
                 else:
-                    table_item.setToolTip(safe_text(value) or "—")
-                if actual_column == 0:
-                    table_item.setData(
-                        Qt.ItemDataRole.UserRole,
-                        item["record"],
+                    remaining = (
+                        f"{max_renewals - renewal_count} remaining"
+                        if max_renewals > 0
+                        else "Unlimited"
                     )
-                self.activity_table.setItem(
-                    row_index, actual_column, table_item
+                    renew_button.setToolTip(
+                        f"Renew loan {format_log_id_display(item['log_id'])} ({remaining})"
+                    )
+                renew_button.clicked.connect(
+                    lambda _checked=False, selected=item:
+                    self.renew_activity_record(selected)
                 )
+                renew_stretch = 14 if renewal_count > 0 else 10
+                actions_layout.addWidget(renew_button, renew_stretch, Qt.AlignmentFlag.AlignVCenter)
 
-            colors = get_theme_colors()
-            badge_palette = (
-                STATUS_BADGE_COLORS
-                if colors.get("is_dark", True)
-                else STATUS_BADGE_COLORS_LIGHT
-            )
-            badge_background, status_color, badge_border = badge_palette.get(
-                item["status"],
-                badge_palette["ISSUED"],
-            )
-            badge = QLabel(item["status"].title())
-            badge.setObjectName("StatusBadge")
-            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            badge.setStyleSheet(
-                f"color: {status_color}; background: {badge_background};"
-                f" border: 1px solid {badge_border}; border-radius: 9px;"
-                f" padding: 1px 6px; margin: 5px 2px;"
-                f" font-size: 10px; font-weight: 800;"
-            )
-            self.activity_table.setCellWidget(row_index, 4, badge)
-
-            actions = QWidget()
-            actions.setObjectName("ActivityRowActions")
-            actions.setStyleSheet(
-                "QWidget#ActivityRowActions { background: transparent; border: none; }"
-            )
-            actions_layout = QHBoxLayout(actions)
-            actions_layout.setContentsMargins(3, 0, 3, 0)
-            actions_layout.setSpacing(4)
-
-            is_active = item["status"] in ("ISSUED", "DUE TODAY", "OVERDUE")
-
-            return_button = QPushButton("Return")
-            return_button.setObjectName("RowAction")
-            return_button.setProperty("actionRole", "return")
-            return_button.setSizePolicy(
-                QSizePolicy.Policy.Ignored,
-                QSizePolicy.Policy.Fixed,
-            )
-            return_button.setFixedHeight(24)
-            return_button.setCursor(Qt.CursorShape.PointingHandCursor)
-            return_button.setEnabled(is_active)
-            return_button.clicked.connect(
-                lambda _checked=False, selected=item:
-                self.return_activity_record(selected)
-            )
-            actions_layout.addWidget(return_button, 10, Qt.AlignmentFlag.AlignVCenter)
-
-            renew_label = "Renew"
-            if renewal_count > 0:
-                renew_label = (
-                    f"Renew ({renewal_count}/{max_renewals})"
-                    if max_renewals > 0
-                    else f"Renew ({renewal_count})"
+                inspect_button = QPushButton("Inspect")
+                inspect_button.setObjectName("RowAction")
+                inspect_button.setProperty("actionRole", "inspect")
+                inspect_button.setSizePolicy(
+                    QSizePolicy.Policy.Ignored,
+                    QSizePolicy.Policy.Fixed,
                 )
-            renew_button = QPushButton(renew_label)
-            renew_button.setObjectName("RowAction")
-            renew_button.setProperty("actionRole", "renew")
-            renew_button.setSizePolicy(
-                QSizePolicy.Policy.Ignored,
-                QSizePolicy.Policy.Fixed,
-            )
-            renew_button.setFixedHeight(24)
-            renew_button.setCursor(Qt.CursorShape.PointingHandCursor)
-            renew_button.setEnabled(is_active)
-            if not is_active:
-                renew_button.setToolTip(
-                    "Returned loans cannot be renewed."
+                inspect_button.setFixedHeight(24)
+                inspect_button.setCursor(Qt.CursorShape.PointingHandCursor)
+                inspect_button.clicked.connect(
+                    lambda _checked=False, selected=item:
+                    self.inspect_activity_record(selected)
                 )
-            elif max_renewals > 0 and renewal_count >= max_renewals:
-                renew_button.setToolTip(
-                    f"Renewal quota reached ({renewal_count}/{max_renewals}). "
-                    "Click to inspect details or apply Librarian Override."
+                actions_layout.addWidget(inspect_button, 11, Qt.AlignmentFlag.AlignVCenter)
+                self.activity_table.setCellWidget(
+                    row_index, 6, actions
                 )
-            else:
-                remaining = (
-                    f"{max_renewals - renewal_count} remaining"
-                    if max_renewals > 0
-                    else "Unlimited"
-                )
-                renew_button.setToolTip(
-                    f"Renew loan {format_log_id_display(item['log_id'])} ({remaining})"
-                )
-            renew_button.clicked.connect(
-                lambda _checked=False, selected=item:
-                self.renew_activity_record(selected)
-            )
-            renew_stretch = 14 if renewal_count > 0 else 10
-            actions_layout.addWidget(renew_button, renew_stretch, Qt.AlignmentFlag.AlignVCenter)
-
-            inspect_button = QPushButton("Inspect")
-            inspect_button.setObjectName("RowAction")
-            inspect_button.setProperty("actionRole", "inspect")
-            inspect_button.setSizePolicy(
-                QSizePolicy.Policy.Ignored,
-                QSizePolicy.Policy.Fixed,
-            )
-            inspect_button.setFixedHeight(24)
-            inspect_button.setCursor(Qt.CursorShape.PointingHandCursor)
-            inspect_button.clicked.connect(
-                lambda _checked=False, selected=item:
-                self.inspect_activity_record(selected)
-            )
-            actions_layout.addWidget(inspect_button, 11, Qt.AlignmentFlag.AlignVCenter)
-            self.activity_table.setCellWidget(
-                row_index, 6, actions
-            )
+        finally:
+            self.activity_table.blockSignals(False)
+            self.activity_table.setUpdatesEnabled(True)
 
         self.activity_summary_label.setText(
             f"{len(records)} transaction(s)"

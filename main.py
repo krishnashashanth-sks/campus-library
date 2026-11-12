@@ -14,14 +14,12 @@ from database import LocalDatabase
 from dialogs import LoginDialog, CustomSplashScreen
 from email_service import LibraryEmailService
 from theme_manager import ThemeManager
-from app_version import get_app_version
+from app_version import APP_DEVELOPER, APP_NAME, get_app_version
 
 
 # ============================================================
 # APPLICATION CONFIGURATION
 # ============================================================
-
-APP_NAME = "Library Management System"
 
 # Keep production authentication enabled; bypass is for local testing only.
 BYPASS_LOGIN = False
@@ -107,7 +105,7 @@ def main():
 
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(get_app_version())
-    app.setOrganizationName("Library Management System")
+    app.setOrganizationName(APP_DEVELOPER)
 
     app.setFont(QFont("Segoe UI", 10))
 
@@ -297,42 +295,59 @@ def main():
             backup_db = None
             try:
                 from google_drive_backup import (
+                    backup_to_sync_folder,
                     is_drive_connected,
                     upload_encrypted_database_backup,
                 )
 
                 backup_db = LocalDatabase(db.database_path)
+                today = datetime.date.today().isoformat()
+
                 enabled = backup_db.get_setting(
                     "google_drive_auto_backup_enabled",
                     "0",
                 )
-                if str(enabled).casefold() not in ("1", "true", "yes"):
-                    return
-                if not is_drive_connected():
-                    return
-
-                today = datetime.date.today().isoformat()
-                if backup_db.get_setting(
-                    "google_drive_last_backup",
-                    "",
-                ) == today:
-                    return
-
-                result = upload_encrypted_database_backup(backup_db)
-                if not backup_db.set_setting(
-                    "google_drive_last_backup",
-                    today,
+                if (
+                    str(enabled).casefold() in ("1", "true", "yes")
+                    and is_drive_connected()
+                    and backup_db.get_setting("google_drive_last_backup", "") != today
                 ):
-                    raise RuntimeError(
-                        "The backup uploaded, but its completion date "
-                        "could not be saved."
-                    )
-                logging.info(
-                    "Uploaded encrypted Google Drive backup %s.",
-                    result.get("name", "library backup"),
+                    try:
+                        result = upload_encrypted_database_backup(backup_db)
+                        if not backup_db.set_setting("google_drive_last_backup", today):
+                            raise RuntimeError(
+                                "The backup uploaded, but its completion date could not be saved."
+                            )
+                        logging.info(
+                            "Uploaded encrypted Google Drive backup %s.",
+                            result.get("name", "library backup"),
+                        )
+                    except Exception:
+                        logging.exception("Automatic Google Drive backup failed.")
+
+                folder_enabled = backup_db.get_setting(
+                    "sync_auto_backup_enabled",
+                    "0",
                 )
+                sync_folder = (
+                    backup_db.get_setting("sync_backup_folder", "") or ""
+                ).strip()
+                if (
+                    str(folder_enabled).casefold() in ("1", "true", "yes")
+                    and sync_folder
+                    and backup_db.get_setting("sync_last_backup", "") != today
+                ):
+                    try:
+                        saved = backup_to_sync_folder(backup_db, sync_folder)
+                        backup_db.set_setting("sync_last_backup", today)
+                        logging.info(
+                            "Saved encrypted synced-folder backup %s.",
+                            saved.get("path", ""),
+                        )
+                    except Exception:
+                        logging.exception("Automatic synced-folder backup failed.")
             except Exception:
-                logging.exception("Automatic Google Drive backup failed.")
+                logging.exception("Automatic backup run failed.")
             finally:
                 if backup_db:
                     backup_db.close()

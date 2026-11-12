@@ -64,6 +64,23 @@ class LocalDatabase:
             self.conn.rollback()
             raise
 
+    def get_data_stamp(self):
+        """Return a lightweight revision token changing on data writes, external commits, or date changes."""
+        today = datetime.date.today().isoformat()
+        conn = getattr(self, "conn", None)
+        if conn is None:
+            return (None, None, today)
+        try:
+            total_changes = int(conn.total_changes)
+        except sqlite3.Error:
+            total_changes = None
+        try:
+            row = conn.execute("PRAGMA data_version").fetchone()
+            data_version = int(row[0]) if row else 0
+        except sqlite3.Error:
+            data_version = 0
+        return (total_changes, data_version, today)
+
     @staticmethod
     def _clean(value):
         return str(value).strip() if value is not None else ""
@@ -303,21 +320,33 @@ class LocalDatabase:
                 (name, "FACULTY", duration)
                 for name, duration in FACULTY_ADDITIONAL_DEPARTMENTS
             ]
-            cur.executemany(
-                """
-                INSERT INTO departments(name, category, duration_years)
-                VALUES (?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    category = excluded.category
-                """,
-                canonical_departments,
-            )
-            allowed_keys = tuple(name.lower() for name, _, _ in canonical_departments)
-            placeholders = ",".join("?" for _ in allowed_keys)
-            cur.execute(
-                f"DELETE FROM departments WHERE LOWER(name) NOT IN ({placeholders})",
-                allowed_keys,
-            )
+            expected_categories = {
+                name.lower(): category
+                for name, category, _ in canonical_departments
+            }
+            existing_depts = {
+                str(row[0]).lower(): row[1]
+                for row in cur.execute(
+                    "SELECT name, category FROM departments"
+                ).fetchall()
+            }
+            if existing_depts != expected_categories:
+                cur.executemany(
+                    """
+                    INSERT INTO departments(name, category, duration_years)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        category = excluded.category
+                    WHERE COALESCE(departments.category, '') != COALESCE(excluded.category, '')
+                    """,
+                    canonical_departments,
+                )
+                allowed_keys = tuple(expected_categories.keys())
+                placeholders = ",".join("?" for _ in allowed_keys)
+                cur.execute(
+                    f"DELETE FROM departments WHERE LOWER(name) NOT IN ({placeholders})",
+                    allowed_keys,
+                )
 
             if cur.execute("SELECT COUNT(*) FROM loan_policies").fetchone()[0] == 0:
                 cur.executemany("""

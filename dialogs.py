@@ -27,6 +27,7 @@ from PyQt6.QtGui import (
     QIntValidator, QColor
 )
 
+from app_version import APP_DEVELOPER_CREDIT, APP_NAME
 from utils import (
     clear_layout,
     format_log_id_display,
@@ -2727,16 +2728,16 @@ class LoginDialog(QDialog):
 
         configure_dialog(
             self,
-            "Library System Security",
-            390,
-            320,
+            f"{APP_NAME} — Administrator Login",
+            400,
+            360,
             min_width=320,
-            min_height=250,
+            min_height=280,
         )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
         layout.addWidget(
             create_heading("🔒 Administrator Login")
@@ -2776,6 +2777,17 @@ class LoginDialog(QDialog):
         self.btn_forgot_password.setDefault(False)
         self.btn_forgot_password.setAutoDefault(False)
         layout.addWidget(self.btn_forgot_password)
+
+        c = get_dialog_colors(self)
+        self.app_credit_label = QLabel(
+            f"{APP_NAME}\n{APP_DEVELOPER_CREDIT}"
+        )
+        self.app_credit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.app_credit_label.setWordWrap(True)
+        self.app_credit_label.setStyleSheet(
+            f"color: {c['muted']}; font-size: 11px;"
+        )
+        layout.addWidget(self.app_credit_label)
 
         self.input_admin_password.setFocus()
 
@@ -3092,16 +3104,16 @@ class CustomSplashScreen(QDialog):
 
         clamp_widget_to_screen(
             self,
-            440,
-            390,
+            450,
+            415,
             max_width_ratio=0.90,
             max_height_ratio=0.88,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setContentsMargins(30, 28, 30, 28)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(18)
+        layout.setSpacing(14)
 
         self.icon_label = QLabel()
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3125,13 +3137,25 @@ class CustomSplashScreen(QDialog):
 
         layout.addWidget(self.icon_label)
 
-        self.text_label = QLabel("Library Management System")
+        self.text_label = QLabel(APP_NAME)
         self.text_label.setFont(
             QFont("Segoe UI", 17, QFont.Weight.Bold)
         )
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.text_label.setWordWrap(True)
 
         layout.addWidget(self.text_label)
+
+        c = get_dialog_colors(self)
+        self.developer_label = QLabel(APP_DEVELOPER_CREDIT)
+        self.developer_label.setFont(
+            QFont("Segoe UI", 9, QFont.Weight.DemiBold)
+        )
+        self.developer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.developer_label.setWordWrap(True)
+        self.developer_label.setStyleSheet(f"color: {c['muted']};")
+
+        layout.addWidget(self.developer_label)
 
         self.sub_label = QLabel(
             "Loading database and application services..."

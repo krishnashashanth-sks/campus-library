@@ -125,22 +125,11 @@ jobs:
           [System.IO.File]::WriteAllText($notesFile, $body, [System.Text.UTF8Encoding]::new($false))
           "body_path=$notesFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Archive build artifacts in workflow run
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ steps.meta.outputs.tag }}
-          retention-days: 30
-          if-no-files-found: error
-          path: |
-            OutputInstaller/LibraryInstaller.exe
-            Library-Windows.zip
-            SHA256SUMS.txt
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          name: LibCore ${{ steps.meta.outputs.tag }}
+          name: Library Management System ${{ steps.meta.outputs.tag }}
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: true
           draft: ${{ steps.meta.outputs.draft == 'true' }}

@@ -28,7 +28,7 @@ requirements-services.txt          # Optional Gmail SMTP & Google Drive backup d
 Every push or pull request targeting `main` automatically:
 1. Bytecode-compiles all Python modules (`python -m compileall -q .`).
 2. Runs `tests/test_release_readiness.py` (validating versions, updater archive extraction rules, `BYPASS_LOGIN = False`, database initialization, and packaging assets).
-3. Builds `LibraryInstaller.exe`, `Library-Windows.zip`, and `SHA256SUMS.txt` on `windows-latest` and uploads a 7-day preview artifact.
+3. Builds `LibraryInstaller.exe`, `Library-Windows.zip`, and `SHA256SUMS.txt` on `windows-latest` and archives `SHA256SUMS.txt` (full binaries are published on GitHub Releases to avoid filling the 500 MB Actions artifact storage quota).
 
 ### 2. Publishing an Official Release (`.github/workflows/release.yml`)
 1. Update `APP_VERSION` in `app_version.py` (for example, `"2.0"` or `"2.1.0"`).
@@ -61,3 +61,10 @@ Run the same script used by CI:
 Optional flags:
 - `-Version 2.0` — Override the stamped installer and `library_version.txt` version.
 - `-SkipInstaller` — Build only the PyInstaller bundle and `Library-Windows.zip` when Inno Setup 6 is not installed locally.
+
+## Google Drive Backup Setup (Librarian-Friendly)
+
+To keep OAuth secrets out of the public repository while letting librarians connect Google Drive in one click:
+1. **Zero-Config Synced Folder Backup (Recommended for Most College PCs):** Install **Google Drive for Desktop** (or OneDrive) and choose that synced folder under **Settings → Backup & Security → Synced Folder Backup** — no `client.json` or Google Cloud project needed.
+2. **Pre-configured Direct Cloud OAuth (Optional IT/College Build):** Before running `.\scripts\build_windows.ps1` locally for internal college deployment, place your private Google OAuth Desktop App JSON at `assets/google_drive_client.json` (gitignored) or alongside the installed `Library.exe` (`google_drive_client.json`). The librarian simply clicks **Connect Google Drive** once to sign in — never touching any `.json` file.
+3. **One-Time Import in App:** A coordinator can also import or paste an OAuth Desktop JSON once in **Settings → Backup & Security → Connect Google Drive**; it is stored securely in Windows Credential Manager and never prompted again.

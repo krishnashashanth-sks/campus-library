@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
         self.anim_group = None
         self.nav_buttons = []
         self.page_views = []
+        self._page_loaded_stamps = {}
         self._workers_stopped = False
         self._last_email_status_message = "Email sync checking"
 
@@ -750,7 +751,7 @@ class MainWindow(QMainWindow):
             ("Ctrl+H", self.dashboard_view.open_activity_history),
             (
                 "F5",
-                lambda: self.refresh_page(self.pages.currentIndex())
+                lambda: self.refresh_page(self.pages.currentIndex(), force=True)
                 if hasattr(self, "pages")
                 else self.dashboard_view.refresh_dashboard(),
             ),
@@ -1305,7 +1306,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "pages"):
             idx = self.pages.currentIndex()
             if idx != 0:
-                self.refresh_page(idx)
+                self.refresh_page(idx, force=True)
 
     def _toggle_theme_from_header(self):
         if hasattr(self, "dashboard_view"):
@@ -1702,7 +1703,7 @@ class MainWindow(QMainWindow):
                     ("↩", "Return Book", "Open return dialog from any page", "Ctrl+R", "book", self._return_from_header),
                     ("⌁", "Quick Scan", "USB / camera instant issue, renew, or return", "Ctrl+Shift+K", "scan", self.dashboard_view.open_quick_scan),
                     ("▦", "Generate Barcode", "Generate printable book barcode", "Ctrl+G", "barcode", self.dashboard_view.open_bargenerate_form),
-                    ("↻", f"Refresh {short_page}", f"Reload {page_label} data", "F5", "history", lambda: self.refresh_page(self.pages.currentIndex())),
+                    ("↻", f"Refresh {short_page}", f"Reload {page_label} data", "F5", "history", lambda: self.refresh_page(self.pages.currentIndex(), force=True)),
                 ],
             ),
         ]
@@ -2123,6 +2124,13 @@ class MainWindow(QMainWindow):
         for page in self.page_views:
             self.pages.addWidget(page)
 
+        initial_stamp = self._page_refresh_stamp()
+        self._page_loaded_stamps = (
+            {idx: initial_stamp for idx in range(len(self.page_views))}
+            if initial_stamp is not None
+            else {}
+        )
+
         parent_layout.addWidget(
             self.pages,
             1
@@ -2161,7 +2169,31 @@ class MainWindow(QMainWindow):
     # PAGE REFRESH
     # ========================================================
 
-    def refresh_page(self, index):
+    def _current_data_stamp(self):
+        getter = getattr(self.db, "get_data_stamp", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return None
+        return None
+
+    def _active_theme_stamp(self):
+        manager = getattr(self, "theme_manager", None)
+        if manager is None:
+            return None
+        try:
+            return manager.get_active_theme()
+        except Exception:
+            return None
+
+    def _page_refresh_stamp(self):
+        data_stamp = self._current_data_stamp()
+        if data_stamp is None:
+            return None
+        return (data_stamp, self._active_theme_stamp())
+
+    def refresh_page(self, index, force=True):
 
         refresh_methods = {
             0: (
@@ -2203,6 +2235,12 @@ class MainWindow(QMainWindow):
         if index not in refresh_methods:
             return
 
+        current_stamp = self._page_refresh_stamp()
+        if not force and current_stamp is not None:
+            loaded_stamps = getattr(self, "_page_loaded_stamps", None)
+            if loaded_stamps is not None and loaded_stamps.get(index) == current_stamp:
+                return
+
         page, methods = refresh_methods[index]
 
         for method_name in methods:
@@ -2217,6 +2255,11 @@ class MainWindow(QMainWindow):
 
                 try:
                     method()
+                    updated_stamp = self._page_refresh_stamp()
+                    if updated_stamp is not None:
+                        if not hasattr(self, "_page_loaded_stamps"):
+                            self._page_loaded_stamps = {}
+                        self._page_loaded_stamps[index] = updated_stamp
 
                 except Exception as error:
 
@@ -2241,7 +2284,7 @@ class MainWindow(QMainWindow):
             index
         )
 
-        self.refresh_page(index)
+        self.refresh_page(index, force=False)
 
         for button, button_index in self.nav_buttons:
 

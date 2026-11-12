@@ -1,4 +1,4 @@
-; Inno Setup script for Campus Library Management System (LibCore)
+; Inno Setup script for Library Management System
 ; Override version from CLI/CI using:
 ;   ISCC.exe /DAppVersion=1.0 installer_scipt.iss
 
@@ -6,9 +6,10 @@
   #define AppVersion "1.0"
 #endif
 
-#define AppName "Library"
+#define AppName "Library Management System"
 #define AppExeName "Library.exe"
-#define AppPublisher "Campus Library"
+#define AppInstallFolder "Library"
+#define AppPublisher "Govt Polytechnic College Masab Tank Hyderabad Students"
 #define AppURL "https://github.com/krishnashashanth-sks/campus-library"
 
 [Setup]
@@ -18,11 +19,13 @@ AppName={#AppName}
 AppVerName={#AppName} v{#AppVersion}
 AppVersion={#AppVersion}
 VersionInfoVersion={#AppVersion}
+VersionInfoProductName={#AppName}
+VersionInfoCompany={#AppPublisher}
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}/issues
 AppUpdatesURL={#AppURL}/releases
-DefaultDirName={localappdata}\Programs\{#AppName}
+DefaultDirName={localappdata}\Programs\{#AppInstallFolder}
 DefaultGroupName={#AppName}
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#AppExeName}

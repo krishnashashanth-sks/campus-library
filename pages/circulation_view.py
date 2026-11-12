@@ -1631,6 +1631,15 @@ class CirculationView(QWidget):
             self.table.setRowCount(len(rows))
 
             c = self.colors or self._get_colors()
+            primary_color = QColor(c["primary"])
+            danger_color = QColor(c["danger"])
+            warning_color = QColor(c["warning"])
+            success_color = QColor(c["success"])
+            muted_color = QColor(c["muted"])
+            cyan_color = QColor(c["cyan"])
+            bold_font = QFont(self.table.font())
+            bold_font.setBold(True)
+            status_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
 
             for row_index, row in enumerate(rows):
                 (
@@ -1684,38 +1693,24 @@ class CirculationView(QWidget):
                             Qt.ItemDataRole.UserRole,
                             tuple(row)
                         )
-                        font = item.font()
-                        font.setBold(True)
-                        item.setFont(font)
-                        item.setForeground(QColor(c["primary"]))
+                        item.setFont(bold_font)
+                        item.setForeground(primary_color)
 
                     if column == 3:
-                        item.setFont(
-                            QFont("Segoe UI", 9, QFont.Weight.Bold)
-                        )
+                        item.setFont(status_font)
 
                         if display_status == "OVERDUE":
-                            item.setForeground(
-                                QColor(c["danger"])
-                            )
+                            item.setForeground(danger_color)
                         elif display_status == "DUE TODAY":
-                            item.setForeground(
-                                QColor(c["warning"])
-                            )
+                            item.setForeground(warning_color)
                         elif display_status == "ISSUED":
-                            item.setForeground(
-                                QColor(c["success"])
-                            )
+                            item.setForeground(success_color)
                         elif display_status == "RETURNED":
-                            item.setForeground(
-                                QColor(c["muted"])
-                            )
+                            item.setForeground(muted_color)
 
                     if column == 5 and renewal_count > 0:
-                        font = item.font()
-                        font.setBold(True)
-                        item.setFont(font)
-                        item.setForeground(QColor(c["cyan"]))
+                        item.setFont(bold_font)
+                        item.setForeground(cyan_color)
                         item.setToolTip(
                             f"Due Date: {self._date_text(due) or '—'}\n"
                             f"Renewals: {renewal_count}\n"
@@ -1723,17 +1718,15 @@ class CirculationView(QWidget):
                         )
 
                     if column == 7 and fine_value > 0:
-                        font = item.font()
-                        font.setBold(True)
-                        item.setFont(font)
+                        item.setFont(bold_font)
                         if settled:
-                            item.setForeground(QColor(c["success"]))
+                            item.setForeground(success_color)
                             item.setToolTip(
                                 f"Fine ₹{fine_value:.2f} marked {fine_action or 'PAID'}"
                                 + (f" on {settled_at}" if settled_at else "")
                             )
                         else:
-                            item.setForeground(QColor(c["warning"]))
+                            item.setForeground(warning_color)
 
                     self.table.setItem(
                         row_index, column, item

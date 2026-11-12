@@ -1242,7 +1242,7 @@ class ReportsView(QWidget):
         chart.setMargins(QMargins(10, 6, 10, 6))
 
         chart.setAnimationOptions(
-            QChart.AnimationOption.SeriesAnimations
+            QChart.AnimationOption.NoAnimation
         )
 
         chart.legend().setVisible(True)

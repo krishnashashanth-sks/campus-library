@@ -11,7 +11,7 @@ from PyQt6.QtCore import (
     Qt,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QCursor
+from PyQt6.QtGui import QColor, QCursor, QFont
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication,
@@ -1601,6 +1601,12 @@ class CatalogView(QWidget):
             self.table.setRowCount(len(rows))
 
             c = self._get_colors()
+            primary_color = QColor(c["primary"])
+            danger_color = QColor(c["danger"])
+            warning_color = QColor(c["warning"])
+            success_color = QColor(c["success"])
+            bold_font = QFont(self.table.font())
+            bold_font.setBold(True)
 
             for row_index, book in enumerate(rows):
 
@@ -1623,28 +1629,22 @@ class CatalogView(QWidget):
                         )
 
                     if col_idx == 0:
-                        font = item.font()
-                        font.setBold(True)
-                        item.setFont(font)
-                        item.setForeground(QColor(c["primary"]))
+                        item.setFont(bold_font)
+                        item.setForeground(primary_color)
 
                     if col_idx == 5:
 
                         if available <= 0:
-                            color = c["danger"]
+                            fg_color = danger_color
 
                         elif available <= 2:
-                            color = c["warning"]
+                            fg_color = warning_color
 
                         else:
-                            color = c["success"]
+                            fg_color = success_color
 
-                        font = item.font()
-                        font.setBold(True)
-                        item.setFont(font)
-                        item.setForeground(
-                            QColor(color)
-                        )
+                        item.setFont(bold_font)
+                        item.setForeground(fg_color)
 
                     self.table.setItem(
                         row_index,

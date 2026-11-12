@@ -1,6 +1,6 @@
 # Library Management System
 
-A comprehensive desktop application for managing campus library operations, including book catalog management, user administration, circulation tracking, and detailed reporting. Built with Python and PyQt6 for a native desktop experience.
+A comprehensive desktop application for managing library operations, including book catalog management, user administration, circulation tracking, and detailed reporting — **developed by Govt Polytechnic College Masab Tank Hyderabad Students**. Built with Python and PyQt6 for a native desktop experience.
 
 ## Features
 
@@ -154,20 +154,22 @@ Complaints are saved locally and notifications are added to the email queue
 for the configured library contact and, when available, the student. This is
 an in-app librarian workflow, not a public student portal.
 
-In **Settings → Encrypted Google Drive Backup**, connect with a Google OAuth
-**Desktop app** client JSON file from a Google Cloud project where the Drive
-API is enabled. The app uploads AES-GCM encrypted database copies. The OAuth
-token and backup key are stored in the signed-in Windows account's Credential
-Manager. Export the backup recovery key and keep it securely outside the
-computer; without it, backups cannot be recovered if that Windows profile is
-lost. Restore writes to a separate database file and does not overwrite the
-currently open database.
+In **Settings → Backup & Security → Cloud & Synced Folder Backup**, librarians can protect backups with AES-GCM encryption in two easy ways:
 
-Automatic daily uploads are optional and run while the application is open,
-after a successful Drive connection and when enabled in backup settings.
-Without saved Drive authorization, no automatic upload is attempted. Email
+- **Synced Folder Backup (Recommended — Zero `client.json` Needed):** Pick any local or cloud-synced folder (such as Google Drive for Desktop, OneDrive, a shared campus drive, or a USB drive) and save encrypted `.clbk` backups manually or automatically once per day.
+- **Direct Google Drive OAuth Backup (One-Time Setup):** Click **Connect Google Drive** once to import/paste a Google OAuth **Desktop app** client JSON (or let IT pre-place `google_drive_client.json` next to `Library.exe` / inside `assets/`). Both the OAuth client config and signed-in refresh token are stored in Windows Credential Manager so librarians never need to re-upload `client.json`.
+
+The backup encryption key is stored in the signed-in Windows account's
+Credential Manager. Export the backup recovery key and keep it securely outside
+the computer; without it, backups cannot be recovered if that Windows profile
+is lost. Restore supports both Google Drive cloud backups and local/synced
+`.clbk` files, always writing to a separate database file without overwriting
+the currently open database.
+
+Automatic daily backups are optional and run while the application is open for
+Google Drive (when connected) and/or any configured synced folder. Email
 messages created while offline remain queued locally until connectivity is
-available; Google Drive backups still require an internet connection.
+available; direct Google Drive uploads still require an internet connection.
 
 ## Building a Windows EXE and Installer (PyInstaller + Inno Setup)
 
@@ -192,106 +194,99 @@ pyinstaller main.spec
 - If you need to generate a `.spec` automatically, you can run a PyInstaller command and then tweak the generated spec:
 
 ```bash
-# One-file, windowed (no console), with icon and assets folder included
-pyinstaller --name "LibCore" --onefile --windowed --icon=assets/library_icon.ico \
-  --add-data "assets;assets" main.py
+# One-folder build via the provided PyInstaller specification
+pyinstaller --noconfirm --clean main.spec
 ```
 
-Notes about the spec file (main.spec)
-- A spec file controls how PyInstaller bundles your app (one-file vs one-folder, data files, binaries, hiddenimports, etc.).
-- If your app uses dynamic imports or Qt plugins, ensure `hiddenimports` and `datas` include those files.
-- Example minimal adjustments you may need in main.spec:
+Notes about the spec file (`main.spec`)
+- `main.spec` builds the one-folder bundle into `dist\main\` with `Library.exe` and bundled `assets` and `barcode` fonts.
+- If your app uses additional dynamic imports or plugins, update `hiddenimports` and `datas` in `main.spec`.
+- Key sections in `main.spec`:
 
 ```python
 # main.spec (snippet)
 # -*- mode: python ; coding: utf-8 -*-
 
-block_cipher = None
+from PyInstaller.utils.hooks import collect_data_files
 
-a = Analysis([
-    'main.py',
-],
-    pathex=['.'],
+datas = [('assets', 'assets')]
+datas += collect_data_files('barcode')
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
     binaries=[],
-    datas=[('assets', 'assets')],
+    datas=datas,
     hiddenimports=[],
-    hookspath=[],
-    runtime_hooks=[],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
+    ...
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-exe = EXE(pyz,
+pyz = PYZ(a.pure)
+exe = EXE(
+    pyz,
     a.scripts,
+    [],
     exclude_binaries=True,
-    name='LibCore',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
+    name='Library',
     console=False,
     icon='assets/library_icon.ico',
 )
-
-coll = COLLECT( ... )  # for one-folder builds
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    name='main',
+)
 ```
 
-- After running `pyinstaller main.spec`, look in the `dist/` directory. For a one-file build you'll have `dist/LibCore.exe`. For a one-folder build you'll have `dist/LibCore/` containing the executable and supporting files.
+- After running `pyinstaller --noconfirm --clean main.spec`, `dist\main\` contains `Library.exe` and its supporting runtime files.
 
-2) Create an Inno Setup installer (.iss)
+2) Create an Inno Setup installer (`.iss`)
 
-- Create an installer script (e.g., `installer.iss`) that references the produced EXE (or the one-folder `dist` directory).
-- Example `.iss` for a one-file EXE:
+- The repository includes `installer_scipt.iss` configured for the one-folder build in `dist\main\`:
 
 ```ini
-; installer.iss
+; installer_scipt.iss (excerpt)
+#define AppName "Library Management System"
+#define AppExeName "Library.exe"
+#define AppInstallFolder "Library"
+#define AppPublisher "Govt Polytechnic College Masab Tank Hyderabad Students"
+
 [Setup]
-AppName=LibCore - Campus Library
-AppVersion=1.0
-DefaultDirName={pf}\LibCore
-DefaultGroupName=LibCore
-OutputBaseFilename=LibCore_Installer
-Compression=lzma
+AppName={#AppName}
+AppVersion={#AppVersion}
+AppPublisher={#AppPublisher}
+DefaultDirName={localappdata}\Programs\{#AppInstallFolder}
+DefaultGroupName={#AppName}
+OutputDir=OutputInstaller
+OutputBaseFilename=LibraryInstaller
+Compression=lzma2/max
 SolidCompression=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; For one-file build
-Source: "dist\LibCore.exe"; DestDir: "{app}"; Flags: ignoreversion
-; If you have additional files (README, LICENSE), add them too:
-Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\main\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\LibCore"; Filename: "{app}\LibCore.exe"
-
-[Tasks]
-Name: "desktopicon"; Description: "Create a &desktop icon"; GroupDescription: "Additional icons:"; Flags: unchecked
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\assets\library_icon.ico"
+Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\assets\library_icon.ico"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\LibCore.exe"; Description: "Launch LibCore"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 ```
 
-- Example `.iss` adjustments for a one-folder build (use Source: "dist\LibCore\*"; Flags: recursesubdirs createallsubdirs)
+3) Compile the Inno Setup script (or use `.\scripts\build_windows.ps1`)
 
-```ini
-[Files]
-Source: "dist\LibCore\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
-```
-
-3) Compile the Inno Setup script
-
-- Open `installer.iss` in Inno Setup Compiler and press Compile, or use the command-line compiler:
+- Open `installer_scipt.iss` in Inno Setup Compiler and press Compile, run `.\scripts\build_windows.ps1`, or run the command-line compiler:
 
 ```powershell
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" path\to\installer.iss
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0 installer_scipt.iss
 ```
 
-- The resulting installer (e.g., `LibCore_Installer.exe`) will be created in the same folder as the .iss or the configured OutputDir.
+- The resulting installer (`OutputInstaller\LibraryInstaller.exe`) will be created in the `OutputInstaller` folder.
 
 4) Test the installer
 
@@ -535,9 +530,9 @@ The application includes comprehensive error handling with user-friendly message
 - Reservation system
 - eBook integration
 
-## License
+## License & Credits
 
-This project is developed for campus library management purposes.
+Developed by **Govt Polytechnic College Masab Tank Hyderabad Students** for library management purposes.
 
 ## Support
 
@@ -545,4 +540,4 @@ For issues or questions about the application, please check the troubleshooting 
 
 ---
 
-**LibCore v1.0** - Streamlining Campus Library Operations
+**Library Management System v1.0** — Developed by Govt Polytechnic College Masab Tank Hyderabad Students

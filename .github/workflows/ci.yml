@@ -54,13 +54,10 @@ jobs:
         shell: pwsh
         run: .\scripts\build_windows.ps1
 
-      - name: Upload preview build artifacts
+      - name: Upload preview build checksums
         uses: actions/upload-artifact@v4
         with:
-          name: windows-preview-installer
-          retention-days: 7
+          name: windows-preview-checksums
+          retention-days: 1
           if-no-files-found: error
-          path: |
-            OutputInstaller/LibraryInstaller.exe
-            Library-Windows.zip
-            SHA256SUMS.txt
+          path: SHA256SUMS.txt
