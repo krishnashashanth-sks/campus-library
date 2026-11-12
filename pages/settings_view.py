@@ -7,14 +7,15 @@ from pathlib import Path
 
 from PyQt6 import sip
 from PyQt6.QtCore import Qt, QSignalBlocker, QThreadPool, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QColor, QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QLabel, QHBoxLayout, QVBoxLayout,
     QLineEdit, QCheckBox, QPushButton, QFileDialog,
     QMessageBox, QDoubleSpinBox, QSpinBox, QComboBox,
     QScrollArea, QFrame, QInputDialog, QApplication,
     QGridLayout, QSizePolicy, QProgressBar, QTabWidget,
-    QPlainTextEdit
+    QPlainTextEdit, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView,
 )
 from ui_responsive import (
     FlowLayout,
@@ -25,8 +26,11 @@ from ui_responsive import (
 from utils import rgba_color
 
 from dialogs import (
+    ComplaintManagementDialog,
     DepartmentManagerDialog,
+    EditDepartmentDialog,
     EmailQueueManagementDialog,
+    ReassignDepartmentDialog,
     RecoveryCodeSetupDialog,
     VersionManagerDialog,
     markdown_to_plain_text,
@@ -157,6 +161,7 @@ class _GoogleDriveSetupDialog(QDialog):
 
 
 class SettingsView(QWidget):
+    departments_updated = pyqtSignal()
 
     DEFAULTS = {
         "daily_fine": 10.00,
@@ -197,6 +202,8 @@ class SettingsView(QWidget):
         self._settings_stacked = None
         self._action_bar_stacked = None
         self._password_rows = []
+        self._dept_rows = []
+        self._theme_colors = {}
 
         self.setObjectName("SettingsView")
 
@@ -320,6 +327,7 @@ class SettingsView(QWidget):
             colors.update(tm_colors)
 
         c = colors
+        self._theme_colors = dict(c)
         self.setStyleSheet(f"""
             QWidget#SettingsView {{
                 background-color: {c["window"]};
@@ -655,7 +663,76 @@ class SettingsView(QWidget):
                 color: #FFFFFF;
                 border-color: {c["primary"]};
             }}
+
+            QFrame#WarningFrame {{
+                background-color: {c["warning_soft"]};
+                border: 1px solid {rgba_color(c["warning"], 0.45)};
+                border-left: 4px solid {c["warning"]};
+                border-radius: 9px;
+            }}
+
+            QFrame#WarningFrame QLabel {{
+                color: {c["text"]};
+                font-size: 11px;
+                font-weight: 600;
+            }}
+
+            QLabel#DeptSummaryBadge {{
+                background-color: {c["primary_soft"]};
+                color: {c["primary"]};
+                border: 1px solid {rgba_color(c["primary"], 0.45)};
+                border-radius: 8px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+
+            QTableWidget#SettingsDeptTable {{
+                background-color: {c["input"]};
+                alternate-background-color: {c["surface_alt"]};
+                color: {c["text"]};
+                border: 1.5px solid {c["border"]};
+                border-radius: 8px;
+                gridline-color: {c["border"]};
+                selection-background-color: {c["selection"]};
+                selection-color: #FFFFFF;
+                outline: none;
+            }}
+
+            QTableWidget#SettingsDeptTable::item {{
+                padding: 4px 8px;
+                border-bottom: 1px solid {c["border"]};
+            }}
+
+            QTableWidget#SettingsDeptTable::item:selected {{
+                background-color: {c["selection"]};
+                color: #FFFFFF;
+            }}
+
+            QTableWidget#SettingsDeptTable QHeaderView::section {{
+                background-color: {c["surface_alt"]};
+                color: {c["text"]};
+                border: none;
+                border-bottom: 1.5px solid {c["border_bright"]};
+                border-right: 1px solid {c["border"]};
+                padding: 6px 8px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+
+            QTableWidget#SettingsDeptTable QHeaderView::section:last {{
+                border-right: none;
+            }}
+
+            QTableWidget#SettingsDeptTable QTableCornerButton::section {{
+                background-color: {c["surface_alt"]};
+                border: none;
+                border-bottom: 1.5px solid {c["border_bright"]};
+            }}
         """)
+
+        if hasattr(self, "dept_table"):
+            self.refresh_department_table()
 
     def apply_selected_theme(self, theme_name):
         manager = self._theme_manager or self.get_theme_manager()
@@ -1009,9 +1086,9 @@ class SettingsView(QWidget):
 
     def build_department_section(self):
         header = self.create_section_header(
-            "Academic Departments",
-            "Manage the academic branches and departments "
-            "available in your institution.",
+            "Academic Departments & Branches",
+            "Add new branches or faculty departments, update names, short codes, "
+            "or course durations, reassign members, or safely remove unused entries.",
             accent_role="primary",
         )
         self.content_layout.addWidget(header)
@@ -1021,22 +1098,140 @@ class SettingsView(QWidget):
         layout.setContentsMargins(14, 11, 14, 11)
         layout.setSpacing(9)
 
-        layout.addWidget(
-            self.create_info_frame(
-                "View fixed college branches and faculty departments, "
-                "and adjust course durations for student branches."
-            )
+        self.dept_summary_badge = QLabel("0 Student Branches · 0 Faculty / Staff Depts · 0 Members")
+        self.dept_summary_badge.setObjectName("DeptSummaryBadge")
+        configure_wrapped_label(self.dept_summary_badge)
+        layout.addWidget(self.dept_summary_badge)
+
+        self.dept_hint_label = QLabel(
+            "Double-click any row to edit details. Changes update user forms, CSV/XLSX imports, and course durations immediately."
         )
+        self.dept_hint_label.setObjectName("MutedLabel")
+        configure_wrapped_label(self.dept_hint_label)
+        layout.addWidget(self.dept_hint_label)
+
+        self.dept_unlisted_frame = QFrame()
+        self.dept_unlisted_frame.setObjectName("WarningFrame")
+        self.dept_unlisted_frame.setMinimumWidth(0)
+        unlisted_layout = QHBoxLayout(self.dept_unlisted_frame)
+        unlisted_layout.setContentsMargins(12, 7, 12, 7)
+        self.dept_unlisted_label = QLabel()
+        configure_wrapped_label(self.dept_unlisted_label)
+        unlisted_layout.addWidget(self.dept_unlisted_label, 1)
+        self.dept_unlisted_frame.hide()
+        layout.addWidget(self.dept_unlisted_frame)
+
+        filter_row = QWidget()
+        filter_row.setMinimumWidth(0)
+        filter_grid = QGridLayout(filter_row)
+        filter_grid.setContentsMargins(0, 0, 0, 0)
+        filter_grid.setHorizontalSpacing(8)
+        filter_grid.setVerticalSpacing(6)
+
+        self.dept_search_input = QLineEdit()
+        self.dept_search_input.setMinimumWidth(0)
+        self.dept_search_input.setMinimumHeight(32)
+        self.dept_search_input.setClearButtonEnabled(True)
+        self.dept_search_input.setPlaceholderText("Filter by branch name or short code...")
+        self.dept_search_input.textChanged.connect(self._render_department_rows)
+
+        self.dept_scope_combo = QComboBox()
+        self.dept_scope_combo.setMinimumWidth(0)
+        self.dept_scope_combo.setMinimumHeight(32)
+        self.dept_scope_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.dept_scope_combo.setMinimumContentsLength(14)
+        self.dept_scope_combo.addItem("All Scopes", "ALL")
+        self.dept_scope_combo.addItem("Students & Faculty", "STUDENT")
+        self.dept_scope_combo.addItem("Faculty & Staff Only", "FACULTY")
+        self.dept_scope_combo.currentIndexChanged.connect(self._render_department_rows)
+
+        filter_grid.addWidget(self.dept_search_input, 0, 0)
+        filter_grid.addWidget(self.dept_scope_combo, 0, 1)
+        filter_grid.setColumnStretch(0, 1)
+        layout.addWidget(filter_row)
+
+        self.dept_table = QTableWidget()
+        self.dept_table.setObjectName("SettingsDeptTable")
+        self.dept_table.setMinimumWidth(0)
+        self.dept_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.dept_table.setFixedHeight(230)
+        self.dept_table.setColumnCount(5)
+        self.dept_table.setHorizontalHeaderLabels([
+            "Code",
+            "Branch / Department",
+            "Available To",
+            "Duration",
+            "Members",
+        ])
+        self.dept_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.dept_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.dept_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.dept_table.setAlternatingRowColors(True)
+        self.dept_table.setWordWrap(False)
+        self.dept_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.dept_table.verticalHeader().setVisible(False)
+        self.dept_table.verticalHeader().setDefaultSectionSize(30)
+        self.dept_table.setShowGrid(False)
+        self.dept_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        dept_header = self.dept_table.horizontalHeader()
+        dept_header.setMinimumSectionSize(44)
+        dept_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        dept_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        dept_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        dept_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        dept_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        dept_header.setStretchLastSection(False)
+
+        self.dept_table.itemSelectionChanged.connect(self._update_dept_action_states)
+        self.dept_table.doubleClicked.connect(lambda _idx: self.edit_selected_department())
+        layout.addWidget(self.dept_table)
+
+        self.dept_actions_host = QWidget()
+        self.dept_actions_host.setMinimumWidth(0)
+        dept_actions_flow = FlowLayout(
+            self.dept_actions_host,
+            margin=0,
+            h_spacing=8,
+            v_spacing=8,
+        )
+
+        self.btn_add_dept = self.create_button(
+            "+ Add Branch / Dept",
+            "SuccessButton",
+        )
+        self.btn_add_dept.clicked.connect(self.add_department_from_settings)
+
+        self.btn_edit_dept = self.create_button(
+            "Update Selected",
+            "PrimaryButton",
+        )
+        self.btn_edit_dept.clicked.connect(self.edit_selected_department)
+
+        self.btn_delete_dept = self.create_button(
+            "Delete Selected",
+            "DangerButton",
+        )
+        self.btn_delete_dept.clicked.connect(self.delete_selected_department)
 
         self.btn_manage_depts = self.create_button(
-            "View Branches && Departments",
-            "PrimaryButton"
+            "Manage All && Reassign...",
+            "SecondaryButton",
         )
-        self.btn_manage_depts.clicked.connect(
-            self.open_department_manager
-        )
+        self.btn_manage_depts.clicked.connect(self.open_department_manager)
 
-        layout.addWidget(self.btn_manage_depts)
+        dept_actions_flow.addWidget(self.btn_add_dept)
+        dept_actions_flow.addWidget(self.btn_edit_dept)
+        dept_actions_flow.addWidget(self.btn_delete_dept)
+        dept_actions_flow.addWidget(self.btn_manage_depts)
+        layout.addWidget(self.dept_actions_host)
+
+        self._update_dept_action_states()
         self.content_layout.addWidget(card)
 
     # =========================================================
@@ -1443,6 +1638,46 @@ class SettingsView(QWidget):
                 "Send one reminder on the due date and one when a loan becomes overdue"
             )
         )
+        self.email_import_complaints_row, self.email_import_complaints_checkbox = (
+            self.create_wrapped_checkbox(
+                "Automatically fetch student complaints from Gmail inbox (IMAP)",
+                tooltip=(
+                    "Uses the configured Gmail sender and App Password over encrypted IMAP "
+                    "(imap.gmail.com:993) to import student complaints into Complaint Inbox."
+                ),
+            )
+        )
+        self.email_complaint_auto_reply_row, self.email_complaint_auto_reply_checkbox = (
+            self.create_wrapped_checkbox(
+                "Queue automatic confirmation receipt when an emailed complaint is imported",
+                tooltip=(
+                    "Queues a confirmation email with the reference number back to the student "
+                    "(delivered when queued email sending is enabled)."
+                ),
+            )
+        )
+        self.email_complaint_filter_label = self.create_field_label(
+            "Gmail complaint filter"
+        )
+        self.email_complaint_filter_combo = QComboBox()
+        self.email_complaint_filter_combo.setMinimumWidth(0)
+        self.email_complaint_filter_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.email_complaint_filter_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.email_complaint_filter_combo.setMinimumContentsLength(16)
+        self.email_complaint_filter_combo.addItem(
+            "Smart filter: registered members, Roll Nos, or complaint keywords (Recommended)",
+            "keywords",
+        )
+        self.email_complaint_filter_combo.addItem(
+            "Import all non-automated inbox emails",
+            "all",
+        )
+
         self.email_form_layout.addWidget(
             self.email_delivery_row,
             5,
@@ -1453,6 +1688,34 @@ class SettingsView(QWidget):
         self.email_form_layout.addWidget(
             self.email_reminders_row,
             6,
+            0,
+            1,
+            2,
+        )
+        self.email_form_layout.addWidget(
+            self.email_import_complaints_row,
+            7,
+            0,
+            1,
+            2,
+        )
+        self.email_form_layout.addWidget(
+            self.email_complaint_auto_reply_row,
+            8,
+            0,
+            1,
+            2,
+        )
+        self.email_form_layout.addWidget(
+            self.email_complaint_filter_label,
+            9,
+            0,
+            1,
+            2,
+        )
+        self.email_form_layout.addWidget(
+            self.email_complaint_filter_combo,
+            10,
             0,
             1,
             2,
@@ -1470,12 +1733,25 @@ class SettingsView(QWidget):
         self.email_queue_btns = QWidget()
         self.email_queue_btns.setMinimumWidth(0)
         queue_btns_flow = FlowLayout(self.email_queue_btns, margin=0, h_spacing=8, v_spacing=8)
+        self.open_complaints_settings_btn = self.create_button(
+            "Open Complaint Inbox",
+            "InfoButton",
+        )
+        self.open_complaints_settings_btn.clicked.connect(
+            self.open_complaint_inbox_from_settings
+        )
         self.sync_email_btn = self.create_button(
             "Sync Now",
             "PrimaryButton",
         )
         self.sync_email_btn.setEnabled(
             self.email_delivery_checkbox.isChecked()
+            or self.email_import_complaints_checkbox.isChecked()
+        )
+        self.email_import_complaints_checkbox.toggled.connect(
+            lambda checked: self.sync_email_btn.setEnabled(
+                bool(checked or self.email_delivery_checkbox.isChecked())
+            )
         )
         self.sync_email_btn.clicked.connect(self.sync_email_queue)
         self.manage_email_queue_btn = self.create_button(
@@ -1485,12 +1761,13 @@ class SettingsView(QWidget):
         self.manage_email_queue_btn.clicked.connect(
             self.manage_email_queue
         )
+        queue_btns_flow.addWidget(self.open_complaints_settings_btn)
         queue_btns_flow.addWidget(self.manage_email_queue_btn)
         queue_btns_flow.addWidget(self.sync_email_btn)
         self.email_queue_layout.addWidget(self.email_queue_status, 0, 0)
-        self.email_queue_layout.addWidget(self.email_queue_btns, 0, 1)
+        self.email_queue_layout.addWidget(self.email_queue_btns, 1, 0)
         self.email_queue_layout.setColumnStretch(0, 1)
-        self.email_form_layout.addWidget(self.email_queue_row, 7, 0, 1, 2)
+        self.email_form_layout.addWidget(self.email_queue_row, 11, 0, 1, 2)
         self.email_form_layout.setColumnStretch(0, 1)
         self.email_form_layout.setColumnStretch(1, 1)
 
@@ -1519,6 +1796,12 @@ class SettingsView(QWidget):
 
     def manage_email_queue(self):
         dialog = EmailQueueManagementDialog(self.db, self)
+        dialog.exec()
+        if self._email_sync_manager:
+            self._email_sync_manager.refresh_status()
+
+    def open_complaint_inbox_from_settings(self):
+        dialog = ComplaintManagementDialog(self.db, self)
         dialog.exec()
         if self._email_sync_manager:
             self._email_sync_manager.refresh_status()
@@ -2043,6 +2326,9 @@ class SettingsView(QWidget):
                     sender,
                 )
 
+            filter_mode = str(
+                self.email_complaint_filter_combo.currentData() or "keywords"
+            )
             for key, value in (
                 ("email_sender", sender),
                 ("library_contact_email", library_contact),
@@ -2050,6 +2336,15 @@ class SettingsView(QWidget):
                     "due_email_reminders_enabled",
                     "1" if self.email_reminders_checkbox.isChecked() else "0",
                 ),
+                (
+                    "email_complaint_import_enabled",
+                    "1" if self.email_import_complaints_checkbox.isChecked() else "0",
+                ),
+                (
+                    "email_complaint_auto_reply",
+                    "1" if self.email_complaint_auto_reply_checkbox.isChecked() else "0",
+                ),
+                ("email_complaint_filter_mode", filter_mode),
             ):
                 if not self.db.set_setting(key, value):
                     raise RuntimeError(f"Unable to save {key}.")
@@ -2119,7 +2414,9 @@ class SettingsView(QWidget):
                 raise RuntimeError(
                     "Unable to save the email delivery setting."
                 )
-            self.sync_email_btn.setEnabled(enabled)
+            self.sync_email_btn.setEnabled(
+                bool(enabled or self.email_import_complaints_checkbox.isChecked())
+            )
             if self._email_sync_manager:
                 self._email_sync_manager.sync_now()
         except Exception as error:
@@ -2135,7 +2432,9 @@ class SettingsView(QWidget):
         self.email_delivery_checkbox.setChecked(enabled)
         self.email_delivery_checkbox.blockSignals(False)
         if hasattr(self, "sync_email_btn"):
-            self.sync_email_btn.setEnabled(enabled)
+            self.sync_email_btn.setEnabled(
+                bool(enabled or self.email_import_complaints_checkbox.isChecked())
+            )
 
     def send_test_email(self):
         if self._closing:
@@ -2786,10 +3085,311 @@ class SettingsView(QWidget):
     # DEPARTMENT MANAGER
     # =========================================================
 
+    def _selected_dept_record(self):
+        if not hasattr(self, "dept_table"):
+            return None
+        row_idx = self.dept_table.currentRow()
+        if row_idx < 0:
+            return None
+        item = self.dept_table.item(row_idx, 1)
+        dept_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if dept_id is None:
+            return None
+        for rec in self._dept_rows:
+            if rec.get("id") == dept_id:
+                return rec
+        return None
+
+    def _update_dept_action_states(self):
+        has_selection = self._selected_dept_record() is not None
+        if hasattr(self, "btn_edit_dept"):
+            self.btn_edit_dept.setEnabled(has_selection)
+        if hasattr(self, "btn_delete_dept"):
+            self.btn_delete_dept.setEnabled(has_selection)
+
+    def refresh_department_table(self, select_id=None):
+        if not hasattr(self, "dept_table"):
+            return
+        if select_id is None:
+            prev = self._selected_dept_record()
+            if prev is not None:
+                select_id = prev.get("id")
+
+        try:
+            if hasattr(self.db, "get_departments_detailed"):
+                self._dept_rows = self.db.get_departments_detailed()
+            else:
+                self._dept_rows = []
+        except Exception:
+            self._dept_rows = []
+
+        unlisted = []
+        if hasattr(self.db, "get_unlisted_user_departments"):
+            try:
+                unlisted = self.db.get_unlisted_user_departments()
+            except Exception:
+                unlisted = []
+
+        if unlisted and hasattr(self, "dept_unlisted_frame"):
+            sample = ", ".join(f"{u['name']} ({u['user_count']})" for u in unlisted[:3])
+            more = f" +{len(unlisted) - 3} more" if len(unlisted) > 3 else ""
+            self.dept_unlisted_label.setText(
+                f"Member records currently reference unlisted department(s): {sample}{more}. "
+                "Add matching branches/departments here or open Manage All & Reassign to align them."
+            )
+            self.dept_unlisted_frame.show()
+        elif hasattr(self, "dept_unlisted_frame"):
+            self.dept_unlisted_frame.hide()
+
+        student_cnt = sum(1 for r in self._dept_rows if r.get("category") == "STUDENT")
+        faculty_cnt = sum(1 for r in self._dept_rows if r.get("category") != "STUDENT")
+        member_cnt = sum(int(r.get("user_count") or 0) for r in self._dept_rows)
+        if hasattr(self, "dept_summary_badge"):
+            self.dept_summary_badge.setText(
+                f"{student_cnt} Student Branches · {faculty_cnt} Faculty / Staff Depts · {member_cnt} Members"
+            )
+
+        self._render_department_rows(select_id=select_id)
+
+    def _render_department_rows(self, *_args, select_id=None):
+        if not hasattr(self, "dept_table"):
+            return
+        if select_id is None:
+            prev = self._selected_dept_record()
+            if prev is not None:
+                select_id = prev.get("id")
+
+        query = (
+            self.dept_search_input.text().strip().casefold()
+            if hasattr(self, "dept_search_input")
+            else ""
+        )
+        scope = (
+            str(self.dept_scope_combo.currentData() or "ALL").upper()
+            if hasattr(self, "dept_scope_combo")
+            else "ALL"
+        )
+
+        filtered = []
+        for rec in self._dept_rows:
+            if scope != "ALL" and rec.get("category") != scope:
+                continue
+            if query:
+                hay = f"{rec.get('name', '')} {rec.get('branch_code', '')}".casefold()
+                if query not in hay:
+                    continue
+            filtered.append(rec)
+
+        c = self._theme_colors or {}
+        primary_c = QColor(c.get("primary", "#3B82F6"))
+        muted_c = QColor(c.get("muted", "#9BB0CE"))
+        success_c = QColor(c.get("success", "#10B981"))
+        purple_c = QColor(c.get("purple", "#A78BFA"))
+        cyan_c = QColor(c.get("cyan", "#22D3EE"))
+        text_c = QColor(c.get("text", "#F8FAFC"))
+
+        blocker = QSignalBlocker(self.dept_table)
+        self.dept_table.setRowCount(len(filtered))
+        selected_row = -1
+
+        for row_idx, rec in enumerate(filtered):
+            dept_id = rec.get("id")
+            raw_cat = rec.get("category", "STUDENT")
+            code = rec.get("branch_code") or ""
+
+            code_item = QTableWidgetItem(code or "—")
+            code_item.setForeground(primary_c if code else muted_c)
+            f_code = code_item.font()
+            f_code.setBold(bool(code))
+            code_item.setFont(f_code)
+
+            name_item = QTableWidgetItem(str(rec.get("name") or ""))
+            name_item.setData(Qt.ItemDataRole.UserRole, dept_id)
+            f_name = name_item.font()
+            f_name.setBold(True)
+            name_item.setFont(f_name)
+
+            scope_label = (
+                "Students & Faculty" if raw_cat == "STUDENT" else "Faculty Only"
+            )
+            scope_item = QTableWidgetItem(scope_label)
+            scope_item.setForeground(success_c if raw_cat == "STUDENT" else purple_c)
+            f_scope = scope_item.font()
+            f_scope.setBold(True)
+            scope_item.setFont(f_scope)
+
+            dur = int(rec.get("duration_years") or 3)
+            dur_text = (
+                ("1 Year" if dur == 1 else f"{dur} Years")
+                if raw_cat == "STUDENT"
+                else "N/A"
+            )
+            dur_item = QTableWidgetItem(dur_text)
+            dur_item.setForeground(cyan_c if raw_cat == "STUDENT" else muted_c)
+
+            members = int(rec.get("user_count") or 0)
+            members_item = QTableWidgetItem(str(members))
+            members_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            members_item.setForeground(text_c if members > 0 else muted_c)
+
+            self.dept_table.setItem(row_idx, 0, code_item)
+            self.dept_table.setItem(row_idx, 1, name_item)
+            self.dept_table.setItem(row_idx, 2, scope_item)
+            self.dept_table.setItem(row_idx, 3, dur_item)
+            self.dept_table.setItem(row_idx, 4, members_item)
+
+            if select_id is not None and dept_id == select_id:
+                selected_row = row_idx
+
+        del blocker
+        if selected_row >= 0:
+            self.dept_table.selectRow(selected_row)
+        self._update_dept_action_states()
+
+    def _on_departments_changed_externally(self):
+        self.refresh_department_table()
+        self.departments_updated.emit()
+
+    def add_department_from_settings(self):
+        dialog = EditDepartmentDialog(
+            name="",
+            category="STUDENT",
+            duration=3,
+            parent=self,
+            branch_code="",
+            mode="add",
+            user_count=0,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_name, new_category, new_duration, new_code = dialog.get_full_data()
+        success, message = self.db.add_department(
+            new_name,
+            new_category,
+            new_duration,
+            branch_code=new_code,
+        )
+        if success:
+            self.refresh_department_table()
+            for rec in self._dept_rows:
+                if rec.get("name", "").casefold() == new_name.casefold():
+                    self._render_department_rows(select_id=rec.get("id"))
+                    break
+            self.departments_updated.emit()
+            QMessageBox.information(self, "Branch / Department Added", message)
+        else:
+            QMessageBox.warning(self, "Add Failed", message)
+
+    def edit_selected_department(self):
+        rec = self._selected_dept_record()
+        if rec is None:
+            QMessageBox.information(
+                self,
+                "Selection Required",
+                "Select a branch or department row first to update it.",
+            )
+            return
+
+        dialog = EditDepartmentDialog(
+            rec["name"],
+            rec["category"],
+            rec["duration_years"],
+            self,
+            branch_code=rec.get("branch_code") or "",
+            mode="edit",
+            user_count=rec.get("user_count") or 0,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_name, new_category, new_duration, new_code = dialog.get_full_data()
+        success, message = self.db.update_department(
+            rec["id"],
+            new_name,
+            new_category,
+            new_duration,
+            branch_code=new_code,
+        )
+        if success:
+            self.refresh_department_table(select_id=rec["id"])
+            self.departments_updated.emit()
+            QMessageBox.information(self, "Branch / Department Updated", message)
+        else:
+            QMessageBox.warning(self, "Update Failed", message)
+
+    def delete_selected_department(self):
+        rec = self._selected_dept_record()
+        if rec is None:
+            QMessageBox.information(
+                self,
+                "Selection Required",
+                "Select a branch or department row first to delete it.",
+            )
+            return
+
+        user_count = int(rec.get("user_count") or 0)
+        student_count = int(rec.get("student_count") or 0)
+        reassign_to = None
+
+        if user_count > 0:
+            targets = [
+                r["name"]
+                for r in self._dept_rows
+                if r["id"] != rec["id"]
+                and (student_count == 0 or r["category"] == "STUDENT")
+            ]
+            if not targets:
+                QMessageBox.warning(
+                    self,
+                    "Cannot Delete Branch",
+                    f"'{rec['name']}' still has {user_count} assigned member(s) "
+                    "and no other compatible branch exists.",
+                )
+                return
+            dlg = ReassignDepartmentDialog(
+                rec["name"],
+                targets,
+                user_count,
+                student_count=student_count,
+                title=f"Reassign & Delete '{rec['name']}'",
+                confirm_text="Reassign & Delete",
+                parent=self,
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            reassign_to = dlg.selected_target()
+        else:
+            answer = QMessageBox.question(
+                self,
+                "Confirm Delete",
+                f"Delete branch / department '{rec['name']}'?\n\n"
+                "You can re-add it later or restore defaults from Manage All.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        success, message = self.db.delete_department(rec["id"], reassign_to=reassign_to)
+        if success:
+            self.refresh_department_table()
+            self.departments_updated.emit()
+            QMessageBox.information(self, "Branch / Department Deleted", message)
+        else:
+            QMessageBox.warning(self, "Delete Failed", message)
+
     def open_department_manager(self):
         try:
             dialog = DepartmentManagerDialog(self.db, self)
+            if hasattr(dialog, "departments_changed"):
+                dialog.departments_changed.connect(
+                    self._on_departments_changed_externally
+                )
             dialog.exec()
+            self.refresh_department_table()
 
         except Exception as error:
             QMessageBox.critical(
@@ -2842,6 +3442,18 @@ class SettingsView(QWidget):
             email_delivery_enabled = self.db.get_setting(
                 "email_delivery_enabled",
                 "0",
+            )
+            import_complaints_enabled = self.db.get_setting(
+                "email_complaint_import_enabled",
+                "1",
+            )
+            complaint_auto_reply = self.db.get_setting(
+                "email_complaint_auto_reply",
+                "1",
+            )
+            complaint_filter_mode = self.db.get_setting(
+                "email_complaint_filter_mode",
+                "keywords",
             )
             auto_backup_enabled = self.db.get_setting(
                 "google_drive_auto_backup_enabled",
@@ -2897,8 +3509,25 @@ class SettingsView(QWidget):
                 str(email_delivery_enabled).casefold()
                 in ("1", "true", "yes")
             )
+            self.email_import_complaints_checkbox.setChecked(
+                str(import_complaints_enabled).casefold()
+                in ("1", "true", "yes")
+            )
+            self.email_complaint_auto_reply_checkbox.setChecked(
+                str(complaint_auto_reply).casefold()
+                in ("1", "true", "yes")
+            )
+            filter_idx = self.email_complaint_filter_combo.findData(
+                str(complaint_filter_mode or "keywords").strip().casefold()
+            )
+            self.email_complaint_filter_combo.setCurrentIndex(
+                filter_idx if filter_idx >= 0 else 0
+            )
             self.sync_email_btn.setEnabled(
-                self.email_delivery_checkbox.isChecked()
+                bool(
+                    self.email_delivery_checkbox.isChecked()
+                    or self.email_import_complaints_checkbox.isChecked()
+                )
             )
             self.auto_drive_backup_checkbox.setChecked(
                 str(auto_backup_enabled).casefold()
@@ -2912,6 +3541,8 @@ class SettingsView(QWidget):
                     in ("1", "true", "yes")
                 )
             self.refresh_drive_status_ui()
+            if hasattr(self, "dept_table"):
+                self.refresh_department_table()
 
             policies_ok, policy_rows = self.db.get_all_loan_policies()
             if policies_ok and policy_rows:
@@ -3071,6 +3702,9 @@ class SettingsView(QWidget):
             )
 
             if success:
+                if hasattr(self, "dept_table"):
+                    self.refresh_department_table()
+                self.departments_updated.emit()
                 filename = (
                     f"Graduated_Batch_{graduating_batch}_Archive.csv"
                 )
@@ -3481,6 +4115,18 @@ class SettingsView(QWidget):
                 "due_email_reminders_enabled",
                 "1" if self.email_reminders_checkbox.isChecked() else "0",
             )
+            self.db.set_setting(
+                "email_complaint_import_enabled",
+                "1" if self.email_import_complaints_checkbox.isChecked() else "0",
+            )
+            self.db.set_setting(
+                "email_complaint_auto_reply",
+                "1" if self.email_complaint_auto_reply_checkbox.isChecked() else "0",
+            )
+            self.db.set_setting(
+                "email_complaint_filter_mode",
+                str(self.email_complaint_filter_combo.currentData() or "keywords"),
+            )
 
             new_password = self.input_new_psw.text()
 
@@ -3737,6 +4383,10 @@ class SettingsView(QWidget):
                 self.email_actions_host,
                 self.email_delivery_row,
                 self.email_reminders_row,
+                self.email_import_complaints_row,
+                self.email_complaint_auto_reply_row,
+                self.email_complaint_filter_label,
+                self.email_complaint_filter_combo,
                 self.email_queue_row,
             )
             for w in email_widgets:
@@ -3756,7 +4406,11 @@ class SettingsView(QWidget):
                 self.email_form_layout.addWidget(self.email_actions_host, 4, 0, 1, 2)
                 self.email_form_layout.addWidget(self.email_delivery_row, 5, 0, 1, 2)
                 self.email_form_layout.addWidget(self.email_reminders_row, 6, 0, 1, 2)
-                self.email_form_layout.addWidget(self.email_queue_row, 7, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_import_complaints_row, 7, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_complaint_auto_reply_row, 8, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_complaint_filter_label, 9, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_complaint_filter_combo, 10, 0, 1, 2)
+                self.email_form_layout.addWidget(self.email_queue_row, 11, 0, 1, 2)
                 self.email_form_layout.setColumnStretch(0, 1)
                 self.email_form_layout.setColumnStretch(1, 1)
 
@@ -3764,10 +4418,7 @@ class SettingsView(QWidget):
             self.email_queue_layout.removeWidget(self.email_queue_status)
             self.email_queue_layout.removeWidget(self.email_queue_btns)
             self.email_queue_layout.addWidget(self.email_queue_status, 0, 0)
-            if stacked:
-                self.email_queue_layout.addWidget(self.email_queue_btns, 1, 0)
-            else:
-                self.email_queue_layout.addWidget(self.email_queue_btns, 0, 1)
+            self.email_queue_layout.addWidget(self.email_queue_btns, 1, 0)
             self.email_queue_layout.setColumnStretch(0, 1)
 
         if hasattr(self, "update_actions_layout"):

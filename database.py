@@ -13,10 +13,12 @@ from typing import Optional, Iterable, Sequence, Any
 from utils import (
     COLLEGE_BRANCHES,
     COLLEGE_BRANCH_NAMES,
+    DEFAULT_BRANCH_CODES,
     FACULTY_ADDITIONAL_DEPARTMENTS,
     FACULTY_ADDITIONAL_DEPARTMENT_NAMES,
     format_log_id_display,
     get_appdata_db_path,
+    normalize_department_for_role as _normalize_static_department_for_role,
 )
 
 
@@ -252,6 +254,16 @@ class LocalDatabase:
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS complaint_email_imports (
+                    message_key TEXT PRIMARY KEY,
+                    sender_email TEXT,
+                    subject TEXT,
+                    action TEXT NOT NULL CHECK(action IN ('IMPORTED', 'IGNORED')),
+                    complaint_id INTEGER,
+                    processed_at TIMESTAMP NOT NULL
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS departments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT UNIQUE COLLATE NOCASE,
@@ -281,6 +293,12 @@ class LocalDatabase:
             self._ensure_column("circulation_logs", "fine_settlement_action", "TEXT")
             self._ensure_column("circulation_logs", "fine_settlement_note", "TEXT")
             self._ensure_column("users", "email", "TEXT")
+            self._ensure_column("departments", "branch_code", "TEXT DEFAULT ''")
+            self._ensure_column("complaints", "source", "TEXT DEFAULT 'DESK'")
+            self._ensure_column("complaints", "reporter_name", "TEXT")
+            self._ensure_column("complaints", "reporter_email", "TEXT")
+            self._ensure_column("complaints", "email_message_id", "TEXT")
+            self._ensure_column("complaints", "staff_notes", "TEXT")
 
             self._backfill_circulation_log_codes(cur)
 
@@ -298,6 +316,11 @@ class LocalDatabase:
                 CREATE INDEX IF NOT EXISTS idx_fine_payments_user ON fine_payments(user_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_email_queue_status_created
                     ON email_queue(status, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_complaints_email_message_id
+                    ON complaints(email_message_id)
+                    WHERE email_message_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_complaints_status_created
+                    ON complaints(status, created_at DESC, id DESC);
             """)
 
             if cur.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
@@ -310,42 +333,38 @@ class LocalDatabase:
 
             cur.executemany(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
-                [("max_renewals", "2"), ("allow_overdue_renewal", "1")],
+                [
+                    ("max_renewals", "2"),
+                    ("allow_overdue_renewal", "1"),
+                    ("email_complaint_import_enabled", "1"),
+                    ("email_complaint_auto_reply", "1"),
+                    ("email_complaint_filter_mode", "keywords"),
+                ],
             )
 
             canonical_departments = [
-                (name, "STUDENT", duration)
+                (name, "STUDENT", duration, DEFAULT_BRANCH_CODES.get(name, ""))
                 for name, duration in COLLEGE_BRANCHES
             ] + [
-                (name, "FACULTY", duration)
+                (name, "FACULTY", duration, DEFAULT_BRANCH_CODES.get(name, ""))
                 for name, duration in FACULTY_ADDITIONAL_DEPARTMENTS
             ]
-            expected_categories = {
-                name.lower(): category
-                for name, category, _ in canonical_departments
-            }
-            existing_depts = {
-                str(row[0]).lower(): row[1]
-                for row in cur.execute(
-                    "SELECT name, category FROM departments"
-                ).fetchall()
-            }
-            if existing_depts != expected_categories:
+            dept_seeded_row = cur.execute(
+                "SELECT value FROM settings WHERE key = 'departments_seeded_v2'"
+            ).fetchone()
+            dept_count = cur.execute("SELECT COUNT(*) FROM departments").fetchone()[0]
+            if dept_count == 0 or not dept_seeded_row or str(dept_seeded_row[0]) != "1":
                 cur.executemany(
                     """
-                    INSERT INTO departments(name, category, duration_years)
-                    VALUES (?, ?, ?)
+                    INSERT INTO departments(name, category, duration_years, branch_code)
+                    VALUES (?, ?, ?, ?)
                     ON CONFLICT(name) DO UPDATE SET
-                        category = excluded.category
-                    WHERE COALESCE(departments.category, '') != COALESCE(excluded.category, '')
+                        branch_code = COALESCE(NULLIF(departments.branch_code, ''), excluded.branch_code)
                     """,
                     canonical_departments,
                 )
-                allowed_keys = tuple(expected_categories.keys())
-                placeholders = ",".join("?" for _ in allowed_keys)
                 cur.execute(
-                    f"DELETE FROM departments WHERE LOWER(name) NOT IN ({placeholders})",
-                    allowed_keys,
+                    "INSERT OR REPLACE INTO settings(key, value) VALUES ('departments_seeded_v2', '1')"
                 )
 
             if cur.execute("SELECT COUNT(*) FROM loan_policies").fetchone()[0] == 0:
@@ -991,18 +1010,180 @@ class LocalDatabase:
         return True
 
     # DEPARTMENTS
-    def get_departments(self, category=None):
-        branches = sorted(COLLEGE_BRANCH_NAMES, key=str.casefold)
-        faculty_extras = list(FACULTY_ADDITIONAL_DEPARTMENT_NAMES)
-        if not category:
-            return branches + faculty_extras
+    @staticmethod
+    def _clean_branch_code(branch_code) -> tuple[bool, str, str]:
+        code = " ".join(str(branch_code or "").split()).upper()
+        if not code:
+            return True, "", ""
+        if not re.fullmatch(r"[A-Z0-9_-]{1,12}", code):
+            return (
+                False,
+                "",
+                "Branch short code must be 1–12 characters (letters, numbers, '-' or '_').",
+            )
+        return True, code, ""
 
-        category_key = self._clean(category).upper()
-        if category_key == "STUDENT":
-            return branches
-        if category_key == "FACULTY":
-            return branches + faculty_extras
-        return []
+    def get_departments(self, category=None):
+        try:
+            category_key = self._clean(category).upper()
+            student_rows = [
+                str(r[0])
+                for r in self.conn.execute(
+                    """
+                    SELECT name FROM departments
+                    WHERE UPPER(COALESCE(category, 'STUDENT')) = 'STUDENT'
+                    ORDER BY name COLLATE NOCASE ASC
+                    """
+                ).fetchall()
+                if r[0]
+            ]
+            if category_key == "STUDENT":
+                return student_rows
+
+            faculty_rows = [
+                str(r[0])
+                for r in self.conn.execute(
+                    """
+                    SELECT name FROM departments
+                    WHERE UPPER(COALESCE(category, 'STUDENT')) != 'STUDENT'
+                    ORDER BY name COLLATE NOCASE ASC
+                    """
+                ).fetchall()
+                if r[0]
+            ]
+            if not category_key or category_key == "FACULTY":
+                return student_rows + faculty_rows
+            return []
+        except sqlite3.Error:
+            logging.exception("Could not read departments table; using fallback defaults")
+            branches = sorted(COLLEGE_BRANCH_NAMES, key=str.casefold)
+            faculty_extras = list(FACULTY_ADDITIONAL_DEPARTMENT_NAMES)
+            if self._clean(category).upper() == "STUDENT":
+                return branches
+            if not category or self._clean(category).upper() == "FACULTY":
+                return branches + faculty_extras
+            return []
+
+    def get_departments_detailed(self):
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT
+                    d.id,
+                    d.name,
+                    UPPER(COALESCE(d.category, 'STUDENT')) AS category,
+                    COALESCE(d.duration_years, 3) AS duration_years,
+                    COALESCE(d.branch_code, '') AS branch_code,
+                    COUNT(u.id) AS user_count,
+                    SUM(CASE WHEN LOWER(COALESCE(u.role, '')) = 'student' THEN 1 ELSE 0 END) AS student_count,
+                    SUM(CASE WHEN u.id IS NOT NULL AND LOWER(COALESCE(u.role, '')) != 'student' THEN 1 ELSE 0 END) AS staff_count
+                FROM departments d
+                LEFT JOIN users u
+                    ON LOWER(TRIM(COALESCE(u.department, ''))) = LOWER(TRIM(COALESCE(d.name, '')))
+                GROUP BY d.id, d.name, d.category, d.duration_years, d.branch_code
+                ORDER BY
+                    CASE WHEN UPPER(COALESCE(d.category, 'STUDENT')) = 'STUDENT' THEN 0 ELSE 1 END,
+                    d.name COLLATE NOCASE ASC
+                """
+            ).fetchall()
+            return [
+                {
+                    "id": int(r[0]),
+                    "name": str(r[1] or ""),
+                    "category": str(r[2] or "STUDENT"),
+                    "duration_years": int(r[3] or 3),
+                    "branch_code": str(r[4] or ""),
+                    "user_count": int(r[5] or 0),
+                    "student_count": int(r[6] or 0),
+                    "staff_count": int(r[7] or 0),
+                }
+                for r in rows
+            ]
+        except sqlite3.Error:
+            logging.exception("Could not read detailed departments")
+            return []
+
+    def get_unlisted_user_departments(self):
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT
+                    TRIM(u.department) AS dept_name,
+                    COUNT(*) AS user_count,
+                    SUM(CASE WHEN LOWER(COALESCE(u.role, '')) = 'student' THEN 1 ELSE 0 END) AS student_count
+                FROM users u
+                WHERE TRIM(COALESCE(u.department, '')) != ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM departments d
+                      WHERE LOWER(TRIM(COALESCE(d.name, ''))) = LOWER(TRIM(u.department))
+                  )
+                GROUP BY LOWER(TRIM(u.department))
+                ORDER BY dept_name COLLATE NOCASE ASC
+                """
+            ).fetchall()
+            return [
+                {
+                    "name": str(r[0]),
+                    "user_count": int(r[1] or 0),
+                    "student_count": int(r[2] or 0),
+                }
+                for r in rows
+                if r[0]
+            ]
+        except sqlite3.Error:
+            logging.exception("Could not check unlisted user departments")
+            return []
+
+    def normalize_department_for_role(self, department, role):
+        key = " ".join(str(department or "").split()).casefold()
+        if not key:
+            return None
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT name, UPPER(COALESCE(category, 'STUDENT')), COALESCE(branch_code, '')
+                FROM departments
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+
+        if not rows:
+            return _normalize_static_department_for_role(department, role)
+
+        student_aliases = {}
+        faculty_aliases = {}
+        for name, category, code in rows:
+            canonical = str(name or "").strip()
+            if not canonical:
+                continue
+            faculty_aliases[canonical.casefold()] = canonical
+            if code and str(code).strip():
+                faculty_aliases.setdefault(str(code).strip().casefold(), canonical)
+            if str(category or "").upper() == "STUDENT":
+                student_aliases[canonical.casefold()] = canonical
+                if code and str(code).strip():
+                    student_aliases.setdefault(str(code).strip().casefold(), canonical)
+
+        # Preserve historical alias translations when target exists in live DB
+        legacy_static = {
+            "humanities & science department": "Sciences & Humanities Department",
+            "humanities and science department": "Sciences & Humanities Department",
+            "sciences and humanities department": "Sciences & Humanities Department",
+            "general administration department": "General Administration",
+            "general adminstration department": "General Administration",
+        }
+        active_ci = {v.casefold(): v for v in faculty_aliases.values()}
+        for alias_key, target_name in legacy_static.items():
+            if target_name.casefold() in active_ci:
+                faculty_aliases.setdefault(alias_key, active_ci[target_name.casefold()])
+
+        return _normalize_static_department_for_role(
+            department,
+            role,
+            student_aliases=student_aliases,
+            faculty_aliases=faculty_aliases,
+        )
 
     def get_course_duration(self, department_name: str) -> int:
         name = self._clean(department_name)
@@ -1025,51 +1206,333 @@ class LocalDatabase:
             return 4
         return 3
 
-    def add_department(self, name, category="STUDENT", duration_years=3):
-        return False, (
-            "College branches and faculty departments are fixed and cannot be added."
-        )
-
-    def update_department(self, dept_id, name, category, duration_years):
-        clean_name = self._clean(name)
+    def add_department(self, name, category="STUDENT", duration_years=3, branch_code=""):
+        clean_name = " ".join(str(name or "").split()).strip()
         category = self._clean(category).upper()
+        if not clean_name:
+            return False, "Enter a branch or department name."
+        if len(clean_name) > 120:
+            return False, "Branch / department name must be 120 characters or fewer."
+        if category not in ("STUDENT", "FACULTY"):
+            return False, "Select either Student & Faculty or Faculty & Staff Only."
+
+        ok_code, clean_code, code_err = self._clean_branch_code(branch_code)
+        if not ok_code:
+            return False, code_err
+
         try:
-            duration = int(duration_years)
-            if duration < 1:
-                return False, "Enter a valid course duration."
-            with self._transaction():
+            duration = int(duration_years) if category == "STUDENT" else 3
+        except (TypeError, ValueError):
+            return False, "Course duration must be between 1 and 6 years."
+        if duration < 1 or duration > 6:
+            return False, "Course duration must be between 1 and 6 years."
+
+        try:
+            with self._transaction(immediate=True):
+                dup_name = self.conn.execute(
+                    "SELECT id FROM departments WHERE name = ? COLLATE NOCASE",
+                    (clean_name,),
+                ).fetchone()
+                if dup_name:
+                    return False, f"A branch or department named '{clean_name}' already exists."
+                if clean_code:
+                    dup_code = self.conn.execute(
+                        "SELECT name FROM departments WHERE UPPER(COALESCE(branch_code, '')) = ?",
+                        (clean_code,),
+                    ).fetchone()
+                    if dup_code:
+                        return (
+                            False,
+                            f"Short code '{clean_code}' is already assigned to '{dup_code[0]}'.",
+                        )
+                self.conn.execute(
+                    """
+                    INSERT INTO departments(name, category, duration_years, branch_code)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (clean_name, category, duration, clean_code),
+                )
+            return True, f"Added '{clean_name}' successfully."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "department creation")
+
+    def update_department(
+        self,
+        dept_id,
+        name,
+        category,
+        duration_years,
+        branch_code="",
+        cascade_users=True,
+    ):
+        clean_name = " ".join(str(name or "").split()).strip()
+        category = self._clean(category).upper()
+        if not clean_name:
+            return False, "Enter a branch or department name."
+        if len(clean_name) > 120:
+            return False, "Branch / department name must be 120 characters or fewer."
+        if category not in ("STUDENT", "FACULTY"):
+            return False, "Select either Student & Faculty or Faculty & Staff Only."
+
+        ok_code, clean_code, code_err = self._clean_branch_code(branch_code)
+        if not ok_code:
+            return False, code_err
+
+        try:
+            duration = int(duration_years) if category == "STUDENT" else 3
+        except (TypeError, ValueError):
+            return False, "Course duration must be between 1 and 6 years."
+        if duration < 1 or duration > 6:
+            return False, "Course duration must be between 1 and 6 years."
+
+        try:
+            with self._transaction(immediate=True):
                 row = self.conn.execute(
-                    "SELECT name, category FROM departments WHERE id = ?", (dept_id,)
+                    "SELECT name, UPPER(COALESCE(category, 'STUDENT')) FROM departments WHERE id = ?",
+                    (dept_id,),
                 ).fetchone()
                 if not row:
                     return False, "Department not found."
-                old_name, old_category = row[0], str(row[1] or "").upper()
-                if (
-                    clean_name.casefold() != old_name.casefold()
-                    or category != old_category
-                ):
-                    return (
-                        False,
-                        "Fixed branch names and categories cannot be changed; "
-                        "only course duration can be updated.",
-                    )
-                if old_category != "STUDENT":
-                    return (
-                        False,
-                        "Course duration applies only to college student branches.",
-                    )
+                old_name, old_category = str(row[0] or ""), str(row[1] or "STUDENT")
+
+                dup_name = self.conn.execute(
+                    "SELECT id FROM departments WHERE name = ? COLLATE NOCASE AND id != ?",
+                    (clean_name, dept_id),
+                ).fetchone()
+                if dup_name:
+                    return False, f"Another branch or department named '{clean_name}' already exists."
+
+                if clean_code:
+                    dup_code = self.conn.execute(
+                        "SELECT name FROM departments WHERE UPPER(COALESCE(branch_code, '')) = ? AND id != ?",
+                        (clean_code, dept_id),
+                    ).fetchone()
+                    if dup_code:
+                        return (
+                            False,
+                            f"Short code '{clean_code}' is already assigned to '{dup_code[0]}'.",
+                        )
+
+                if old_category == "STUDENT" and category != "STUDENT":
+                    other_student = self.conn.execute(
+                        "SELECT COUNT(*) FROM departments WHERE UPPER(COALESCE(category, 'STUDENT')) = 'STUDENT' AND id != ?",
+                        (dept_id,),
+                    ).fetchone()[0]
+                    if other_student == 0:
+                        return (
+                            False,
+                            "At least one student branch must remain available.",
+                        )
+                    assigned_students = self.conn.execute(
+                        """
+                        SELECT COUNT(*) FROM users
+                        WHERE LOWER(TRIM(COALESCE(department, ''))) = LOWER(TRIM(?))
+                          AND LOWER(COALESCE(role, '')) = 'student'
+                        """,
+                        (old_name,),
+                    ).fetchone()[0]
+                    if assigned_students > 0:
+                        return (
+                            False,
+                            f"Cannot restrict '{old_name}' to Faculty & Staff Only while "
+                            f"{assigned_students} student(s) are assigned to it. Reassign those students first.",
+                        )
+
                 self.conn.execute(
-                    "UPDATE departments SET duration_years = ? WHERE id = ?",
-                    (duration, dept_id),
+                    """
+                    UPDATE departments
+                    SET name = ?, category = ?, duration_years = ?, branch_code = ?
+                    WHERE id = ?
+                    """,
+                    (clean_name, category, duration, clean_code, dept_id),
                 )
-            return True, "Course duration updated successfully."
+
+                updated_users = 0
+                if cascade_users and clean_name != old_name:
+                    cur = self.conn.execute(
+                        """
+                        UPDATE users
+                        SET department = ?
+                        WHERE LOWER(TRIM(COALESCE(department, ''))) = LOWER(TRIM(?))
+                        """,
+                        (clean_name, old_name),
+                    )
+                    updated_users = int(cur.rowcount or 0)
+
+            msg = f"Updated '{clean_name}' successfully."
+            if updated_users > 0:
+                msg += f" Updated {updated_users} member record(s)."
+            return True, msg
         except Exception as exc:
             return False, self._parse_db_error(exc, "department update")
 
-    def delete_department(self, name):
-        return False, (
-            "College branches and faculty departments are fixed and cannot be removed."
-        )
+    def reassign_department_users(self, source_name, target_name):
+        src = self._clean(source_name)
+        tgt = self._clean(target_name)
+        if not src or not tgt:
+            return False, "Select both source and target branches/departments."
+        if src.casefold() == tgt.casefold():
+            return False, "Source and target branch/department must be different."
+        try:
+            with self._transaction(immediate=True):
+                tgt_row = self.conn.execute(
+                    "SELECT name, UPPER(COALESCE(category, 'STUDENT')) FROM departments WHERE name = ? COLLATE NOCASE",
+                    (tgt,),
+                ).fetchone()
+                if not tgt_row:
+                    return False, f"Target branch/department '{tgt}' does not exist."
+                canonical_target, tgt_cat = str(tgt_row[0]), str(tgt_row[1] or "STUDENT")
+                student_cnt = self.conn.execute(
+                    """
+                    SELECT COUNT(*) FROM users
+                    WHERE LOWER(TRIM(COALESCE(department, ''))) = LOWER(TRIM(?))
+                      AND LOWER(COALESCE(role, '')) = 'student'
+                    """,
+                    (src,),
+                ).fetchone()[0]
+                if student_cnt > 0 and tgt_cat != "STUDENT":
+                    return (
+                        False,
+                        f"Cannot move {student_cnt} student(s) into Faculty/Staff-only department '{canonical_target}'. "
+                        "Select an academic student branch instead.",
+                    )
+                cur = self.conn.execute(
+                    """
+                    UPDATE users
+                    SET department = ?
+                    WHERE LOWER(TRIM(COALESCE(department, ''))) = LOWER(TRIM(?))
+                    """,
+                    (canonical_target, src),
+                )
+                moved = int(cur.rowcount or 0)
+            return True, f"Reassigned {moved} member(s) from '{src}' to '{canonical_target}'."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "department reassignment")
+
+    def delete_department(self, identifier, reassign_to=None):
+        try:
+            with self._transaction(immediate=True):
+                if isinstance(identifier, int) or str(identifier or "").isdigit():
+                    row = self.conn.execute(
+                        "SELECT id, name, UPPER(COALESCE(category, 'STUDENT')) FROM departments WHERE id = ?",
+                        (int(identifier),),
+                    ).fetchone()
+                else:
+                    clean_name = self._clean(identifier)
+                    row = self.conn.execute(
+                        "SELECT id, name, UPPER(COALESCE(category, 'STUDENT')) FROM departments WHERE name = ? COLLATE NOCASE",
+                        (clean_name,),
+                    ).fetchone()
+
+                if not row:
+                    return False, "Branch or department not found."
+                dept_id, name, category = int(row[0]), str(row[1]), str(row[2] or "STUDENT")
+
+                if category == "STUDENT":
+                    remaining_student = self.conn.execute(
+                        "SELECT COUNT(*) FROM departments WHERE UPPER(COALESCE(category, 'STUDENT')) = 'STUDENT' AND id != ?",
+                        (dept_id,),
+                    ).fetchone()[0]
+                    if remaining_student == 0:
+                        return False, "At least one student academic branch must remain active."
+
+                counts = self.conn.execute(
+                    """
+                    SELECT
+                        COUNT(*),
+                        SUM(CASE WHEN LOWER(COALESCE(role, '')) = 'student' THEN 1 ELSE 0 END)
+                    FROM users
+                    WHERE LOWER(TRIM(COALESCE(department, ''))) = LOWER(TRIM(?))
+                    """,
+                    (name,),
+                ).fetchone()
+                total_users = int(counts[0] or 0)
+                student_users = int(counts[1] or 0)
+
+                reassigned_msg = ""
+                if total_users > 0:
+                    if not self._clean(reassign_to):
+                        return (
+                            False,
+                            f"Cannot delete '{name}' because {total_users} member(s) are assigned to it. "
+                            "Choose a replacement branch/department to reassign those members first.",
+                        )
+                    tgt_row = self.conn.execute(
+                        """
+                        SELECT id, name, UPPER(COALESCE(category, 'STUDENT'))
+                        FROM departments
+                        WHERE name = ? COLLATE NOCASE AND id != ?
+                        """,
+                        (self._clean(reassign_to), dept_id),
+                    ).fetchone()
+                    if not tgt_row:
+                        return False, f"Replacement branch/department '{reassign_to}' was not found."
+                    tgt_name, tgt_cat = str(tgt_row[1]), str(tgt_row[2] or "STUDENT")
+                    if student_users > 0 and tgt_cat != "STUDENT":
+                        return (
+                            False,
+                            f"'{name}' has {student_users} student(s) and can only be reassigned to a student academic branch.",
+                        )
+                    self.conn.execute(
+                        """
+                        UPDATE users
+                        SET department = ?
+                        WHERE LOWER(TRIM(COALESCE(department, ''))) = LOWER(TRIM(?))
+                        """,
+                        (tgt_name, name),
+                    )
+                    reassigned_msg = f" Reassigned {total_users} member(s) to '{tgt_name}'."
+
+                self.conn.execute("DELETE FROM departments WHERE id = ?", (dept_id,))
+            return True, f"Deleted '{name}'.{reassigned_msg}"
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "department removal")
+
+    def restore_default_departments(self):
+        canonical_departments = [
+            (name, "STUDENT", duration, DEFAULT_BRANCH_CODES.get(name, ""))
+            for name, duration in COLLEGE_BRANCHES
+        ] + [
+            (name, "FACULTY", duration, DEFAULT_BRANCH_CODES.get(name, ""))
+            for name, duration in FACULTY_ADDITIONAL_DEPARTMENTS
+        ]
+        try:
+            added = 0
+            with self._transaction(immediate=True):
+                for name, category, duration, code in canonical_departments:
+                    exists = self.conn.execute(
+                        "SELECT id, COALESCE(branch_code, '') FROM departments WHERE name = ? COLLATE NOCASE",
+                        (name,),
+                    ).fetchone()
+                    if not exists:
+                        safe_code = code
+                        if safe_code and self.conn.execute(
+                            "SELECT 1 FROM departments WHERE UPPER(COALESCE(branch_code, '')) = ?",
+                            (safe_code,),
+                        ).fetchone():
+                            safe_code = ""
+                        self.conn.execute(
+                            """
+                            INSERT INTO departments(name, category, duration_years, branch_code)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (name, category, duration, safe_code),
+                        )
+                        added += 1
+                    elif not exists[1] and code:
+                        if not self.conn.execute(
+                            "SELECT 1 FROM departments WHERE UPPER(COALESCE(branch_code, '')) = ? AND id != ?",
+                            (code, exists[0]),
+                        ).fetchone():
+                            self.conn.execute(
+                                "UPDATE departments SET branch_code = ? WHERE id = ?",
+                                (code, exists[0]),
+                            )
+            if added:
+                return True, f"Restored {added} default branch(es)/department(s)."
+            return True, "All default college branches and departments are already present."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "default department restore")
 
     # LOAN POLICIES
     def get_loan_policy(self, role):
@@ -2129,27 +2592,184 @@ class LocalDatabase:
             """, (pk, reminder_type, sent_at))
         return True
 
-    def create_complaint(self, user_id, subject, body):
+    _ID_TOKEN_PATTERN = re.compile(
+        r"(?<![A-Za-z0-9-])([A-Za-z0-9][A-Za-z0-9_-]{3,40})(?![A-Za-z0-9-])"
+    )
+
+    def get_registered_user_emails(self):
+        rows = self.conn.execute("""
+            SELECT id, COALESCE(full_name, ''), LOWER(TRIM(email))
+            FROM users
+            WHERE COALESCE(TRIM(email), '') != ''
+        """).fetchall()
+        mapping = {}
+        for uid, full_name, email in rows:
+            mapping.setdefault(email, []).append((uid, full_name, email))
+        return mapping
+
+    def find_user_for_inbound_email(
+        self,
+        sender_email,
+        subject="",
+        body="",
+        sender_name="",
+    ):
+        clean_email = self._clean(sender_email).casefold()
+        clean_name = self._clean(sender_name)
+        combined_text = f"{subject or ''}\n{body or ''}"
+
+        # 1. Exact registered email lookup
+        if clean_email:
+            matches = self.conn.execute("""
+                SELECT id, COALESCE(full_name, ''), COALESCE(email, '')
+                FROM users
+                WHERE LOWER(TRIM(COALESCE(email, ''))) = ?
+            """, (clean_email,)).fetchall()
+            if len(matches) == 1:
+                uid, full_name, user_email = matches[0]
+                return uid, full_name, user_email or clean_email, "Registered email"
+            if len(matches) > 1:
+                lowered_text = combined_text.casefold()
+                narrowed = [
+                    m for m in matches
+                    if str(m[0] or "").casefold() in lowered_text
+                ]
+                if len(narrowed) == 1:
+                    uid, full_name, user_email = narrowed[0]
+                    return uid, full_name, user_email or clean_email, "Email + Roll No"
+
+        # 2. Match a Roll No / PIN / User ID mentioned inside the subject or body
+        tokens = {
+            tok.upper()
+            for tok in self._ID_TOKEN_PATTERN.findall(combined_text)
+        }
+        if tokens:
+            rows = self.conn.execute("""
+                SELECT id, COALESCE(full_name, ''), COALESCE(email, '')
+                FROM users
+            """).fetchall()
+            id_matches = [
+                row for row in rows
+                if str(row[0] or "").strip().upper() in tokens
+            ]
+            if len(id_matches) == 1:
+                uid, full_name, user_email = id_matches[0]
+                return (
+                    uid,
+                    full_name,
+                    user_email or clean_email,
+                    "Roll No / ID in message",
+                )
+
+        return None, clean_name, clean_email, "External email sender"
+
+    def get_complaint_import_map(self):
+        mapping = {}
+        for msg_key, action, complaint_id in self.conn.execute("""
+            SELECT message_key, action, complaint_id
+            FROM complaint_email_imports
+        """).fetchall():
+            if msg_key:
+                mapping[str(msg_key)] = (str(action), complaint_id)
+        for msg_key, cid in self.conn.execute("""
+            SELECT email_message_id, id
+            FROM complaints
+            WHERE email_message_id IS NOT NULL
+        """).fetchall():
+            if msg_key and str(msg_key) not in mapping:
+                mapping[str(msg_key)] = ("IMPORTED", cid)
+        return mapping
+
+    def mark_email_complaint_ignored(
+        self,
+        message_key,
+        sender_email="",
+        subject="",
+    ):
+        key = self._clean(message_key)
+        if not key:
+            return False
+        now_text = datetime.datetime.now().isoformat(timespec="seconds")
+        with self._transaction(immediate=True):
+            existing = self.conn.execute(
+                "SELECT action FROM complaint_email_imports WHERE message_key = ?",
+                (key,),
+            ).fetchone()
+            if existing and existing[0] == "IMPORTED":
+                return False
+            self.conn.execute("""
+                INSERT INTO complaint_email_imports(
+                    message_key, sender_email, subject, action, complaint_id, processed_at
+                )
+                VALUES (?, ?, ?, 'IGNORED', NULL, ?)
+                ON CONFLICT(message_key) DO UPDATE SET
+                    sender_email = excluded.sender_email,
+                    subject = excluded.subject,
+                    action = 'IGNORED',
+                    complaint_id = NULL,
+                    processed_at = excluded.processed_at
+            """, (
+                key,
+                self._clean(sender_email).casefold(),
+                self._clean(subject)[:200],
+                now_text,
+            ))
+        return True
+
+    def create_complaint(
+        self,
+        user_id,
+        subject,
+        body,
+        source="DESK",
+        reporter_name=None,
+        reporter_email=None,
+        email_message_id=None,
+        created_at=None,
+        staff_notes=None,
+    ):
         uid = self._clean(user_id) or None
         subject = self._clean(subject)
-        body = self._clean(body)
+        body = str(body or "").strip()
         if not subject or not body:
             return False, "Complaint subject and details are required."
 
-        created_at = datetime.datetime.now().isoformat(timespec="seconds")
+        normalized_source = (
+            "EMAIL" if self._clean(source).upper() == "EMAIL" else "DESK"
+        )
+        rep_name = self._clean(reporter_name) or None
+        rep_email = self._clean(reporter_email).casefold() or None
+        msg_key = self._clean(email_message_id) or None
+        notes = self._clean(staff_notes) or None
+        now_text = datetime.datetime.now().isoformat(timespec="seconds")
+        created_text = self._clean(created_at) or now_text
+
         try:
             with self._transaction():
                 cursor = self.conn.execute("""
                     INSERT INTO complaints(
-                        user_id, subject, body, status, created_at, updated_at
+                        user_id, subject, body, status, created_at, updated_at,
+                        source, reporter_name, reporter_email, email_message_id, staff_notes
                     )
-                    VALUES (?, ?, ?, 'OPEN', ?, ?)
-                """, (uid, subject, body, created_at, created_at))
+                    VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    uid,
+                    subject,
+                    body,
+                    created_text,
+                    now_text,
+                    normalized_source,
+                    rep_name,
+                    rep_email,
+                    msg_key,
+                    notes,
+                ))
                 complaint_id = cursor.lastrowid
                 row = self.conn.execute("""
-                    SELECT c.id, c.user_id, COALESCE(u.full_name, ''),
-                        COALESCE(u.email, ''), c.subject, c.body,
-                        c.created_at
+                    SELECT c.id, c.user_id,
+                        COALESCE(NULLIF(u.full_name, ''), NULLIF(c.reporter_name, ''), ''),
+                        COALESCE(NULLIF(u.email, ''), NULLIF(c.reporter_email, ''), ''),
+                        c.subject, c.body, c.created_at
                     FROM complaints c
                     LEFT JOIN users u ON u.id = c.user_id
                     WHERE c.id = ?
@@ -2159,11 +2779,123 @@ class LocalDatabase:
             logging.exception("Could not create library complaint")
             return False, str(exc)
 
+    def import_emailed_complaint(
+        self,
+        message_key,
+        sender_email,
+        sender_name,
+        subject,
+        body,
+        user_id=None,
+        received_at=None,
+        allow_if_ignored=False,
+    ):
+        key = self._clean(message_key)
+        clean_sender_email = self._clean(sender_email).casefold()
+        clean_sender_name = self._clean(sender_name)
+        clean_subject = self._clean(subject)[:160] or "(No Subject)"
+        clean_body = str(body or "").strip() or "(Empty email body)"
+        if not key:
+            return False, "Missing email message key.", None
+
+        resolved_uid = self._clean(user_id) or None
+        if resolved_uid is None:
+            resolved_uid, matched_name, matched_email, _ = (
+                self.find_user_for_inbound_email(
+                    clean_sender_email,
+                    clean_subject,
+                    clean_body,
+                    clean_sender_name,
+                )
+            )
+            if not clean_sender_name and matched_name:
+                clean_sender_name = matched_name
+            if not clean_sender_email and matched_email:
+                clean_sender_email = matched_email
+
+        now_text = datetime.datetime.now().isoformat(timespec="seconds")
+        created_text = self._clean(received_at) or now_text
+
+        try:
+            with self._transaction(immediate=True):
+                imp = self.conn.execute(
+                    "SELECT action, complaint_id FROM complaint_email_imports WHERE message_key = ?",
+                    (key,),
+                ).fetchone()
+                if imp:
+                    if imp[0] == "IMPORTED":
+                        return False, "ALREADY_IMPORTED", None
+                    if imp[0] == "IGNORED" and not allow_if_ignored:
+                        return False, "IGNORED", None
+
+                existing_complaint = self.conn.execute(
+                    "SELECT id FROM complaints WHERE email_message_id = ?",
+                    (key,),
+                ).fetchone()
+                if existing_complaint:
+                    self.conn.execute("""
+                        INSERT INTO complaint_email_imports(
+                            message_key, sender_email, subject, action, complaint_id, processed_at
+                        )
+                        VALUES (?, ?, ?, 'IMPORTED', ?, ?)
+                        ON CONFLICT(message_key) DO UPDATE SET
+                            action = 'IMPORTED',
+                            complaint_id = excluded.complaint_id,
+                            processed_at = excluded.processed_at
+                    """, (key, clean_sender_email, clean_subject, existing_complaint[0], now_text))
+                    return False, "ALREADY_IMPORTED", None
+
+                cursor = self.conn.execute("""
+                    INSERT INTO complaints(
+                        user_id, subject, body, status, created_at, updated_at,
+                        source, reporter_name, reporter_email, email_message_id
+                    )
+                    VALUES (?, ?, ?, 'OPEN', ?, ?, 'EMAIL', ?, ?, ?)
+                """, (
+                    resolved_uid,
+                    clean_subject,
+                    clean_body,
+                    created_text,
+                    now_text,
+                    clean_sender_name or None,
+                    clean_sender_email or None,
+                    key,
+                ))
+                complaint_id = cursor.lastrowid
+                self.conn.execute("""
+                    INSERT INTO complaint_email_imports(
+                        message_key, sender_email, subject, action, complaint_id, processed_at
+                    )
+                    VALUES (?, ?, ?, 'IMPORTED', ?, ?)
+                    ON CONFLICT(message_key) DO UPDATE SET
+                        sender_email = excluded.sender_email,
+                        subject = excluded.subject,
+                        action = 'IMPORTED',
+                        complaint_id = excluded.complaint_id,
+                        processed_at = excluded.processed_at
+                """, (key, clean_sender_email, clean_subject, complaint_id, now_text))
+
+                row = self.conn.execute("""
+                    SELECT c.id, c.user_id,
+                        COALESCE(NULLIF(u.full_name, ''), NULLIF(c.reporter_name, ''), ''),
+                        COALESCE(NULLIF(u.email, ''), NULLIF(c.reporter_email, ''), ''),
+                        c.subject, c.body, c.created_at
+                    FROM complaints c
+                    LEFT JOIN users u ON u.id = c.user_id
+                    WHERE c.id = ?
+                """, (complaint_id,)).fetchone()
+            return True, "IMPORTED", row
+        except Exception as exc:
+            logging.exception("Could not import emailed complaint")
+            return False, str(exc), None
+
     def get_complaints(self, status=None):
         try:
             query = """
-                SELECT c.id, c.user_id, COALESCE(u.full_name, ''),
-                    COALESCE(u.email, ''), c.subject, c.body, c.status,
+                SELECT c.id, c.user_id,
+                    COALESCE(NULLIF(u.full_name, ''), NULLIF(c.reporter_name, ''), ''),
+                    COALESCE(NULLIF(u.email, ''), NULLIF(c.reporter_email, ''), ''),
+                    c.subject, c.body, c.status,
                     c.created_at, c.updated_at
                 FROM complaints c
                 LEFT JOIN users u ON u.id = c.user_id
@@ -2178,22 +2910,137 @@ class LocalDatabase:
             logging.exception("Could not fetch library complaints")
             raise
 
-    def update_complaint_status(self, complaint_id, status):
+    def get_complaints_detailed(self, status=None, source=None, search=None):
+        try:
+            query = """
+                SELECT c.id, c.user_id,
+                    COALESCE(NULLIF(u.full_name, ''), NULLIF(c.reporter_name, ''), ''),
+                    COALESCE(NULLIF(u.email, ''), NULLIF(c.reporter_email, ''), ''),
+                    c.subject, c.body, c.status,
+                    c.created_at, c.updated_at,
+                    COALESCE(NULLIF(c.source, ''), 'DESK'),
+                    COALESCE(c.reporter_name, ''),
+                    COALESCE(c.reporter_email, ''),
+                    COALESCE(c.email_message_id, ''),
+                    COALESCE(c.staff_notes, '')
+                FROM complaints c
+                LEFT JOIN users u ON u.id = c.user_id
+            """
+            clauses = []
+            params = []
+            if status and status != "ALL":
+                clauses.append("UPPER(COALESCE(c.status, 'OPEN')) = ?")
+                params.append(self._clean(status).upper())
+            if source and source != "ALL":
+                clauses.append("UPPER(COALESCE(NULLIF(c.source, ''), 'DESK')) = ?")
+                params.append(self._clean(source).upper())
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY c.created_at DESC, c.id DESC"
+            rows = self.conn.execute(query, params).fetchall()
+
+            search_key = self._clean(search).casefold()
+            detailed = []
+            for row in rows:
+                entry = {
+                    "id": int(row[0]),
+                    "user_id": row[1] or "",
+                    "full_name": row[2] or "",
+                    "email": row[3] or "",
+                    "subject": row[4] or "",
+                    "body": row[5] or "",
+                    "status": str(row[6] or "OPEN").upper(),
+                    "created_at": row[7] or "",
+                    "updated_at": row[8] or "",
+                    "source": str(row[9] or "DESK").upper(),
+                    "reporter_name": row[10] or "",
+                    "reporter_email": row[11] or "",
+                    "email_message_id": row[12] or "",
+                    "staff_notes": row[13] or "",
+                }
+                if search_key:
+                    haystack = " ".join(
+                        str(entry.get(k) or "")
+                        for k in (
+                            "id",
+                            "user_id",
+                            "full_name",
+                            "email",
+                            "subject",
+                            "body",
+                            "staff_notes",
+                        )
+                    ).casefold()
+                    if search_key not in haystack:
+                        continue
+                detailed.append(entry)
+            return detailed
+        except sqlite3.Error:
+            logging.exception("Could not fetch detailed library complaints")
+            raise
+
+    def get_complaint_counts(self):
+        counts = {
+            "total": 0,
+            "open": 0,
+            "in_progress": 0,
+            "resolved": 0,
+            "unresolved": 0,
+            "email": 0,
+            "desk": 0,
+        }
+        try:
+            for status, source in self.conn.execute("""
+                SELECT UPPER(COALESCE(status, 'OPEN')),
+                       UPPER(COALESCE(NULLIF(source, ''), 'DESK'))
+                FROM complaints
+            """).fetchall():
+                counts["total"] += 1
+                if status == "RESOLVED":
+                    counts["resolved"] += 1
+                elif status == "IN_PROGRESS":
+                    counts["in_progress"] += 1
+                    counts["unresolved"] += 1
+                else:
+                    counts["open"] += 1
+                    counts["unresolved"] += 1
+                if source == "EMAIL":
+                    counts["email"] += 1
+                else:
+                    counts["desk"] += 1
+        except sqlite3.Error:
+            logging.exception("Could not summarize complaint counts")
+        return counts
+
+    def update_complaint_status(self, complaint_id, status, staff_notes=None):
         normalized_status = self._clean(status).upper()
         if normalized_status not in ("OPEN", "IN_PROGRESS", "RESOLVED"):
             return False, "Invalid complaint status."
 
         try:
+            now_text = datetime.datetime.now().isoformat(timespec="seconds")
             with self._transaction():
-                cursor = self.conn.execute("""
-                    UPDATE complaints
-                    SET status = ?, updated_at = ?
-                    WHERE id = ?
-                """, (
-                    normalized_status,
-                    datetime.datetime.now().isoformat(timespec="seconds"),
-                    int(complaint_id),
-                ))
+                if staff_notes is None:
+                    cursor = self.conn.execute("""
+                        UPDATE complaints
+                        SET status = ?, updated_at = ?
+                        WHERE id = ?
+                    """, (
+                        normalized_status,
+                        now_text,
+                        int(complaint_id),
+                    ))
+                else:
+                    cursor = self.conn.execute("""
+                        UPDATE complaints
+                        SET status = ?, staff_notes = ?, updated_at = ?
+                        WHERE id = ?
+                    """, (
+                        normalized_status,
+                        self._clean(staff_notes) or None,
+                        now_text,
+                        int(complaint_id),
+                    ))
                 if cursor.rowcount == 0:
                     return False, "Complaint not found."
             return True, "Complaint status updated."
@@ -2701,9 +3548,34 @@ class LocalDatabase:
             return False, []
 
     def get_all_user_departments(self, role_filter=None):
-        if self._clean(role_filter).upper() == "STUDENT":
-            return self.get_departments("STUDENT")
-        return self.get_departments("FACULTY")
+        is_student = self._clean(role_filter).upper() == "STUDENT"
+        base = self.get_departments("STUDENT" if is_student else "FACULTY")
+        seen = {d.casefold(): d for d in base}
+        try:
+            if is_student:
+                rows = self.conn.execute(
+                    """
+                    SELECT DISTINCT TRIM(department) FROM users
+                    WHERE LOWER(COALESCE(role, '')) = 'student'
+                      AND TRIM(COALESCE(department, '')) != ''
+                    ORDER BY TRIM(department) COLLATE NOCASE ASC
+                    """
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """
+                    SELECT DISTINCT TRIM(department) FROM users
+                    WHERE TRIM(COALESCE(department, '')) != ''
+                    ORDER BY TRIM(department) COLLATE NOCASE ASC
+                    """
+                ).fetchall()
+            for (dept_name,) in rows:
+                if dept_name and dept_name.casefold() not in seen:
+                    seen[dept_name.casefold()] = dept_name
+                    base.append(dept_name)
+        except sqlite3.Error:
+            pass
+        return base
 
     # IMPORT / EXPORT
     def import_books_batch(self, books_data: list):

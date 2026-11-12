@@ -123,6 +123,9 @@ class MainWindow(QMainWindow):
         self.email_sync_manager.status_changed.connect(
             self.update_email_status
         )
+        self.email_sync_manager.complaints_imported.connect(
+            self._on_emailed_complaints_imported
+        )
         self.email_sync_manager.start()
 
     # ========================================================
@@ -1102,6 +1105,16 @@ class MainWindow(QMainWindow):
         self._sync_status_badge_text()
         self._apply_email_status_style()
 
+    def _on_emailed_complaints_imported(self, count):
+        if hasattr(self, "usermanagement_view") and hasattr(
+            self.usermanagement_view, "update_complaint_badge"
+        ):
+            self.usermanagement_view.update_complaint_badge()
+        if int(count or 0) > 0 and hasattr(self, "status_badge"):
+            self.status_badge.setToolTip(
+                f"{self._last_email_status_message} · Imported {count} new emailed complaint(s)"
+            )
+
     def _apply_email_status_style(self, colors=None):
         colors = colors or self.get_theme_colors()
         message = getattr(self, "_last_email_status_message", "")
@@ -1677,7 +1690,7 @@ class MainWindow(QMainWindow):
             ],
             2: [
                 ("👤", "Add New User", "Register a student or faculty member", "Ctrl+U", "user", self.usermanagement_view.add_user),
-                ("💬", "Complaint Inbox", "Review and resolve member complaints", "", "scan", self.usermanagement_view.open_complaint_inbox),
+                ("💬", "Complaint Inbox", "Review emailed & desk member complaints", "", "scan", self.usermanagement_view.open_complaint_inbox),
             ],
             3: [
                 ("💳", "Pending Fines Desk", "Collect, waive, or review unpaid fines", "", "scan", self.circulation_view.open_fines_desk),
@@ -1689,7 +1702,7 @@ class MainWindow(QMainWindow):
             ],
             5: [
                 ("💾", "Save All Settings", "Persist policies, theme & preferences", "", "book", self.settings_view.save_settings),
-                ("🏛", "Departments", "Manage college branches & courses", "", "history", self.settings_view.open_department_manager),
+                ("🏛", "Departments", "Add, update, reassign & manage branches", "", "history", self.settings_view.open_department_manager),
             ],
         }
 
@@ -2111,6 +2124,10 @@ class MainWindow(QMainWindow):
         self.settings_view = SettingsView(
             self.db
         )
+        if hasattr(self.settings_view, "departments_updated"):
+            self.settings_view.departments_updated.connect(
+                self._on_departments_updated
+            )
 
         # Register pages in navigation order.
 
@@ -2194,6 +2211,23 @@ class MainWindow(QMainWindow):
         if data_stamp is None:
             return None
         return (data_stamp, self._active_theme_stamp())
+
+    def _on_departments_updated(self):
+        loaded_stamps = getattr(self, "_page_loaded_stamps", None)
+        if isinstance(loaded_stamps, dict):
+            for idx in (0, 2, 3, 4):
+                loaded_stamps.pop(idx, None)
+        user_view = getattr(self, "usermanagement_view", None)
+        if user_view is not None:
+            cache = getattr(user_view, "_course_duration_cache", None)
+            if isinstance(cache, dict):
+                cache.clear()
+            loader = getattr(user_view, "load_users_to_table", None)
+            if callable(loader):
+                try:
+                    loader()
+                except Exception as error:
+                    print(f"User view refresh error after department update: {error}")
 
     def refresh_page(self, index, force=True):
 

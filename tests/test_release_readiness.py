@@ -138,11 +138,11 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(app_version.APP_NAME, "Library Management System")
         self.assertEqual(
             app_version.APP_DEVELOPER,
-            "Govt Polytechnic College Masab Tank Hyderabad Students",
+            "Govt Polytechnic College Hyderabad",
         )
         self.assertEqual(
             app_version.APP_DEVELOPER_CREDIT,
-            "Developed by Govt Polytechnic College Masab Tank Hyderabad Students",
+            "Developed by Govt Polytechnic College Hyderabad",
         )
 
         legacy_pattern = re.compile(r"lib" r"[\s_-]*" r"core", re.IGNORECASE)
@@ -169,7 +169,7 @@ class ReleaseReadinessTests(unittest.TestCase):
         iss_text = (REPO_ROOT / "installer_scipt.iss").read_text(encoding="utf-8")
         self.assertIn('#define AppName "Library Management System"', iss_text)
         self.assertIn(
-            '#define AppPublisher "Govt Polytechnic College Masab Tank Hyderabad Students"',
+            '#define AppPublisher "Govt Polytechnic College Hyderabad"',
             iss_text,
         )
         self.assertIn('#define AppExeName "Library.exe"', iss_text)

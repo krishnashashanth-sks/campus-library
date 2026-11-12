@@ -35,6 +35,21 @@ FACULTY_ADDITIONAL_DEPARTMENT_NAMES = tuple(
     name for name, _ in FACULTY_ADDITIONAL_DEPARTMENTS
 )
 
+DEFAULT_BRANCH_CODES = {
+    "CSE (Computer Science & Engineering)": "CS",
+    "ECE (Electronics & Communication)": "EC",
+    "EEE (Electrical & Electronics)": "EE",
+    "Advanced Manufacturing Technology (AMT)": "AMT",
+    "Electrical Engineering and Electric Vehicle Technology": "EEVT",
+    "Interior Design (ID)": "ID",
+    "Civil Engineering": "CE",
+    "Mechanical Engineering": "ME",
+    "Automobile Engineering": "AE",
+    "Pharmacy": "PH",
+    "Sciences & Humanities Department": "SH",
+    "General Administration": "GA",
+}
+
 _STUDENT_DEPARTMENT_ALIASES = {
     name.casefold(): name for name in COLLEGE_BRANCH_NAMES
 }
@@ -55,18 +70,25 @@ def normalize_user_role(role):
     return USER_ROLES.get(str(role or "").strip().casefold())
 
 
-def normalize_department_for_role(department, role):
+def normalize_department_for_role(
+    department,
+    role,
+    student_aliases=None,
+    faculty_aliases=None,
+):
     """Return the canonical college branch/department allowed for a role, or None."""
     key = " ".join(str(department or "").split()).casefold()
     if not key:
         return None
     canonical_role = normalize_user_role(role)
+    s_map = student_aliases if student_aliases is not None else _STUDENT_DEPARTMENT_ALIASES
+    f_map = faculty_aliases if faculty_aliases is not None else _FACULTY_DEPARTMENT_ALIASES
     if canonical_role == "Student":
-        return _STUDENT_DEPARTMENT_ALIASES.get(key)
+        return s_map.get(key)
     if canonical_role in ("Faculty", "Guest Lecturer"):
-        return _FACULTY_DEPARTMENT_ALIASES.get(key)
+        return f_map.get(key)
     if canonical_role in ("Admin", "Librarian"):
-        return _FACULTY_DEPARTMENT_ALIASES.get(key, "General Administration")
+        return f_map.get(key, "General Administration")
     return None
 
 

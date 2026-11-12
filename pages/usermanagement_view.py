@@ -951,6 +951,34 @@ class UserManagementView(QWidget):
         header_actions.setContentsMargins(0, 0, 0, 0)
         header_actions.setSpacing(8)
 
+        self.complaint_inbox_btn = QPushButton("Complaint Inbox")
+        self.complaint_inbox_btn.setObjectName("InfoButton")
+        self.complaint_inbox_btn.setMinimumHeight(32)
+        self.complaint_inbox_btn.setToolTip(
+            "View walk-in and emailed student complaints, fetch from Gmail, and reply"
+        )
+        self.complaint_inbox_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.complaint_inbox_btn.clicked.connect(
+            self.open_complaint_inbox
+        )
+        header_actions.addWidget(self.complaint_inbox_btn)
+
+        self.complaint_btn = QPushButton("+ Complaint")
+        self.complaint_btn.setObjectName("WarningButton")
+        self.complaint_btn.setMinimumHeight(32)
+        self.complaint_btn.setToolTip(
+            "Record a new walk-in or desk library complaint"
+        )
+        self.complaint_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.complaint_btn.clicked.connect(
+            lambda: self.open_complaint_dialog()
+        )
+        header_actions.addWidget(self.complaint_btn)
+
         self.refresh_btn = QPushButton("↻ Refresh")
         self.refresh_btn.setObjectName("SecondaryButton")
         self.refresh_btn.setMinimumHeight(32)
@@ -1199,7 +1227,7 @@ class UserManagementView(QWidget):
                 self.main_layout.setContentsMargins(16, 10, 16, 40)
                 self.main_layout.setSpacing(8)
 
-        self._reflow_header(avail_w < 640)
+        self._reflow_header(avail_w < 920)
         self._reflow_toolbar(avail_w < 880)
 
         columns = (
@@ -1594,22 +1622,6 @@ class UserManagementView(QWidget):
             self.export_users_to_csv
         )
 
-        self.complaint_btn = QPushButton("New Complaint", self)
-        self.complaint_btn.setObjectName("WarningButton")
-        self.complaint_btn.setMinimumHeight(32)
-        self.complaint_btn.clicked.connect(
-            self.open_complaint_dialog
-        )
-        self.complaint_btn.hide()
-
-        self.complaint_inbox_btn = QPushButton("Complaint Inbox", self)
-        self.complaint_inbox_btn.setObjectName("InfoButton")
-        self.complaint_inbox_btn.setMinimumHeight(32)
-        self.complaint_inbox_btn.clicked.connect(
-            self.open_complaint_inbox
-        )
-        self.complaint_inbox_btn.hide()
-
         self.add_btn = QPushButton("+ Add New User")
         self.add_btn.setObjectName("PrimaryButton")
         self.add_btn.setMinimumHeight(32)
@@ -1621,8 +1633,6 @@ class UserManagementView(QWidget):
         for button in (
             self.import_btn,
             self.export_btn,
-            self.complaint_btn,
-            self.complaint_inbox_btn,
             self.add_btn,
         ):
 
@@ -1787,6 +1797,7 @@ class UserManagementView(QWidget):
             self.all_users = list(rows or [])
 
             self.update_statistics()
+            self.update_complaint_badge()
             self.update_branch_dropdown()
             self.apply_filters()
 
@@ -2683,6 +2694,11 @@ class UserManagementView(QWidget):
                 lambda: self.send_custom_email(user[0]),
                 "InfoButton",
             ),
+            (
+                "Record Complaint",
+                lambda: self.open_complaint_dialog(initial_user_id=user[0]),
+                "WarningButton",
+            ),
         ]
         if unpaid_fines > 0:
             actions.append((
@@ -3005,10 +3021,30 @@ class UserManagementView(QWidget):
         dialog.exec()
         self.load_users_to_table()
 
-    def open_complaint_dialog(self):
+    def update_complaint_badge(self):
+        if not hasattr(self, "complaint_inbox_btn"):
+            return
         try:
-            dialog = ComplaintDialog(self.db, self)
+            counts = self.db.get_complaint_counts()
+            unresolved = int(counts.get("unresolved") or 0)
+        except Exception:
+            unresolved = 0
+        if unresolved > 0:
+            self.complaint_inbox_btn.setText(
+                f"Complaints ({unresolved})"
+            )
+        else:
+            self.complaint_inbox_btn.setText("Complaint Inbox")
+
+    def open_complaint_dialog(self, initial_user_id=None):
+        try:
+            dialog = ComplaintDialog(
+                self.db,
+                self,
+                initial_user_id=initial_user_id,
+            )
             dialog.exec()
+            self.update_complaint_badge()
         except Exception as error:
             QMessageBox.critical(
                 self,
@@ -3019,6 +3055,7 @@ class UserManagementView(QWidget):
     def open_complaint_inbox(self):
         dialog = ComplaintManagementDialog(self.db, self)
         dialog.exec()
+        self.update_complaint_badge()
 
     # ========================================================
     # CSV / XLSX IMPORT
@@ -3309,22 +3346,26 @@ class UserManagementView(QWidget):
                     )
                     continue
 
-                canonical_department = normalize_department_for_role(
-                    department,
-                    role,
-                )
+                if hasattr(self.db, "normalize_department_for_role"):
+                    canonical_department = self.db.normalize_department_for_role(
+                        department,
+                        role,
+                    )
+                else:
+                    canonical_department = normalize_department_for_role(
+                        department,
+                        role,
+                    )
                 if role == "Student" and not canonical_department:
                     errors.append(
                         f"Line {line_number}: Students must be assigned an "
-                        "official college branch (not Sciences & Humanities "
-                        "or General Administration)."
+                        "active college branch (not a faculty-only department)."
                     )
                     continue
                 if role in ("Faculty", "Guest Lecturer") and not canonical_department:
                     errors.append(
-                        f"Line {line_number}: {role} must be assigned a "
-                        "college branch, Sciences & Humanities Department, "
-                        "or General Administration."
+                        f"Line {line_number}: {role} must be assigned an "
+                        "active college branch or faculty department."
                     )
                     continue
                 department = canonical_department or "General Administration"
@@ -3622,9 +3663,9 @@ class UserManagementView(QWidget):
             )
             menu.addSeparator()
             delete_action = menu.addAction("Delete Selected Users")
-            view_action = edit_action = email_action = None
+            view_action = edit_action = email_action = complaint_action = None
         else:
-            issue_action = return_action = None
+            issue_action = return_action = complaint_action = None
             view_action = menu.addAction(
                 "View Assigned Books"
             )
@@ -3634,6 +3675,9 @@ class UserManagementView(QWidget):
             )
             email_action = menu.addAction(
                 "Send Custom Email"
+            )
+            complaint_action = menu.addAction(
+                "Record Complaint"
             )
 
             menu.addSeparator()
@@ -3662,6 +3706,10 @@ class UserManagementView(QWidget):
         elif action == email_action:
 
             self.send_custom_email(user_id)
+
+        elif action == complaint_action:
+
+            self.open_complaint_dialog(initial_user_id=user_id)
 
         elif action == issue_action:
 

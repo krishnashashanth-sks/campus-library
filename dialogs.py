@@ -5,6 +5,7 @@ import io
 import os
 import re
 import secrets
+import threading
 import cv2
 import barcode
 
@@ -22,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from PyQt6.QtCore import (
-    pyqtSignal, Qt, QTimer, QRegularExpression, QUrl
+    pyqtSignal, Qt, QTimer, QRegularExpression, QThreadPool, QUrl
 )
 
 from PyQt6.QtGui import (
@@ -583,23 +584,46 @@ class BookDialog(QDialog):
 
 class ComplaintDialog(QDialog):
 
-    def __init__(self, db, parent=None):
+    def __init__(
+        self,
+        db,
+        parent=None,
+        initial_user_id=None,
+        initial_subject="",
+        initial_body="",
+    ):
         super().__init__(parent)
         self.db = db
+        self._initial_user_id = str(initial_user_id or "").strip()
 
         configure_dialog(
             self,
             "Record Library Complaint",
-            560,
-            480,
-            min_width=400,
-            min_height=340,
+            590,
+            520,
+            min_width=410,
+            min_height=350,
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(10)
         layout.addWidget(create_heading("New library complaint"))
+
+        hint = QLabel(
+            "Record a walk-in or desk complaint, or log one on a member's behalf. "
+            "Students can also email complaints directly to the library Gmail."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        success, users = self.db.get_users()
+        if not success:
+            raise RuntimeError("Unable to load users for the complaint form.")
+        self._all_users = [
+            (str(u[0] or ""), str(u[1] or ""), str(u[6] or "") if len(u) > 6 else "")
+            for u in users
+        ]
 
         form_host = QWidget()
         form_host_layout = QVBoxLayout(form_host)
@@ -607,32 +631,35 @@ class ComplaintDialog(QDialog):
         form = QFormLayout()
         configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=10)
 
+        self.user_filter_input = QLineEdit()
+        self.user_filter_input.setClearButtonEnabled(True)
+        self.user_filter_input.setPlaceholderText(
+            "Filter member by Roll No, name, or email..."
+        )
+        self.user_filter_input.textChanged.connect(self._populate_user_combo)
+
         self.user_combo = QComboBox()
         self.user_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.user_combo.setMinimumContentsLength(16)
-        self.user_combo.addItem("General / anonymous", "")
-
-        success, users = self.db.get_users()
-        if not success:
-            raise RuntimeError("Unable to load users for the complaint form.")
-        for user in users:
-            self.user_combo.addItem(
-                f"{user[1]} ({user[0]})",
-                str(user[0]),
-            )
+        self._populate_user_combo("")
 
         self.subject_input = QLineEdit()
         self.subject_input.setMaxLength(160)
         self.subject_input.setPlaceholderText("Short summary")
+        if initial_subject:
+            self.subject_input.setText(str(initial_subject))
 
         self.body_input = QPlainTextEdit()
         self.body_input.setPlaceholderText(
             "Describe the issue, suggestion, or complaint..."
         )
         self.body_input.setMinimumHeight(120)
+        if initial_body:
+            self.body_input.setPlainText(str(initial_body))
 
+        form.addRow("Find Member:", self.user_filter_input)
         form.addRow("User:", self.user_combo)
         form.addRow("Subject:", self.subject_input)
         form.addRow("Details:", self.body_input)
@@ -646,6 +673,28 @@ class ComplaintDialog(QDialog):
             create_button("Submit Complaint", self.submit_complaint, variant="PrimaryButton")
         )
         layout.addLayout(buttons)
+
+    def _populate_user_combo(self, query=""):
+        current_selected = self.user_combo.currentData()
+        target_uid = (
+            str(current_selected).strip()
+            if current_selected
+            else self._initial_user_id
+        )
+        q = str(query or "").strip().casefold()
+        self.user_combo.blockSignals(True)
+        self.user_combo.clear()
+        self.user_combo.addItem("General / anonymous", "")
+        matched_index = 0
+        for uid, name, email in self._all_users:
+            if q and q not in uid.casefold() and q not in name.casefold() and q not in email.casefold():
+                continue
+            label = f"{name} ({uid})" if name else uid
+            self.user_combo.addItem(label, uid)
+            if target_uid and uid.casefold() == target_uid.casefold():
+                matched_index = self.user_combo.count() - 1
+        self.user_combo.setCurrentIndex(matched_index)
+        self.user_combo.blockSignals(False)
 
     def submit_complaint(self):
         user_id = self.user_combo.currentData()
@@ -664,6 +713,7 @@ class ComplaintDialog(QDialog):
             user_id,
             subject,
             body,
+            source="DESK",
         )
         if not success:
             show_error(self, "Complaint Not Saved", complaint)
@@ -685,6 +735,13 @@ class ComplaintDialog(QDialog):
             self.accept()
             return
 
+        app = QApplication.instance()
+        sync_manager = (
+            getattr(app, "email_sync_manager", None) if app else None
+        )
+        if sync_manager:
+            sync_manager.sync_now()
+
         show_success(
             self,
             "Complaint Submitted",
@@ -694,30 +751,467 @@ class ComplaintDialog(QDialog):
         self.accept()
 
 
+class GmailComplaintReviewDialog(QDialog):
+    complaint_imported = pyqtSignal(int)
+
+    def __init__(self, db, parent=None, prefetched_messages=None):
+        super().__init__(parent)
+        self.db = db
+        self.messages = list(prefetched_messages or [])
+        self._visible_messages = []
+        self._closing = False
+        self._stop_event = threading.Event()
+        self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(1)
+        self._active_worker = None
+        self._users = []
+        try:
+            ok, users = self.db.get_users()
+            if ok and users:
+                self._users = [
+                    (str(u[0] or ""), str(u[1] or ""), str(u[6] or "") if len(u) > 6 else "")
+                    for u in users
+                ]
+        except Exception:
+            self._users = []
+
+        configure_dialog(
+            self,
+            "Review Gmail Inbox Complaints",
+            960,
+            640,
+            min_width=460,
+            min_height=360,
+        )
+
+        c = get_dialog_colors(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(create_heading("Review Gmail inbox for student complaints"))
+
+        self.status_banner = QLabel(
+            "Inspect recent inbox emails and import missed student complaints or ignore unrelated emails."
+        )
+        self.status_banner.setWordWrap(True)
+        self.status_banner.setStyleSheet(
+            f"background: {c['cyan_soft']}; color: {c['text']}; "
+            f"border: 1px solid {c['cyan']}; border-left: 4px solid {c['cyan']}; "
+            "border-radius: 7px; padding: 7px 10px; font-weight: 600;"
+        )
+        layout.addWidget(self.status_banner)
+
+        filter_host = QWidget()
+        filter_flow = FlowLayout(filter_host, margin=0, h_spacing=8, v_spacing=6)
+        self.search_input = QLineEdit()
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMinimumWidth(250)
+        self.search_input.setPlaceholderText("Search sender, subject, or body...")
+        self.search_input.textChanged.connect(self._render_messages)
+        self.hide_processed_checkbox = QCheckBox("Hide already imported / ignored")
+        self.hide_processed_checkbox.setChecked(True)
+        self.hide_processed_checkbox.toggled.connect(self._render_messages)
+        self.hide_automated_checkbox = QCheckBox("Hide automated / alerts")
+        self.hide_automated_checkbox.setChecked(True)
+        self.hide_automated_checkbox.toggled.connect(self._render_messages)
+        filter_flow.addWidget(self.search_input)
+        filter_flow.addWidget(self.hide_processed_checkbox)
+        filter_flow.addWidget(self.hide_automated_checkbox)
+        layout.addWidget(filter_host)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels([
+            "From", "Subject", "Rule / Match", "State", "Received",
+        ])
+        configure_table(self.table)
+        self.table.setMinimumHeight(140)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        self.table.setColumnWidth(0, 180)
+        self.table.setColumnWidth(2, 200)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        layout.addWidget(self.table, 1)
+
+        self.preview_box = QPlainTextEdit()
+        self.preview_box.setReadOnly(True)
+        self.preview_box.setMaximumHeight(130)
+        self.preview_box.setPlaceholderText("Select an email to inspect its sender and message content.")
+        layout.addWidget(self.preview_box)
+
+        assign_host = QWidget()
+        assign_flow = FlowLayout(assign_host, margin=0, h_spacing=8, v_spacing=6)
+        assign_lbl = QLabel("Link to member:")
+        assign_lbl.setStyleSheet("font-weight: 600;")
+        self.assign_user_combo = QComboBox()
+        self.assign_user_combo.setMinimumWidth(240)
+        self.assign_user_combo.addItem("General / External Email Sender", "")
+        for uid, name, _email in self._users:
+            self.assign_user_combo.addItem(f"{name} ({uid})" if name else uid, uid)
+        assign_flow.addWidget(assign_lbl)
+        assign_flow.addWidget(self.assign_user_combo)
+        layout.addWidget(assign_host)
+
+        actions_host = QWidget()
+        actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
+        self.refresh_btn = create_button(
+            "↻ Refresh Gmail",
+            self.refresh_from_gmail,
+            variant="InfoButton",
+        )
+        self.import_btn = create_button(
+            "Import as Complaint",
+            self.import_selected_message,
+            variant="PrimaryButton",
+        )
+        self.ignore_btn = create_button(
+            "Ignore Email",
+            self.ignore_selected_message,
+            variant="WarningButton",
+        )
+        close_btn = create_button("Close", self.accept, variant="SecondaryButton")
+        actions.addWidget(self.refresh_btn)
+        actions.addWidget(self.import_btn)
+        actions.addWidget(self.ignore_btn)
+        actions.addWidget(close_btn)
+        layout.addWidget(actions_host)
+
+        self.import_btn.setEnabled(False)
+        self.ignore_btn.setEnabled(False)
+
+        if prefetched_messages is not None:
+            self._render_messages()
+        else:
+            QTimer.singleShot(0, self.refresh_from_gmail)
+
+    def _stop_workers(self):
+        self._closing = True
+        self._stop_event.set()
+        self._thread_pool.waitForDone(1500)
+
+    def done(self, result):
+        self._stop_workers()
+        super().done(result)
+
+    def closeEvent(self, event):
+        self._stop_workers()
+        super().closeEvent(event)
+
+    def refresh_from_gmail(self):
+        if self._closing or self._active_worker is not None:
+            return
+        from email_queue import ComplaintImapInboxWorker
+        from email_service import LibraryEmailService
+
+        if not LibraryEmailService(self.db).is_configured():
+            self.status_banner.setText(
+                "Configure Gmail sender and App Password in Settings -> Email & Updates first."
+            )
+            return
+
+        self.refresh_btn.setEnabled(False)
+        self.status_banner.setText("Checking Gmail INBOX for recent emails...")
+        worker = ComplaintImapInboxWorker(
+            self.db.database_path,
+            limit=40,
+            lookback_days=14,
+            stop_event=self._stop_event,
+        )
+        worker.signals.finished.connect(self._on_gmail_fetched)
+        self._active_worker = worker
+        self._thread_pool.start(worker)
+
+    def _on_gmail_fetched(self, payload):
+        self._active_worker = None
+        if self._closing or sip.isdeleted(self):
+            return
+        self.refresh_btn.setEnabled(True)
+        if not payload.get("ok"):
+            err = payload.get("error") or "Unable to connect to Gmail IMAP."
+            self.status_banner.setText(f"Gmail check failed: {err}")
+            return
+        self.messages = list(payload.get("messages") or [])
+        self.status_banner.setText(
+            f"Loaded {len(self.messages)} recent Gmail inbox email(s) from the last 14 days."
+        )
+        self._render_messages()
+
+    def _render_messages(self):
+        c = get_dialog_colors(self)
+        query = self.search_input.text().strip().casefold()
+        hide_processed = self.hide_processed_checkbox.isChecked()
+        hide_auto = self.hide_automated_checkbox.isChecked()
+
+        visible = []
+        for msg in reversed(self.messages):
+            imp_status = str(msg.get("import_status") or "").upper()
+            if hide_processed and imp_status in ("IMPORTED", "IGNORED"):
+                continue
+            if hide_auto and msg.get("is_automated"):
+                continue
+            if query:
+                hay = " ".join(
+                    str(msg.get(k) or "")
+                    for k in ("sender_name", "sender_email", "subject", "body", "matched_user_id")
+                ).casefold()
+                if query not in hay:
+                    continue
+            visible.append(msg)
+
+        self._visible_messages = visible
+        self.table.setRowCount(len(visible))
+        for row_idx, msg in enumerate(visible):
+            imp_status = str(msg.get("import_status") or "").upper()
+            if imp_status == "IMPORTED":
+                cid = msg.get("complaint_id")
+                state_text = f"Imported (#{cid})" if cid else "Imported"
+                state_key = "success"
+            elif imp_status == "IGNORED":
+                state_text = "Ignored"
+                state_key = "muted"
+            elif msg.get("is_automated"):
+                state_text = "Automated"
+                state_key = "muted"
+            elif msg.get("matches_filter"):
+                state_text = "Ready"
+                state_key = "cyan"
+            else:
+                state_text = "Unfiltered"
+                state_key = "warning"
+
+            sender_lbl = msg.get("sender_name") or msg.get("sender_email") or "Unknown"
+            if msg.get("matched_user_id"):
+                sender_lbl = f"{sender_lbl} [{msg['matched_user_id']}]"
+
+            row_vals = (
+                sender_lbl,
+                msg.get("subject") or "(No Subject)",
+                msg.get("filter_reason") or msg.get("match_reason") or "",
+                state_text,
+                msg.get("received_at") or "",
+            )
+            for col_idx, val in enumerate(row_vals):
+                item = QTableWidgetItem(str(val or ""))
+                item.setData(Qt.ItemDataRole.UserRole, row_idx)
+                if col_idx == 3:
+                    item.setForeground(QColor(c[state_key]))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                self.table.setItem(row_idx, col_idx, item)
+
+        if visible:
+            self.table.selectRow(0)
+        else:
+            self.preview_box.setPlainText(
+                "No matching inbox emails to review."
+                if self.messages
+                else "No recent Gmail inbox emails loaded yet. Click 'Refresh Gmail' to fetch."
+            )
+            self.import_btn.setEnabled(False)
+            self.ignore_btn.setEnabled(False)
+
+    def _current_message(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        row_idx = rows[0].row()
+        if 0 <= row_idx < len(self._visible_messages):
+            return self._visible_messages[row_idx]
+        return None
+
+    def _on_selection_changed(self):
+        msg = self._current_message()
+        if not msg:
+            self.import_btn.setEnabled(False)
+            self.ignore_btn.setEnabled(False)
+            return
+
+        imp_status = str(msg.get("import_status") or "").upper()
+        matched_uid = str(msg.get("matched_user_id") or "")
+        combo_idx = self.assign_user_combo.findData(matched_uid)
+        self.assign_user_combo.setCurrentIndex(combo_idx if combo_idx >= 0 else 0)
+
+        self.preview_box.setPlainText(
+            f"From: {msg.get('sender_name') or ''} <{msg.get('sender_email') or 'unknown'}>\n"
+            f"Match: {msg.get('match_reason') or 'External'} | "
+            f"Filter: {msg.get('filter_reason') or ''}\n\n"
+            f"{msg.get('body') or '(Empty message)'}"
+        )
+        self.import_btn.setEnabled(imp_status != "IMPORTED")
+        self.ignore_btn.setEnabled(imp_status != "IMPORTED")
+
+    def import_selected_message(self):
+        msg = self._current_message()
+        if not msg:
+            return
+        selected_uid = str(self.assign_user_combo.currentData() or "").strip() or None
+        ok, status_code, complaint_row = self.db.import_emailed_complaint(
+            message_key=msg["message_key"],
+            sender_email=msg.get("sender_email") or "",
+            sender_name=msg.get("sender_name") or "",
+            subject=msg.get("subject") or "(No Subject)",
+            body=msg.get("body") or "(Empty message)",
+            user_id=selected_uid,
+            received_at=msg.get("received_at"),
+            allow_if_ignored=True,
+        )
+        if not ok:
+            if status_code == "ALREADY_IMPORTED":
+                msg["import_status"] = "IMPORTED"
+                self._render_messages()
+                return
+            show_error(self, "Import Failed", status_code)
+            return
+
+        msg["import_status"] = "IMPORTED"
+        msg["complaint_id"] = complaint_row[0]
+        msg["matched_user_id"] = selected_uid or ""
+
+        auto_reply = str(
+            self.db.get_setting("email_complaint_auto_reply", "1")
+        ).casefold() in ("1", "true", "yes")
+        if auto_reply:
+            try:
+                from email_service import LibraryEmailService
+
+                LibraryEmailService(self.db).send_complaint_receipt(
+                    complaint_row,
+                    require_staff_email=False,
+                    notify_staff=True,
+                )
+            except Exception as error:
+                show_warning(
+                    self,
+                    "Imported; Receipt Not Queued",
+                    f"Complaint #{complaint_row[0]} was imported, but the confirmation email could not be queued:\n\n{error}",
+                )
+
+        app = QApplication.instance()
+        sync_manager = getattr(app, "email_sync_manager", None) if app else None
+        if sync_manager:
+            sync_manager.sync_now()
+
+        self.complaint_imported.emit(int(complaint_row[0]))
+        self.status_banner.setText(
+            f"Imported email as Complaint #{complaint_row[0]}."
+        )
+        self._render_messages()
+
+    def ignore_selected_message(self):
+        msg = self._current_message()
+        if not msg:
+            return
+        if self.db.mark_email_complaint_ignored(
+            msg["message_key"],
+            msg.get("sender_email") or "",
+            msg.get("subject") or "",
+        ):
+            msg["import_status"] = "IGNORED"
+            self.status_banner.setText("Marked selected email as ignored.")
+            self._render_messages()
+
+
 class ComplaintManagementDialog(QDialog):
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
         self.complaints = []
+        self._closing = False
+        self._stop_event = threading.Event()
+        self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(1)
+        self._imap_sync_worker = None
         configure_dialog(
             self,
             "Library Complaints",
-            900,
-            600,
-            min_width=460,
-            min_height=360,
+            980,
+            660,
+            min_width=520,
+            min_height=380,
         )
 
+        c = get_dialog_colors(self)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setContentsMargins(18, 16, 18, 14)
         layout.setSpacing(10)
         layout.addWidget(create_heading("Complaint inbox"))
 
+        summary_host = QWidget()
+        summary_flow = FlowLayout(summary_host, margin=0, h_spacing=8, v_spacing=6)
+        self.summary_badge = QLabel()
+        self.summary_badge.setStyleSheet(
+            f"background: {c['primary_soft']}; color: {c['primary']}; "
+            f"border: 1px solid {c['primary']}; border-radius: 10px; "
+            "padding: 4px 10px; font-weight: 700; font-size: 11px;"
+        )
+        self.new_complaint_button = create_button(
+            "+ New Complaint",
+            self.open_new_complaint,
+            variant="SuccessButton",
+        )
+        self.fetch_gmail_button = create_button(
+            "↻ Fetch Gmail",
+            self.fetch_emailed_complaints,
+            variant="InfoButton",
+        )
+        self.review_gmail_button = create_button(
+            "Review Gmail Inbox...",
+            self.open_gmail_review_dialog,
+            variant="SecondaryButton",
+        )
+        summary_flow.addWidget(self.summary_badge)
+        summary_flow.addWidget(self.new_complaint_button)
+        summary_flow.addWidget(self.fetch_gmail_button)
+        summary_flow.addWidget(self.review_gmail_button)
+        layout.addWidget(summary_host)
+
+        self.imap_status_banner = QLabel()
+        self.imap_status_banner.setWordWrap(True)
+        self.imap_status_banner.setStyleSheet(
+            f"color: {c['muted']}; font-size: 11px; font-weight: 600;"
+        )
+        layout.addWidget(self.imap_status_banner)
+
+        filters_host = QWidget()
+        filters = FlowLayout(filters_host, margin=0, h_spacing=8, v_spacing=6)
+        filters.addWidget(QLabel("Status:"))
+        self.filter_status_combo = QComboBox()
+        self.filter_status_combo.addItem("All", "ALL")
+        self.filter_status_combo.addItem("Open", "OPEN")
+        self.filter_status_combo.addItem("In Progress", "IN_PROGRESS")
+        self.filter_status_combo.addItem("Resolved", "RESOLVED")
+        self.filter_status_combo.currentIndexChanged.connect(self.load_complaints)
+        filters.addWidget(self.filter_status_combo)
+
+        filters.addWidget(QLabel("Source:"))
+        self.filter_source_combo = QComboBox()
+        self.filter_source_combo.addItem("All Sources", "ALL")
+        self.filter_source_combo.addItem("From Email", "EMAIL")
+        self.filter_source_combo.addItem("At Desk", "DESK")
+        self.filter_source_combo.currentIndexChanged.connect(self.load_complaints)
+        filters.addWidget(self.filter_source_combo)
+
+        self.search_input = QLineEdit()
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMinimumWidth(260)
+        self.search_input.setPlaceholderText(
+            "Search #ID, student, email, or subject..."
+        )
+        self.search_input.textChanged.connect(self.load_complaints)
+        filters.addWidget(self.search_input)
+        layout.addWidget(filters_host)
+
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            "ID", "User", "Subject", "Status", "Received",
+            "ID", "Source", "Member / Sender", "Subject", "Status", "Received",
         ])
         configure_table(self.table)
         self.table.setMinimumHeight(140)
@@ -726,7 +1220,10 @@ class ComplaintManagementDialog(QDialog):
         )
         c_header = self.table.horizontalHeader()
         c_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        c_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        c_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        c_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        c_header.setStretchLastSection(False)
+        self.table.setColumnWidth(2, 215)
         self.table.itemSelectionChanged.connect(
             self.show_selected_complaint
         )
@@ -734,11 +1231,27 @@ class ComplaintManagementDialog(QDialog):
 
         self.body_view = QPlainTextEdit()
         self.body_view.setReadOnly(True)
-        self.body_view.setMaximumHeight(110)
+        self.body_view.setMaximumHeight(115)
         layout.addWidget(self.body_view)
 
+        notes_host = QWidget()
+        notes_layout = QHBoxLayout(notes_host)
+        notes_layout.setContentsMargins(0, 0, 0, 0)
+        notes_layout.setSpacing(8)
+        notes_lbl = QLabel("Staff Notes:")
+        notes_lbl.setStyleSheet("font-weight: 600;")
+        self.staff_notes_input = QLineEdit()
+        self.staff_notes_input.setPlaceholderText(
+            "Optional action taken, fine adjustment note, or follow-up details..."
+        )
+        notes_layout.addWidget(notes_lbl)
+        notes_layout.addWidget(self.staff_notes_input, 1)
+        layout.addWidget(notes_host)
+
         actions_host = QWidget()
-        actions = FlowLayout(actions_host, margin=0, h_spacing=8, v_spacing=6)
+        actions = QHBoxLayout(actions_host)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
         self.status_combo = QComboBox()
         self.status_combo.addItem("Open", "OPEN")
         self.status_combo.addItem("In Progress", "IN_PROGRESS")
@@ -748,48 +1261,128 @@ class ComplaintManagementDialog(QDialog):
             self.update_status,
             variant="PrimaryButton",
         )
+        self.reply_email_button = create_button(
+            "Reply by Email",
+            self.reply_to_selected_complaint,
+            variant="InfoButton",
+        )
         close_button = create_button("Close", self.accept, variant="SecondaryButton")
         actions.addWidget(self.status_combo)
         actions.addWidget(self.update_status_button)
+        actions.addWidget(self.reply_email_button)
+        actions.addStretch(1)
         actions.addWidget(close_button)
         layout.addWidget(actions_host)
+
+        self._refresh_imap_banner()
         self.load_complaints()
 
+    def _stop_workers(self):
+        self._closing = True
+        self._stop_event.set()
+        self._thread_pool.waitForDone(1500)
+
+    def done(self, result):
+        self._stop_workers()
+        super().done(result)
+
+    def closeEvent(self, event):
+        self._stop_workers()
+        super().closeEvent(event)
+
+    def _refresh_imap_banner(self, override_text=None):
+        if override_text:
+            self.imap_status_banner.setText(override_text)
+            return
+        from email_service import LibraryEmailService
+
+        svc = LibraryEmailService(self.db)
+        sender = str(self.db.get_setting("email_sender", "")).strip()
+        if svc.is_configured():
+            auto_on = str(
+                self.db.get_setting("email_complaint_import_enabled", "1")
+            ).casefold() in ("1", "true", "yes")
+            mode = str(
+                self.db.get_setting("email_complaint_filter_mode", "keywords")
+            ).strip()
+            mode_lbl = "Smart Filter" if mode != "all" else "All Inbox Emails"
+            self.imap_status_banner.setText(
+                f"Gmail intake ({sender}): {'Auto-sync ON' if auto_on else 'Manual sync'} · {mode_lbl}"
+            )
+            self.fetch_gmail_button.setEnabled(True)
+            self.review_gmail_button.setEnabled(True)
+        else:
+            self.imap_status_banner.setText(
+                "Configure Gmail sender & App Password in Settings -> Email & Updates to fetch student complaint emails."
+            )
+            self.fetch_gmail_button.setEnabled(False)
+            self.review_gmail_button.setEnabled(False)
+
     def load_complaints(self):
+        selected_id = self._selected_complaint_id()
         try:
-            self.complaints = self.db.get_complaints()
+            self.complaints = self.db.get_complaints_detailed(
+                status=self.filter_status_combo.currentData(),
+                source=self.filter_source_combo.currentData(),
+                search=self.search_input.text().strip(),
+            )
+            counts = self.db.get_complaint_counts()
         except Exception as error:
             show_error(self, "Complaint Loading Error", error)
             return
 
+        self.summary_badge.setText(
+            f"{counts['open']} Open · {counts['in_progress']} In Progress · "
+            f"{counts['resolved']} Resolved · {counts['email']} From Email"
+        )
+
         c = get_dialog_colors(self)
         self.table.setRowCount(len(self.complaints))
+        target_row = 0
         for row_index, complaint in enumerate(self.complaints):
-            user_label = (
-                f"{complaint[2]} ({complaint[1]})"
-                if complaint[1]
-                else "General / anonymous"
-            )
-            raw_status = str(complaint[6] or "").upper()
+            cid = int(complaint["id"])
+            if selected_id is not None and cid == selected_id:
+                target_row = row_index
+            uid = complaint["user_id"]
+            name = complaint["full_name"]
+            email_addr = complaint["email"]
+            if uid and name:
+                user_label = f"{name} ({uid})"
+            elif uid:
+                user_label = uid
+            elif name and email_addr and name.casefold() != email_addr.casefold():
+                user_label = f"{name} <{email_addr}>"
+            elif email_addr or name:
+                user_label = email_addr or name
+            else:
+                user_label = "General / anonymous"
+
+            raw_status = complaint["status"]
+            source_text = "Email" if complaint["source"] == "EMAIL" else "Desk"
             values = (
-                complaint[0],
+                f"#{cid}",
+                source_text,
                 user_label,
-                complaint[4],
-                complaint[6].replace("_", " ").title(),
-                complaint[7],
+                complaint["subject"],
+                raw_status.replace("_", " ").title(),
+                complaint["created_at"],
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value or ""))
-                item.setData(
-                    Qt.ItemDataRole.UserRole,
-                    int(complaint[0]),
-                )
+                item.setData(Qt.ItemDataRole.UserRole, cid)
                 if column == 0:
                     item.setForeground(QColor(c["primary"]))
                     f = item.font()
                     f.setBold(True)
                     item.setFont(f)
-                elif column == 3:
+                elif column == 1:
+                    item.setForeground(
+                        QColor(c["cyan"] if source_text == "Email" else c["muted"])
+                    )
+                    f = item.font()
+                    f.setBold(source_text == "Email")
+                    item.setFont(f)
+                elif column == 4:
                     color_key = (
                         "success"
                         if raw_status == "RESOLVED"
@@ -804,43 +1397,57 @@ class ComplaintManagementDialog(QDialog):
                 self.table.setItem(row_index, column, item)
 
         if self.complaints:
-            self.table.selectRow(0)
+            self.table.selectRow(target_row)
+            self.show_selected_complaint()
         else:
-            self.body_view.setPlainText("No complaints have been recorded.")
+            self.body_view.setPlainText("No complaints match the current filter.")
+            self.staff_notes_input.clear()
+            self.staff_notes_input.setEnabled(False)
             self.update_status_button.setEnabled(False)
+            self.reply_email_button.setEnabled(False)
 
-    def show_selected_complaint(self):
+    def _selected_complaint_id(self):
+        if not hasattr(self, "table"):
+            return None
         rows = self.table.selectionModel().selectedRows()
         if not rows:
-            return
+            return None
+        item = self.table.item(rows[0].row(), 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
 
-        complaint_id = self.table.item(
-            rows[0].row(),
-            0,
-        ).data(Qt.ItemDataRole.UserRole)
-        complaint = next(
-            (
-                item for item in self.complaints
-                if int(item[0]) == complaint_id
-            ),
+    def _selected_complaint(self):
+        complaint_id = self._selected_complaint_id()
+        if complaint_id is None:
+            return None
+        return next(
+            (item for item in self.complaints if int(item["id"]) == int(complaint_id)),
             None,
         )
+
+    def show_selected_complaint(self):
+        complaint = self._selected_complaint()
         if not complaint:
             return
 
+        source_label = "Emailed to Library Gmail" if complaint["source"] == "EMAIL" else "Recorded at Desk"
+        member_tag = complaint["user_id"] or "Unmatched / Anonymous"
+        sender_display = complaint["full_name"] or complaint["reporter_name"] or "Not specified"
         self.body_view.setPlainText(
-            f"From: {complaint[2]} ({complaint[1] or 'anonymous'})\n"
-            f"Email: {complaint[3] or 'Not provided'}\n\n"
-            f"{complaint[5]}"
+            f"From: {sender_display} ({member_tag}) · Source: {source_label}\n"
+            f"Email: {complaint['email'] or 'Not provided'} · Updated: {complaint['updated_at']}\n\n"
+            f"{complaint['body']}"
         )
-        index = self.status_combo.findData(complaint[6])
+        index = self.status_combo.findData(complaint["status"])
         if index >= 0:
             self.status_combo.setCurrentIndex(index)
+        self.staff_notes_input.setEnabled(True)
+        self.staff_notes_input.setText(complaint.get("staff_notes") or "")
         self.update_status_button.setEnabled(True)
+        self.reply_email_button.setEnabled(bool(str(complaint.get("email") or "").strip()))
 
     def update_status(self):
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
+        complaint = self._selected_complaint()
+        if not complaint:
             show_warning(
                 self,
                 "Select a Complaint",
@@ -848,19 +1455,136 @@ class ComplaintManagementDialog(QDialog):
             )
             return
 
-        complaint_id = self.table.item(
-            rows[0].row(),
-            0,
-        ).data(Qt.ItemDataRole.UserRole)
         success, message = self.db.update_complaint_status(
-            complaint_id,
+            complaint["id"],
             self.status_combo.currentData(),
+            staff_notes=self.staff_notes_input.text().strip(),
         )
         if not success:
             show_error(self, "Status Update Failed", message)
             return
 
         self.load_complaints()
+
+    def reply_to_selected_complaint(self):
+        complaint = self._selected_complaint()
+        if not complaint:
+            return
+        recipient = str(complaint.get("email") or "").strip()
+        if not recipient:
+            show_warning(
+                self,
+                "No Reply Email Address",
+                "This complaint has no saved student or sender email address.",
+            )
+            return
+
+        recipient_name = (
+            complaint.get("full_name")
+            or complaint.get("reporter_name")
+            or recipient
+        )
+        initial_subject = f"Re: [Complaint #{complaint['id']}] {complaint['subject']}"
+        note_text = self.staff_notes_input.text().strip()
+        initial_body = (
+            f"Hello {recipient_name},\n\n"
+            f"Regarding your library complaint #{complaint['id']} "
+            f"({complaint['subject']}):\n\n"
+            f"{note_text + chr(10) + chr(10) if note_text else ''}"
+            "Regards,\nLibrary Management System"
+        )
+        dialog = CustomEmailDialog(
+            f"{recipient_name} <{recipient}>",
+            self,
+            initial_subject=initial_subject,
+            initial_body=initial_body,
+        )
+        if not dialog.exec():
+            return
+        subject, body = dialog.get_data()
+        try:
+            self.db.enqueue_email(
+                recipient,
+                subject,
+                body,
+                "SYSTEM_ALERT",
+            )
+        except Exception as error:
+            show_error(self, "Email Queue Failed", error)
+            return
+
+        app = QApplication.instance()
+        sync_manager = getattr(app, "email_sync_manager", None) if app else None
+        if sync_manager:
+            sync_manager.sync_now()
+
+        show_success(
+            self,
+            "Reply Queued",
+            f"Reply to {recipient} was added to the email queue.",
+        )
+
+    def open_new_complaint(self):
+        try:
+            dialog = ComplaintDialog(self.db, self)
+            if dialog.exec():
+                self.load_complaints()
+        except Exception as error:
+            show_error(self, "Complaint Form Error", error)
+
+    def fetch_emailed_complaints(self):
+        if self._closing or self._imap_sync_worker is not None:
+            return
+        from email_queue import ComplaintImapSyncWorker
+
+        self.fetch_gmail_button.setEnabled(False)
+        self._refresh_imap_banner("Checking Gmail inbox for new student complaints...")
+        worker = ComplaintImapSyncWorker(
+            self.db.database_path,
+            limit=40,
+            lookback_days=14,
+            stop_event=self._stop_event,
+        )
+        worker.signals.finished.connect(self._on_fetch_emailed_finished)
+        self._imap_sync_worker = worker
+        self._thread_pool.start(worker)
+
+    def _on_fetch_emailed_finished(self, payload):
+        self._imap_sync_worker = None
+        if self._closing or sip.isdeleted(self):
+            return
+        self.fetch_gmail_button.setEnabled(True)
+        if not payload.get("ok"):
+            err = payload.get("error") or "Unknown Gmail IMAP error."
+            self._refresh_imap_banner(f"Gmail sync failed: {err}")
+            show_warning(self, "Gmail Fetch Failed", err)
+            return
+
+        summary = payload.get("summary") or {}
+        imported = int(summary.get("imported", 0))
+        checked = int(summary.get("checked", 0))
+        matched = int(summary.get("matched_users", 0))
+        if imported > 0:
+            app = QApplication.instance()
+            sync_manager = getattr(app, "email_sync_manager", None) if app else None
+            if sync_manager:
+                sync_manager.sync_now()
+            self._refresh_imap_banner(
+                f"Imported {imported} new emailed complaint(s) "
+                f"({matched} matched to registered members)."
+            )
+            self.load_complaints()
+        else:
+            self._refresh_imap_banner(
+                f"Checked {checked} recent Gmail message(s): no new unmatched complaints found."
+            )
+
+    def open_gmail_review_dialog(self):
+        dialog = GmailComplaintReviewDialog(self.db, self)
+        dialog.complaint_imported.connect(lambda _cid: self.load_complaints())
+        dialog.exec()
+        self.load_complaints()
+        self._refresh_imap_banner()
 
 
 class EmailQueueManagementDialog(QDialog):
@@ -1705,9 +2429,16 @@ class UserDialog(QDialog):
             self.combo_role.setCurrentText(role)
             self.on_role_changed(role)
 
-            canonical_department = (
-                normalize_department_for_role(department, role) or department
-            )
+            if hasattr(self.db, "normalize_department_for_role"):
+                canonical_department = (
+                    self.db.normalize_department_for_role(department, role)
+                    or department
+                )
+            else:
+                canonical_department = (
+                    normalize_department_for_role(department, role)
+                    or department
+                )
             index = self.combo_department.findText(
                 canonical_department,
                 Qt.MatchFlag.MatchFixedString,
@@ -1715,6 +2446,15 @@ class UserDialog(QDialog):
 
             if index >= 0:
                 self.combo_department.setCurrentIndex(index)
+            elif canonical_department and role in (
+                "Student",
+                "Faculty",
+                "Guest Lecturer",
+            ):
+                self.combo_department.addItem(canonical_department)
+                self.combo_department.setCurrentIndex(
+                    self.combo_department.count() - 1
+                )
 
         except Exception as error:
             show_error(self, "Database Error", error)
@@ -4055,175 +4795,344 @@ class BookHistoryDialog(QDialog):
 
 
 # ============================================================
-# EDIT DEPARTMENT DIALOG
+# EDIT / ADD DEPARTMENT & BRANCH DIALOG
 # ============================================================
 
-class EditDepartmentDialog(QDialog):
-    """Dialog for updating the course duration of a fixed college branch."""
 
-    def __init__(self, name, category, duration, parent=None):
+class EditDepartmentDialog(QDialog):
+    """Dialog for adding or updating a college branch or faculty department."""
+
+    def __init__(
+        self,
+        name="",
+        category="STUDENT",
+        duration=3,
+        parent=None,
+        branch_code="",
+        mode="edit",
+        user_count=0,
+    ):
         super().__init__(parent)
+        self._mode = "add" if mode == "add" or not str(name or "").strip() else "edit"
 
         configure_dialog(
             self,
-            "Edit Course Duration",
-            450,
-            300
+            "Add Branch / Department" if self._mode == "add" else "Update Branch / Department",
+            490,
+            400,
+            min_width=360,
+            min_height=310,
         )
 
+        c = get_dialog_colors(self)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
 
         layout.addWidget(
-            create_heading("✏️ Edit Branch Course Duration")
+            create_heading(
+                "+ Add Branch / Department"
+                if self._mode == "add"
+                else "Update Branch / Department"
+            )
         )
+
+        body_host = QWidget()
+        body_layout = QVBoxLayout(body_host)
+        body_layout.setContentsMargins(0, 0, 4, 0)
+        body_layout.setSpacing(10)
 
         self.form_layout = QFormLayout()
         configure_inspector_form(self.form_layout, horizontal_spacing=12, vertical_spacing=11)
 
-        self.input_name = QLineEdit(str(name))
-        self.input_name.setReadOnly(True)
+        self.input_name = QLineEdit(str(name or ""))
+        self.input_name.setMaxLength(120)
+        self.input_name.setPlaceholderText("e.g. Artificial Intelligence & ML")
+
+        self.input_code = QLineEdit(str(branch_code or "").upper())
+        self.input_code.setMaxLength(12)
+        self.input_code.setPlaceholderText("Optional code (e.g. CS, AI, PH)")
+        self.input_code.setValidator(
+            QRegularExpressionValidator(
+                QRegularExpression(r"^[A-Za-z0-9_-]{0,12}$"),
+                self.input_code,
+            )
+        )
 
         self.combo_cat = QComboBox()
-        self.combo_cat.addItems(["STUDENT", "FACULTY"])
-        self.combo_cat.setCurrentText(str(category).upper())
-        self.combo_cat.setEnabled(False)
+        self.combo_cat.addItem("Students & Faculty (Academic Branch)", "STUDENT")
+        self.combo_cat.addItem("Faculty & Staff Only", "FACULTY")
+        cat_code = str(category or "STUDENT").strip().upper()
+        cat_idx = self.combo_cat.findData(cat_code)
+        self.combo_cat.setCurrentIndex(cat_idx if cat_idx >= 0 else 0)
+        self.combo_cat.currentIndexChanged.connect(self.on_category_changed)
 
         self.combo_duration = QComboBox()
-        self.combo_duration.addItems([
-            "2 Years",
-            "3 Years",
-            "4 Years",
-            "5 Years"
-        ])
+        for yrs in range(1, 7):
+            label = "1 Year" if yrs == 1 else f"{yrs} Years"
+            self.combo_duration.addItem(label, yrs)
 
         try:
-            duration = int(duration)
+            duration_val = int(duration)
         except (ValueError, TypeError):
-            duration = 3
+            duration_val = 3
 
-        index = self.combo_duration.findText(
-            f"{duration} Years"
-        )
+        index = self.combo_duration.findData(duration_val)
+        if index < 0:
+            index = self.combo_duration.findData(3)
+        self.combo_duration.setCurrentIndex(index if index >= 0 else 2)
 
-        self.combo_duration.setCurrentIndex(
-            index if index >= 0 else 1
-        )
-
-        self.duration_label = QLabel("Duration:")
+        self.duration_label = QLabel("Course Duration:")
 
         self.form_layout.addRow("Branch / Department:", self.input_name)
-        self.form_layout.addRow("Category:", self.combo_cat)
-        self.form_layout.addRow(
-            self.duration_label,
-            self.combo_duration
-        )
+        self.form_layout.addRow("Short Code:", self.input_code)
+        self.form_layout.addRow("Available To:", self.combo_cat)
+        self.form_layout.addRow(self.duration_label, self.combo_duration)
+        body_layout.addLayout(self.form_layout)
 
-        layout.addLayout(self.form_layout)
-        layout.addStretch()
+        if self._mode == "edit" and int(user_count or 0) > 0:
+            cascade_note = QLabel(
+                f"Currently assigned to {int(user_count)} member(s). "
+                "Renaming automatically updates those member records."
+            )
+            cascade_note.setWordWrap(True)
+            cascade_note.setStyleSheet(
+                f"background: {c['cyan_soft']}; color: {c['text']}; "
+                f"border: 1px solid {c['cyan']}; border-left: 4px solid {c['cyan']}; "
+                "border-radius: 7px; padding: 7px 10px; font-weight: 600; font-size: 11px;"
+            )
+            body_layout.addWidget(cascade_note)
+
+        body_layout.addStretch()
+        layout.addWidget(wrap_in_scroll_area(body_host, object_name="EditDeptScroll"), 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
-
         buttons.addWidget(
             create_button("Cancel", self.reject, variant="SecondaryButton")
         )
-
         buttons.addWidget(
-            create_button("Save Changes", self.validate_and_accept, variant="PrimaryButton")
+            create_button(
+                "Add Branch / Dept" if self._mode == "add" else "Save Changes",
+                self.validate_and_accept,
+                variant="PrimaryButton",
+            )
         )
-
         layout.addLayout(buttons)
 
         self.on_category_changed()
 
     def on_category_changed(self, *args):
-        is_student = (
-            self.combo_cat.currentText() == "STUDENT"
-        )
-
+        cat_code = str(self.combo_cat.currentData() or self.combo_cat.currentText()).upper()
+        is_student = cat_code == "STUDENT"
         self.duration_label.setVisible(is_student)
         self.combo_duration.setVisible(is_student)
 
     def validate_and_accept(self):
+        name = " ".join(self.input_name.text().split()).strip()
+        if not name:
+            show_warning(
+                self,
+                "Name Required",
+                "Enter a branch or department name.",
+            )
+            return
+        code = self.input_code.text().strip().upper()
+        if code and not re.fullmatch(r"[A-Z0-9_-]{1,12}", code):
+            show_warning(
+                self,
+                "Invalid Short Code",
+                "Short code may only use letters, numbers, '-' or '_' (up to 12 characters).",
+            )
+            return
+        self.input_name.setText(name)
+        self.input_code.setText(code)
         self.accept()
 
     def get_data(self):
+        cat_code = str(self.combo_cat.currentData() or self.combo_cat.currentText()).upper()
         duration = (
-            int(self.combo_duration.currentText().split()[0])
-            if self.combo_cat.currentText() == "STUDENT"
+            int(self.combo_duration.currentData() or 3)
+            if cat_code == "STUDENT"
             else 3
         )
-
         return (
             self.input_name.text().strip(),
-            self.combo_cat.currentText(),
-            duration
+            cat_code,
+            duration,
         )
+
+    def get_full_data(self):
+        name, cat_code, duration = self.get_data()
+        code = self.input_code.text().strip().upper()
+        return name, cat_code, duration, code
+
+
+class ReassignDepartmentDialog(QDialog):
+    """Prompt to reassign users from one branch/department into another."""
+
+    def __init__(
+        self,
+        source_name,
+        target_options,
+        user_count,
+        student_count=0,
+        title="Reassign Members",
+        confirm_text="Reassign Members",
+        parent=None,
+    ):
+        super().__init__(parent)
+        configure_dialog(self, title, 470, 290, min_width=360, min_height=240)
+        c = get_dialog_colors(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        layout.addWidget(create_heading(title))
+
+        note = QLabel(
+            f"{int(user_count)} member(s)"
+            + (f" (including {int(student_count)} student(s))" if int(student_count or 0) > 0 else "")
+            + f" currently belong to '{source_name}'. Select the destination branch/department:"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {c['text']}; font-weight: 600;")
+        layout.addWidget(note)
+
+        self.target_combo = QComboBox()
+        self.target_combo.setMinimumWidth(0)
+        self.target_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.target_combo.setMinimumContentsLength(20)
+        for opt in target_options:
+            self.target_combo.addItem(str(opt), str(opt))
+        layout.addWidget(self.target_combo)
+        layout.addStretch()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(create_button("Cancel", self.reject, variant="SecondaryButton"))
+        buttons.addWidget(
+            create_button(
+                confirm_text,
+                self.accept,
+                variant="DangerButton" if "Delete" in confirm_text else "PrimaryButton",
+            )
+        )
+        layout.addLayout(buttons)
+
+    def selected_target(self):
+        return str(self.target_combo.currentData() or self.target_combo.currentText() or "").strip()
 
 
 # ============================================================
 # DEPARTMENT MANAGER
 # ============================================================
 
+
 class DepartmentManagerDialog(QDialog):
+    departments_changed = pyqtSignal()
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
 
         self.db = db
+        self._all_rows = []
+        self._filtered_rows = []
 
         configure_dialog(
             self,
-            "College Branches & Faculty Departments",
-            740,
-            560,
-            min_width=460,
-            min_height=340,
+            "Branches & Departments Manager",
+            860,
+            610,
+            min_width=480,
+            min_height=380,
         )
 
+        c = get_dialog_colors(self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         layout.addWidget(
-            create_heading("🏛️ College Branches & Faculty Departments")
+            create_heading("Branches & Departments Manager")
         )
 
-        info_label = QLabel(
-            "College branches are fixed and shared by Students and Faculty. "
-            "Sciences & Humanities Department and General Administration are "
-            "available only to Faculty and Staff."
+        self.summary_badge = QLabel()
+        self.summary_badge.setWordWrap(True)
+        self.summary_badge.setMinimumWidth(0)
+        self.summary_badge.setStyleSheet(
+            f"background: {c['primary_soft']}; color: {c['primary']}; "
+            f"border: 1px solid {c['primary']}; border-radius: 10px; "
+            "padding: 5px 10px; font-weight: 700; font-size: 11px;"
         )
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
+        self.info_label = QLabel(
+            "Student branches appear for Students & Faculty; Faculty/Staff departments apply to staff only."
+        )
+        self.info_label.setWordWrap(True)
+        self.info_label.setMinimumWidth(0)
+        self.info_label.setStyleSheet(f"color: {c['muted']}; font-size: 11px; font-weight: 600;")
+        layout.addWidget(self.summary_badge)
+        layout.addWidget(self.info_label)
+
+        self.unlisted_banner = QLabel()
+        self.unlisted_banner.setWordWrap(True)
+        self.unlisted_banner.setMinimumWidth(0)
+        self.unlisted_banner.setStyleSheet(
+            f"background: {c['warning_soft']}; color: {c['text']}; "
+            f"border: 1px solid {c['warning']}; border-left: 4px solid {c['warning']}; "
+            "border-radius: 7px; padding: 6px 10px; font-weight: 600; font-size: 11px;"
+        )
+        self.unlisted_banner.hide()
+        layout.addWidget(self.unlisted_banner)
+
+        filter_host = QWidget()
+        filter_host.setMinimumWidth(0)
+        filter_grid = QGridLayout(filter_host)
+        filter_grid.setContentsMargins(0, 0, 0, 0)
+        filter_grid.setHorizontalSpacing(8)
+        filter_grid.setVerticalSpacing(6)
+        self.search_input = QLineEdit()
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMinimumWidth(0)
+        self.search_input.setPlaceholderText("Search branch name or short code...")
+        self.search_input.textChanged.connect(self._render_rows)
+
+        self.category_filter = QComboBox()
+        self.category_filter.setMinimumWidth(0)
+        self.category_filter.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.category_filter.setMinimumContentsLength(16)
+        self.category_filter.addItem("All", "ALL")
+        self.category_filter.addItem("Students & Faculty", "STUDENT")
+        self.category_filter.addItem("Faculty & Staff Only", "FACULTY")
+        self.category_filter.currentIndexChanged.connect(self._render_rows)
+
+        filter_grid.addWidget(self.search_input, 0, 0)
+        filter_grid.addWidget(QLabel("Scope:"), 0, 1)
+        filter_grid.addWidget(self.category_filter, 0, 2)
+        filter_grid.setColumnStretch(0, 1)
+        layout.addWidget(filter_host)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-
+        self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels([
+            "Code",
             "Branch / Department",
             "Available To",
-            "Duration"
+            "Duration",
+            "Members",
         ])
 
         configure_table(self.table)
-        self.table.setMinimumHeight(140)
+        self.table.setMinimumHeight(160)
+        self.table.doubleClicked.connect(lambda _idx: self.handle_edit_department())
 
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(
-            0,
-            QHeaderView.ResizeMode.Stretch
-        )
-        header.setSectionResizeMode(
-            1,
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        header.setSectionResizeMode(
-            2,
-            QHeaderView.ResizeMode.ResizeToContents
-        )
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setStretchLastSection(False)
 
         layout.addWidget(self.table, 1)
 
@@ -4232,9 +5141,37 @@ class DepartmentManagerDialog(QDialog):
 
         actions.addWidget(
             create_button(
-                "✏️ Edit Course Duration",
+                "+ Add Branch / Dept",
+                self.handle_add_department,
+                variant="SuccessButton",
+            )
+        )
+        actions.addWidget(
+            create_button(
+                "Update Selected",
                 self.handle_edit_department,
                 variant="PrimaryButton",
+            )
+        )
+        actions.addWidget(
+            create_button(
+                "Reassign Members",
+                self.handle_reassign_members,
+                variant="InfoButton",
+            )
+        )
+        actions.addWidget(
+            create_button(
+                "Delete Selected",
+                self.handle_delete_department,
+                variant="DangerButton",
+            )
+        )
+        actions.addWidget(
+            create_button(
+                "Restore Defaults",
+                self.handle_restore_defaults,
+                variant="SecondaryButton",
             )
         )
         actions.addWidget(
@@ -4245,141 +5182,321 @@ class DepartmentManagerDialog(QDialog):
 
         self.load_data()
 
+    def _selected_department_record(self):
+        selected = self.table.currentRow()
+        if selected < 0:
+            return None
+        if 0 <= selected < len(self._filtered_rows):
+            return self._filtered_rows[selected]
+        return None
+
     def load_data(self):
         try:
-            cursor = self.db.conn.cursor()
+            if hasattr(self.db, "get_departments_detailed"):
+                self._all_rows = self.db.get_departments_detailed()
+            else:
+                rows = self.db.conn.execute(
+                    """
+                    SELECT id, name, category, duration_years, ''
+                    FROM departments
+                    ORDER BY CASE WHEN UPPER(category) = 'STUDENT' THEN 0 ELSE 1 END,
+                             name COLLATE NOCASE ASC
+                    """
+                ).fetchall()
+                self._all_rows = [
+                    {
+                        "id": int(r[0]),
+                        "name": str(r[1] or ""),
+                        "category": str(r[2] or "STUDENT").upper(),
+                        "duration_years": int(r[3] or 3),
+                        "branch_code": str(r[4] or ""),
+                        "user_count": 0,
+                        "student_count": 0,
+                        "staff_count": 0,
+                    }
+                    for r in rows
+                ]
 
-            cursor.execute(
-                """
-                SELECT id, name, category, duration_years
-                FROM departments
-                ORDER BY
-                    CASE WHEN UPPER(category) = 'STUDENT' THEN 0 ELSE 1 END,
-                    name COLLATE NOCASE ASC
-                """
+            unlisted = (
+                self.db.get_unlisted_user_departments()
+                if hasattr(self.db, "get_unlisted_user_departments")
+                else []
             )
-
-            rows = cursor.fetchall()
-            c = get_dialog_colors(self)
-
-            self.table.setRowCount(len(rows))
-
-            for row_index, row in enumerate(rows):
-                dept_id, name, category, duration = row
-                raw_category = str(category or "").upper()
-
-                name_item = QTableWidgetItem(str(name))
-                name_item.setData(
-                    Qt.ItemDataRole.UserRole,
-                    dept_id
+            if unlisted:
+                sample = ", ".join(f"{u['name']} ({u['user_count']})" for u in unlisted[:3])
+                more = f" +{len(unlisted) - 3} more" if len(unlisted) > 3 else ""
+                self.unlisted_banner.setText(
+                    f"Note: Member records reference unlisted department(s): {sample}{more}. "
+                    "Add matching entries here so dropdowns stay in sync."
                 )
-                f_name = name_item.font()
-                f_name.setBold(True)
-                name_item.setFont(f_name)
+                self.unlisted_banner.show()
+            else:
+                self.unlisted_banner.hide()
 
-                available_label = (
-                    "Students & Faculty"
-                    if raw_category == "STUDENT"
-                    else "Faculty & Staff Only"
-                )
-                category_item = QTableWidgetItem(available_label)
-                category_item.setData(
-                    Qt.ItemDataRole.UserRole,
-                    raw_category
-                )
-                category_item.setForeground(
-                    QColor(c["success"] if raw_category == "STUDENT" else c["purple"])
-                )
-                f_cat = category_item.font()
-                f_cat.setBold(True)
-                category_item.setFont(f_cat)
-
-                duration_text = (
-                    f"{duration} Years"
-                    if raw_category == "STUDENT"
-                    else "N/A"
-                )
-
-                duration_item = QTableWidgetItem(duration_text)
-                duration_item.setForeground(
-                    QColor(c["cyan"] if raw_category == "STUDENT" else c["muted"])
-                )
-
-                self.table.setItem(row_index, 0, name_item)
-                self.table.setItem(row_index, 1, category_item)
-                self.table.setItem(row_index, 2, duration_item)
-
+            student_cnt = sum(1 for r in self._all_rows if r["category"] == "STUDENT")
+            faculty_cnt = sum(1 for r in self._all_rows if r["category"] != "STUDENT")
+            member_cnt = sum(int(r.get("user_count") or 0) for r in self._all_rows)
+            self.summary_badge.setText(
+                f"{student_cnt} Student Branches · {faculty_cnt} Faculty / Staff Depts · {member_cnt} Members"
+            )
+            self._render_rows()
         except Exception as error:
             show_error(self, "Department Loading Error", error)
 
-    def handle_edit_department(self):
-        selected = self.table.currentRow()
+    def _render_rows(self):
+        c = get_dialog_colors(self)
+        query = self.search_input.text().strip().casefold()
+        cat_filter = str(self.category_filter.currentData() or "ALL").upper()
 
-        if selected < 0:
+        filtered = []
+        for rec in self._all_rows:
+            if cat_filter != "ALL" and rec["category"] != cat_filter:
+                continue
+            if query:
+                hay = f"{rec['name']} {rec.get('branch_code', '')}".casefold()
+                if query not in hay:
+                    continue
+            filtered.append(rec)
+
+        self._filtered_rows = filtered
+        self.table.setRowCount(len(filtered))
+
+        for row_index, rec in enumerate(filtered):
+            raw_category = rec["category"]
+            code_item = QTableWidgetItem(rec.get("branch_code") or "—")
+            code_item.setForeground(QColor(c["primary"] if rec.get("branch_code") else c["muted"]))
+            f_code = code_item.font()
+            f_code.setBold(bool(rec.get("branch_code")))
+            code_item.setFont(f_code)
+
+            name_item = QTableWidgetItem(rec["name"])
+            name_item.setData(Qt.ItemDataRole.UserRole, rec["id"])
+            f_name = name_item.font()
+            f_name.setBold(True)
+            name_item.setFont(f_name)
+
+            available_label = (
+                "Students & Faculty"
+                if raw_category == "STUDENT"
+                else "Faculty & Staff Only"
+            )
+            category_item = QTableWidgetItem(available_label)
+            category_item.setData(Qt.ItemDataRole.UserRole, raw_category)
+            category_item.setForeground(
+                QColor(c["success"] if raw_category == "STUDENT" else c["purple"])
+            )
+            f_cat = category_item.font()
+            f_cat.setBold(True)
+            category_item.setFont(f_cat)
+
+            duration = int(rec.get("duration_years") or 3)
+            duration_text = (
+                ("1 Year" if duration == 1 else f"{duration} Years")
+                if raw_category == "STUDENT"
+                else "N/A"
+            )
+            duration_item = QTableWidgetItem(duration_text)
+            duration_item.setForeground(
+                QColor(c["cyan"] if raw_category == "STUDENT" else c["muted"])
+            )
+
+            count = int(rec.get("user_count") or 0)
+            members_item = QTableWidgetItem(str(count))
+            members_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            members_item.setForeground(QColor(c["text"] if count > 0 else c["muted"]))
+
+            self.table.setItem(row_index, 0, code_item)
+            self.table.setItem(row_index, 1, name_item)
+            self.table.setItem(row_index, 2, category_item)
+            self.table.setItem(row_index, 3, duration_item)
+            self.table.setItem(row_index, 4, members_item)
+
+    def handle_add_department(self):
+        dialog = EditDepartmentDialog(
+            name="",
+            category="STUDENT",
+            duration=3,
+            parent=self,
+            branch_code="",
+            mode="add",
+            user_count=0,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_name, new_category, new_duration, new_code = dialog.get_full_data()
+        success, message = self.db.add_department(
+            new_name,
+            new_category,
+            new_duration,
+            branch_code=new_code,
+        )
+        if success:
+            self.load_data()
+            self.departments_changed.emit()
+            show_success(self, "Branch / Department Added", message)
+        else:
+            show_warning(self, "Add Failed", message)
+
+    def handle_edit_department(self):
+        rec = self._selected_department_record()
+        if not rec:
             show_warning(
                 self,
                 "Selection Required",
-                "Select a college branch to update its course duration."
+                "Select a branch or department row to update.",
             )
             return
-
-        name_item = self.table.item(selected, 0)
-        category_item = self.table.item(selected, 1)
-        duration_item = self.table.item(selected, 2)
-
-        if not name_item:
-            return
-
-        dept_id = name_item.data(Qt.ItemDataRole.UserRole)
-        current_name = name_item.text()
-
-        current_category = (
-            category_item.data(Qt.ItemDataRole.UserRole)
-            if category_item else "STUDENT"
-        )
-        if current_category != "STUDENT":
-            show_warning(
-                self,
-                "Fixed Department",
-                "Course duration applies only to college student branches."
-            )
-            return
-
-        try:
-            current_duration = int(
-                duration_item.text().split()[0]
-            )
-        except (ValueError, AttributeError, IndexError):
-            current_duration = 3
 
         dialog = EditDepartmentDialog(
-            current_name,
-            current_category,
-            current_duration,
-            self
+            rec["name"],
+            rec["category"],
+            rec["duration_years"],
+            self,
+            branch_code=rec.get("branch_code") or "",
+            mode="edit",
+            user_count=rec.get("user_count") or 0,
         )
-
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        new_name, new_category, new_duration = dialog.get_data()
-
+        new_name, new_category, new_duration, new_code = dialog.get_full_data()
         try:
             success, message = self.db.update_department(
-                dept_id,
+                rec["id"],
                 new_name,
                 new_category,
-                new_duration
+                new_duration,
+                branch_code=new_code,
             )
-
             if success:
                 self.load_data()
+                self.departments_changed.emit()
                 show_success(self, "Updated", message)
             else:
                 show_warning(self, "Update Failed", message)
-
         except Exception as error:
             show_error(self, "Database Error", error)
+
+    def handle_reassign_members(self):
+        rec = self._selected_department_record()
+        if not rec:
+            show_warning(
+                self,
+                "Selection Required",
+                "Select a branch or department whose members you want to move.",
+            )
+            return
+        user_count = int(rec.get("user_count") or 0)
+        student_count = int(rec.get("student_count") or 0)
+        if user_count == 0:
+            show_warning(
+                self,
+                "No Assigned Members",
+                f"No members are currently assigned to '{rec['name']}'.",
+            )
+            return
+        targets = [
+            r["name"]
+            for r in self._all_rows
+            if r["id"] != rec["id"]
+            and (student_count == 0 or r["category"] == "STUDENT")
+        ]
+        if not targets:
+            show_warning(
+                self,
+                "No Compatible Target",
+                "Add another compatible branch first before reassigning these members.",
+            )
+            return
+        dlg = ReassignDepartmentDialog(
+            rec["name"],
+            targets,
+            user_count,
+            student_count=student_count,
+            title="Reassign Branch / Department Members",
+            confirm_text="Move Members",
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        target = dlg.selected_target()
+        success, message = self.db.reassign_department_users(rec["name"], target)
+        if success:
+            self.load_data()
+            self.departments_changed.emit()
+            show_success(self, "Members Reassigned", message)
+        else:
+            show_warning(self, "Reassignment Failed", message)
+
+    def handle_delete_department(self):
+        rec = self._selected_department_record()
+        if not rec:
+            show_warning(
+                self,
+                "Selection Required",
+                "Select a branch or department row to delete.",
+            )
+            return
+
+        user_count = int(rec.get("user_count") or 0)
+        student_count = int(rec.get("student_count") or 0)
+        reassign_to = None
+        if user_count > 0:
+            targets = [
+                r["name"]
+                for r in self._all_rows
+                if r["id"] != rec["id"]
+                and (student_count == 0 or r["category"] == "STUDENT")
+            ]
+            if not targets:
+                show_warning(
+                    self,
+                    "Cannot Delete Branch",
+                    f"'{rec['name']}' still has {user_count} assigned member(s) and no other compatible branch exists.",
+                )
+                return
+            dlg = ReassignDepartmentDialog(
+                rec["name"],
+                targets,
+                user_count,
+                student_count=student_count,
+                title=f"Reassign & Delete '{rec['name']}'",
+                confirm_text="Reassign & Delete",
+                parent=self,
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            reassign_to = dlg.selected_target()
+        else:
+            answer = QMessageBox.question(
+                self,
+                "Confirm Delete",
+                f"Delete branch / department '{rec['name']}'?\n\n"
+                "You can re-add it later or click Restore Defaults.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        success, message = self.db.delete_department(rec["id"], reassign_to=reassign_to)
+        if success:
+            self.load_data()
+            self.departments_changed.emit()
+            show_success(self, "Deleted", message)
+        else:
+            show_warning(self, "Delete Failed", message)
+
+    def handle_restore_defaults(self):
+        success, message = self.db.restore_default_departments()
+        if success:
+            self.load_data()
+            self.departments_changed.emit()
+            show_success(self, "Default Branches", message)
+        else:
+            show_warning(self, "Restore Failed", message)
 
 
 # ============================================================
@@ -4799,7 +5916,13 @@ class BatchCirculationDialog(QDialog):
 class CustomEmailDialog(QDialog):
     """Compose a one-off message for a library user."""
 
-    def __init__(self, recipient_name, parent=None):
+    def __init__(
+        self,
+        recipient_name,
+        parent=None,
+        initial_subject="",
+        initial_body="",
+    ):
         super().__init__(parent)
         configure_dialog(
             self,
@@ -4824,9 +5947,13 @@ class CustomEmailDialog(QDialog):
         configure_inspector_form(form, horizontal_spacing=12, vertical_spacing=10)
         self.subject_input = QLineEdit()
         self.subject_input.setPlaceholderText("Email subject")
+        if initial_subject:
+            self.subject_input.setText(str(initial_subject))
         self.body_input = QPlainTextEdit()
         self.body_input.setPlaceholderText("Write your message...")
         self.body_input.setMinimumHeight(130)
+        if initial_body:
+            self.body_input.setPlainText(str(initial_body))
         form.addRow("Subject:", self.subject_input)
         form.addRow("Message:", self.body_input)
         form_host_layout.addLayout(form, 1)

@@ -327,10 +327,12 @@ class ReportsView(QWidget):
 
         self.colors = self.DEFAULT_COLORS.copy()
         self.theme_manager = self._find_theme_manager()
+        self._initializing = True
 
         self._build_ui()
         self._connect_theme()
         self.apply_theme()
+        self._initializing = False
         self.load_analytics()
 
     # --------------------------------------------------------
@@ -566,7 +568,7 @@ class ReportsView(QWidget):
             card.accent = self.accents.get(key, card.accent)
             card.set_colors(self.colors)
 
-        if hasattr(self, "chart_view"):
+        if hasattr(self, "chart_view") and not getattr(self, "_initializing", False):
             self._render_current_chart()
 
     # --------------------------------------------------------
@@ -1228,6 +1230,32 @@ class ReportsView(QWidget):
     # CHART ENGINE
     # --------------------------------------------------------
 
+    @staticmethod
+    def _detach_chart_contents(chart):
+        if chart is None:
+            return
+        try:
+            chart.removeAllSeries()
+        except Exception:
+            pass
+        try:
+            for axis in list(chart.axes()):
+                chart.removeAxis(axis)
+        except Exception:
+            pass
+
+    def _set_chart(self, new_chart):
+        if not hasattr(self, "chart_view"):
+            return
+        old_chart = None
+        try:
+            old_chart = self.chart_view.chart()
+        except Exception:
+            old_chart = None
+        if old_chart is not None and old_chart is not new_chart:
+            self._detach_chart_contents(old_chart)
+        self.chart_view.setChart(new_chart)
+
     def _create_base_chart(self):
         c = self.colors
 
@@ -1286,7 +1314,7 @@ class ReportsView(QWidget):
             chart.setTitleBrush(QColor(self.colors["muted"]))
             chart.setTitleFont(QFont("Segoe UI", 11))
             self.hover_readout.setText("No chart data available")
-            self.chart_view.setChart(chart)
+            self._set_chart(chart)
             return
 
         bar_set = QBarSet(series_label)
@@ -1398,7 +1426,7 @@ class ReportsView(QWidget):
             "Hover over a bar to inspect its value"
         )
 
-        self.chart_view.setChart(chart)
+        self._set_chart(chart)
 
     def render_status_pie_chart(self):
         chart = self._create_base_chart()
@@ -1480,7 +1508,7 @@ class ReportsView(QWidget):
             "Hover over a segment to inspect its proportion"
         )
 
-        self.chart_view.setChart(chart)
+        self._set_chart(chart)
 
     # --------------------------------------------------------
     # CSV EXPORT
@@ -1656,6 +1684,11 @@ class ReportsView(QWidget):
     # --------------------------------------------------------
 
     def closeEvent(self, event):
+        if hasattr(self, "chart_view"):
+            try:
+                self._detach_chart_contents(self.chart_view.chart())
+            except Exception:
+                pass
         if self.theme_manager is not None:
             try:
                 self.theme_manager.themeChanged.disconnect(

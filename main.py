@@ -7,7 +7,7 @@ import datetime
 
 from PyQt6.QtWidgets import QApplication, QDialog
 from PyQt6.QtGui import QIcon, QFont
-from PyQt6.QtCore import QElapsedTimer, QTimer, Qt
+from PyQt6.QtCore import QElapsedTimer, QTimer, Qt, qInstallMessageHandler
 
 from mainwindow import MainWindow
 from database import LocalDatabase
@@ -95,8 +95,37 @@ def initialize_database():
 # APPLICATION STARTUP
 # ============================================================
 
+_QT_CHARTS_WILDCARD_NOISE = (
+    "QObject::disconnect: wildcard call disconnects from destroyed signal of BarChartItem::",
+    "QObject::disconnect: wildcard call disconnects from destroyed signal of ChartValueAxis",
+    "QObject::disconnect: wildcard call disconnects from destroyed signal of ChartBarCategoryAxis",
+)
+_ACTIVE_QT_MSG_HANDLER = None
+
+
+def install_qt_warning_filter():
+    """Filter upstream Qt 6 Charts wildcard-disconnect teardown noise while preserving all other Qt logs."""
+    global _ACTIVE_QT_MSG_HANDLER
+    previous_handler = [None]
+
+    def _handler(msg_type, context, message):
+        text = str(message or "")
+        if any(marker in text for marker in _QT_CHARTS_WILDCARD_NOISE):
+            return
+        prev = previous_handler[0]
+        if callable(prev):
+            prev(msg_type, context, message)
+        elif sys.stderr is not None:
+            sys.stderr.write(f"{text}\n")
+
+    previous_handler[0] = qInstallMessageHandler(_handler)
+    _ACTIVE_QT_MSG_HANDLER = _handler
+    return _handler
+
+
 def main():
 
+    install_qt_warning_filter()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )

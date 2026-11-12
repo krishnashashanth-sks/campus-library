@@ -1,6 +1,6 @@
 # Library Management System
 
-A comprehensive desktop application for managing library operations, including book catalog management, user administration, circulation tracking, and detailed reporting — **developed by Govt Polytechnic College Masab Tank Hyderabad Students**. Built with Python and PyQt6 for a native desktop experience.
+A comprehensive desktop application for managing library operations, including book catalog management, user administration, circulation tracking, and detailed reporting — **developed by Govt Polytechnic College Hyderabad**. Built with Python and PyQt6 for a native desktop experience.
 
 ## Features
 
@@ -250,7 +250,7 @@ coll = COLLECT(
 #define AppName "Library Management System"
 #define AppExeName "Library.exe"
 #define AppInstallFolder "Library"
-#define AppPublisher "Govt Polytechnic College Masab Tank Hyderabad Students"
+#define AppPublisher "Govt Polytechnic College Hyderabad"
 
 [Setup]
 AppName={#AppName}
@@ -532,7 +532,7 @@ The application includes comprehensive error handling with user-friendly message
 
 ## License & Credits
 
-Developed by **Govt Polytechnic College Masab Tank Hyderabad Students** for library management purposes.
+Developed by **Govt Polytechnic College Hyderabad** for library management purposes.
 
 ## Support
 
@@ -540,4 +540,4 @@ For issues or questions about the application, please check the troubleshooting 
 
 ---
 
-**Library Management System v1.0** — Developed by Govt Polytechnic College Masab Tank Hyderabad Students
+**Library Management System v1.1** — Developed by Govt Polytechnic College Hyderabad

@@ -51,9 +51,14 @@ class HelpDialog(QDialog):
             "are skipped or reported.\n\n"
             "Select multiple users to issue or return one title for each "
             "selected user. For one user, use Actions to compose a custom "
-            "email. Messages are queued for delivery if the mail service "
-            "is unavailable. Use Complaint Inbox to review submitted "
-            "complaints.",
+            "email or record a walk-in complaint. Messages are queued for "
+            "delivery if the mail service is unavailable.\n\n"
+            "Complaints & Gmail Intake\n"
+            "Students can email complaints directly to the configured "
+            "library Gmail address, or staff can log desk complaints via "
+            "+ Complaint. Open Complaint Inbox to filter by source or "
+            "status, fetch emailed complaints from Gmail, review unread "
+            "inbox messages, add resolution notes, and reply by email.",
         ),
         (
             "Batch Circulation",
@@ -109,8 +114,9 @@ class HelpDialog(QDialog):
             "delivery. When the network or mail service is unavailable, "
             "queued messages remain pending and are retried by background "
             "sync. The top-bar badge shows the current sync status. In "
-            "Settings, configure the email sender and credentials, test the "
-            "configuration, enable due reminders, or select Sync Now.",
+            "Settings, configure the Gmail sender and App Password, test "
+            "the configuration, enable due reminders, configure incoming "
+            "Gmail complaint fetching (IMAP), or select Sync Now.",
         ),
         (
             "Reports && Settings",
@@ -120,8 +126,10 @@ class HelpDialog(QDialog):
             "detailed CSV reports.\n\n"
             "Settings contains global circulation/renewal rules, Role-Based "
             "Borrowing & Fine Policies (Max Books, Loan Days, Daily Fine per "
-            "role), theme preferences, academic and security options, "
-            "database maintenance, email configuration, and Application "
+            "role), theme preferences, Academic Departments & Branches (add, "
+            "rename, assign short codes, change course durations, reassign "
+            "members, or delete branches), Academic Year Rollover, security "
+            "options, database maintenance, email configuration, and Application "
             "Updates. Check for Updates compares the installed version with "
             "the latest stable release; confirm before applying an update "
             "and restarting the app. Review confirmation dialogs before "

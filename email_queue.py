@@ -13,7 +13,14 @@ from PyQt6.QtCore import (
 )
 
 from database import LocalDatabase
-from email_service import LibraryEmailService, SMTP_HOST, SMTP_PORT
+from email_service import (
+    IMAP_HOST,
+    IMAP_PORT,
+    LibraryEmailService,
+    SMTP_HOST,
+    SMTP_PORT,
+    is_transient_imap_error,
+)
 
 
 class _WorkerSignals(QObject):
@@ -34,6 +41,100 @@ def _safe_emit(signals_obj, signal_name, *args):
             signal.emit(*args)
     except (RuntimeError, AttributeError):
         pass
+
+
+class ComplaintImapSyncWorker(QRunnable):
+    def __init__(
+        self,
+        database_path,
+        mode=None,
+        auto_reply=None,
+        limit=40,
+        lookback_days=14,
+        stop_event=None,
+    ):
+        super().__init__()
+        self.database_path = database_path
+        self.mode = mode
+        self.auto_reply = auto_reply
+        self.limit = limit
+        self.lookback_days = lookback_days
+        self._stop_event = stop_event
+        self.signals = _WorkerSignals()
+
+    def run(self):
+        db = None
+        payload = None
+        try:
+            if self._stop_event is not None and self._stop_event.is_set():
+                return
+            db = LocalDatabase(self.database_path)
+            summary = LibraryEmailService(db).sync_emailed_complaints(
+                mode=self.mode,
+                auto_reply=self.auto_reply,
+                limit=self.limit,
+                lookback_days=self.lookback_days,
+                stop_event=self._stop_event,
+            )
+            payload = {"ok": True, "summary": summary}
+        except Exception as error:
+            logging.warning("Gmail complaint import failed: %s", error)
+            payload = {"ok": False, "error": str(error)}
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            if (
+                payload is not None
+                and (self._stop_event is None or not self._stop_event.is_set())
+            ):
+                _safe_emit(self.signals, "finished", payload)
+
+
+class ComplaintImapInboxWorker(QRunnable):
+    def __init__(
+        self,
+        database_path,
+        limit=40,
+        lookback_days=14,
+        stop_event=None,
+    ):
+        super().__init__()
+        self.database_path = database_path
+        self.limit = limit
+        self.lookback_days = lookback_days
+        self._stop_event = stop_event
+        self.signals = _WorkerSignals()
+
+    def run(self):
+        db = None
+        payload = None
+        try:
+            if self._stop_event is not None and self._stop_event.is_set():
+                return
+            db = LocalDatabase(self.database_path)
+            messages = LibraryEmailService(db).fetch_inbox_messages(
+                limit=self.limit,
+                lookback_days=self.lookback_days,
+                stop_event=self._stop_event,
+            )
+            payload = {"ok": True, "messages": messages}
+        except Exception as error:
+            logging.warning("Gmail inbox fetch failed: %s", error)
+            payload = {"ok": False, "error": str(error)}
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            if (
+                payload is not None
+                and (self._stop_event is None or not self._stop_event.is_set())
+            ):
+                _safe_emit(self.signals, "finished", payload)
 
 
 class EmailTestWorker(QRunnable):
@@ -75,11 +176,18 @@ class EmailTestWorker(QRunnable):
 
 
 class EmailWorker(QRunnable):
-    def __init__(self, database_path, retry_failed=False, stop_event=None):
+    def __init__(
+        self,
+        database_path,
+        retry_failed=False,
+        stop_event=None,
+        last_imap_error=None,
+    ):
         super().__init__()
         self.database_path = database_path
         self.retry_failed = retry_failed
         self._stop_event = stop_event
+        self._last_imap_error = last_imap_error
         self.signals = _WorkerSignals()
 
     @staticmethod
@@ -87,6 +195,17 @@ class EmailWorker(QRunnable):
         try:
             with socket.create_connection(
                 (SMTP_HOST, SMTP_PORT),
+                timeout=3,
+            ):
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _is_imap_online():
+        try:
+            with socket.create_connection(
+                (IMAP_HOST, IMAP_PORT),
                 timeout=3,
             ):
                 return True
@@ -102,6 +221,8 @@ class EmailWorker(QRunnable):
             "sent": 0,
             "failed": 0,
             "pending": 0,
+            "imported_complaints": 0,
+            "imap_error": None,
             "error": None,
         }
         try:
@@ -109,12 +230,50 @@ class EmailWorker(QRunnable):
                 return
 
             db = LocalDatabase(self.database_path)
+            email_service = LibraryEmailService(db)
+            result["configured"] = email_service.is_configured()
             result["enabled"] = (
                 str(
                     db.get_setting("email_delivery_enabled", "0")
                 ).casefold()
                 in ("1", "true", "yes")
             )
+
+            import_enabled = (
+                str(
+                    db.get_setting("email_complaint_import_enabled", "1")
+                ).casefold()
+                in ("1", "true", "yes")
+            )
+            if (
+                import_enabled
+                and result["configured"]
+                and (self._stop_event is None or not self._stop_event.is_set())
+                and self._is_imap_online()
+            ):
+                try:
+                    imap_summary = email_service.sync_emailed_complaints(
+                        stop_event=self._stop_event
+                    )
+                    result["imported_complaints"] = int(
+                        imap_summary.get("imported", 0)
+                    )
+                except Exception as imap_error:
+                    err_text = str(imap_error)
+                    is_transient = is_transient_imap_error(imap_error)
+                    result["imap_error"] = err_text
+                    result["imap_error_transient"] = is_transient
+                    if is_transient:
+                        logging.debug(
+                            "Inbound Gmail complaint check deferred after retry: %s",
+                            err_text,
+                        )
+                    elif err_text != self._last_imap_error:
+                        logging.warning(
+                            "Inbound Gmail complaint check skipped: %s",
+                            err_text,
+                        )
+
             counts = db.get_email_queue_counts()
             result["pending"] = counts["pending"]
             if not result["enabled"]:
@@ -123,8 +282,6 @@ class EmailWorker(QRunnable):
             if self.retry_failed:
                 db.prepare_email_queue_for_manual_sync()
 
-            email_service = LibraryEmailService(db)
-            result["configured"] = email_service.is_configured()
             counts = db.get_email_queue_counts()
             result["pending"] = counts["pending"]
 
@@ -176,6 +333,7 @@ class EmailWorker(QRunnable):
 
 class EmailQueueManager(QObject):
     status_changed = pyqtSignal(str)
+    complaints_imported = pyqtSignal(int)
 
     def __init__(self, database_path, parent=None, status_database=None):
         super().__init__(parent)
@@ -198,6 +356,7 @@ class EmailQueueManager(QObject):
         self._enabled = None
         self._online = None
         self._error = None
+        self._last_imap_error = None
         self._retrying = False
 
     def start(self):
@@ -238,6 +397,7 @@ class EmailQueueManager(QObject):
             self.database_path,
             retry_failed=self._retry_failed_requested,
             stop_event=self._stop_event,
+            last_imap_error=self._last_imap_error,
         )
         self._retry_failed_requested = False
         worker.signals.finished.connect(self._sync_finished)
@@ -257,8 +417,12 @@ class EmailQueueManager(QObject):
         self._enabled = result.get("enabled")
         self._online = result.get("online")
         self._error = result.get("error")
+        self._last_imap_error = result.get("imap_error")
         self._retrying = bool(result.get("failed"))
+        imported_count = int(result.get("imported_complaints") or 0)
         self.refresh_status()
+        if imported_count > 0:
+            self.complaints_imported.emit(imported_count)
 
         if self._sync_requested and not self._shutting_down:
             self._sync_requested = False

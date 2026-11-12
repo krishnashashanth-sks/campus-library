@@ -1,15 +1,15 @@
 ; Inno Setup script for Library Management System
 ; Override version from CLI/CI using:
-;   ISCC.exe /DAppVersion=1.0 installer_scipt.iss
+;   ISCC.exe /DAppVersion=1.1 installer_scipt.iss
 
 #ifndef AppVersion
-  #define AppVersion "1.0"
+  #define AppVersion "1.1"
 #endif
 
 #define AppName "Library Management System"
 #define AppExeName "Library.exe"
 #define AppInstallFolder "Library"
-#define AppPublisher "Govt Polytechnic College Masab Tank Hyderabad Students"
+#define AppPublisher "Govt Polytechnic College Hyderabad"
 #define AppURL "https://github.com/krishnashashanth-sks/campus-library"
 
 [Setup]
