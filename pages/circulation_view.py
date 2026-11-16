@@ -1959,10 +1959,20 @@ class CirculationView(QWidget):
         configure_inspector_form(form, horizontal_spacing=10, vertical_spacing=7)
         form.setContentsMargins(2, 5, 2, 5)
 
+        borrow_status = None
+        if hasattr(self.db, "get_user_borrowing_status"):
+            borrow_status = self.db.get_user_borrowing_status(user_id)
+        quota_text = (
+            f"{borrow_status['active_count']} / {borrow_status['max_books']} books ({borrow_status['role']})"
+            if borrow_status
+            else "—"
+        )
+
         details = [
             ("Log ID", log_id),
             ("Book ID", book_id),
             ("User ID", user_id),
+            ("Borrow Quota", quota_text),
             ("Issue Date", checkout),
             ("Due Date", due),
             ("Renewals", renewal_text),

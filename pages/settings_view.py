@@ -168,6 +168,7 @@ class SettingsView(QWidget):
         "default_days": 14,
         "max_renewals": 2,
         "allow_overdue_renewal": True,
+        "student_max_books": 3,
         "theme_mode": "Dark",
     }
 
@@ -1386,6 +1387,31 @@ class SettingsView(QWidget):
         self.circ_days_desc.setObjectName("MutedLabel")
         configure_wrapped_label(self.circ_days_desc)
 
+        self.circ_student_max_label = self.create_field_label("Student Max Books Allowed")
+
+        self.spin_student_max_books = QSpinBox()
+        self.spin_student_max_books.setRange(1, 50)
+        self.spin_student_max_books.setValue(3)
+        self.spin_student_max_books.setSuffix(" books")
+        self.spin_student_max_books.setMinimumWidth(0)
+        self.spin_student_max_books.setMinimumHeight(34)
+        self.spin_student_max_books.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.spin_student_max_books.setToolTip(
+            "Maximum number of books a student can borrow concurrently at any time."
+        )
+        self.spin_student_max_books.valueChanged.connect(
+            self._on_student_max_books_changed
+        )
+
+        self.circ_student_max_desc = QLabel(
+            "Maximum concurrent books a student can borrow (default: 3 books)."
+        )
+        self.circ_student_max_desc.setObjectName("MutedLabel")
+        configure_wrapped_label(self.circ_student_max_desc)
+
         self.circ_max_renew_label = self.create_field_label("Max Renewals per Loan")
 
         self.spin_max_renewals = QSpinBox()
@@ -1417,10 +1443,13 @@ class SettingsView(QWidget):
         self.circ_form_layout.addWidget(self.spin_default_days, 1, 1)
         self.circ_form_layout.addWidget(self.circ_fine_desc, 2, 0)
         self.circ_form_layout.addWidget(self.circ_days_desc, 2, 1)
-        self.circ_form_layout.addWidget(self.circ_max_renew_label, 3, 0, 1, 2)
-        self.circ_form_layout.addWidget(self.spin_max_renewals, 4, 0)
-        self.circ_form_layout.addWidget(self.circ_max_renew_desc, 4, 1)
-        self.circ_form_layout.addWidget(self.chk_allow_overdue_row, 5, 0, 1, 2)
+        self.circ_form_layout.addWidget(self.circ_student_max_label, 3, 0)
+        self.circ_form_layout.addWidget(self.circ_max_renew_label, 3, 1)
+        self.circ_form_layout.addWidget(self.spin_student_max_books, 4, 0)
+        self.circ_form_layout.addWidget(self.spin_max_renewals, 4, 1)
+        self.circ_form_layout.addWidget(self.circ_student_max_desc, 5, 0)
+        self.circ_form_layout.addWidget(self.circ_max_renew_desc, 5, 1)
+        self.circ_form_layout.addWidget(self.chk_allow_overdue_row, 6, 0, 1, 2)
         self.circ_form_layout.setColumnStretch(0, 1)
         self.circ_form_layout.setColumnStretch(1, 1)
 
@@ -1541,8 +1570,26 @@ class SettingsView(QWidget):
                 "default_days": spin_days,
                 "fine_per_day": spin_fine,
             }
+            if role_name.casefold() == "student":
+                spin_books.valueChanged.connect(self._on_role_policy_student_books_changed)
 
         self.content_layout.addWidget(role_card)
+
+    def _on_student_max_books_changed(self, val):
+        student_ctrls = self.role_policy_controls.get("Student")
+        if student_ctrls and "max_books" in student_ctrls:
+            spin = student_ctrls["max_books"]
+            if spin.value() != val:
+                spin.blockSignals(True)
+                spin.setValue(val)
+                spin.blockSignals(False)
+
+    def _on_role_policy_student_books_changed(self, val):
+        if hasattr(self, "spin_student_max_books"):
+            if self.spin_student_max_books.value() != val:
+                self.spin_student_max_books.blockSignals(True)
+                self.spin_student_max_books.setValue(val)
+                self.spin_student_max_books.blockSignals(False)
 
     def build_email_section(self):
         header = self.create_section_header(
@@ -3412,6 +3459,10 @@ class SettingsView(QWidget):
                 "1" if self.DEFAULTS["allow_overdue_renewal"] else "0",
             )
 
+            student_max_books = self.db.get_student_max_books(
+                self.DEFAULTS["student_max_books"]
+            )
+
             theme = self.db.get_setting(
                 "theme_mode",
                 self.DEFAULTS["theme_mode"]
@@ -3529,6 +3580,8 @@ class SettingsView(QWidget):
             self.refresh_drive_status_ui()
             if hasattr(self, "dept_table"):
                 self.refresh_department_table()
+            if hasattr(self, "spin_student_max_books"):
+                self.spin_student_max_books.setValue(max(1, int(student_max_books)))
 
             policies_ok, policy_rows = self.db.get_all_loan_policies()
             if policies_ok and policy_rows:
@@ -3543,6 +3596,8 @@ class SettingsView(QWidget):
                         ctrls["max_books"].setValue(vals[0])
                         ctrls["default_days"].setValue(vals[1])
                         ctrls["fine_per_day"].setValue(vals[2])
+                if "student" in policy_map and hasattr(self, "spin_student_max_books"):
+                    self.spin_student_max_books.setValue(policy_map["student"][0])
 
         except Exception as error:
             QMessageBox.warning(
@@ -3911,6 +3966,11 @@ class SettingsView(QWidget):
             self.DEFAULTS["allow_overdue_renewal"]
         )
 
+        if hasattr(self, "spin_student_max_books"):
+            self.spin_student_max_books.setValue(
+                self.DEFAULTS.get("student_max_books", 3)
+            )
+
         for role_name, def_books, def_days, def_fine in self.DEFAULT_ROLE_POLICIES:
             ctrls = self.role_policy_controls.get(role_name)
             if ctrls:
@@ -3967,6 +4027,14 @@ class SettingsView(QWidget):
                 self,
                 "Invalid Loan Duration",
                 "The loan duration must be between 1 and 365 days."
+            )
+            return False
+
+        if hasattr(self, "spin_student_max_books") and self.spin_student_max_books.value() < 1:
+            QMessageBox.warning(
+                self,
+                "Invalid Student Book Limit",
+                "The maximum books allowed for students must be at least 1."
             )
             return False
 
@@ -4079,6 +4147,13 @@ class SettingsView(QWidget):
                 "allow_overdue_renewal",
                 "1" if self.chk_allow_overdue_renew.isChecked() else "0"
             )
+
+            if hasattr(self, "spin_student_max_books"):
+                student_limit = self.spin_student_max_books.value()
+                self.db.set_setting("student_max_books", str(student_limit))
+                student_ctrls = self.role_policy_controls.get("Student")
+                if student_ctrls and "max_books" in student_ctrls:
+                    student_ctrls["max_books"].setValue(student_limit)
 
             for role_name, ctrls in self.role_policy_controls.items():
                 ok, err = self.db.update_loan_policy(
@@ -4332,6 +4407,9 @@ class SettingsView(QWidget):
                 self.circ_days_label,
                 self.spin_default_days,
                 self.circ_days_desc,
+                self.circ_student_max_label,
+                self.spin_student_max_books,
+                self.circ_student_max_desc,
                 self.circ_max_renew_label,
                 self.spin_max_renewals,
                 self.circ_max_renew_desc,
@@ -4351,10 +4429,13 @@ class SettingsView(QWidget):
                 self.circ_form_layout.addWidget(self.spin_default_days, 1, 1)
                 self.circ_form_layout.addWidget(self.circ_fine_desc, 2, 0)
                 self.circ_form_layout.addWidget(self.circ_days_desc, 2, 1)
-                self.circ_form_layout.addWidget(self.circ_max_renew_label, 3, 0, 1, 2)
-                self.circ_form_layout.addWidget(self.spin_max_renewals, 4, 0)
-                self.circ_form_layout.addWidget(self.circ_max_renew_desc, 4, 1)
-                self.circ_form_layout.addWidget(self.chk_allow_overdue_row, 5, 0, 1, 2)
+                self.circ_form_layout.addWidget(self.circ_student_max_label, 3, 0)
+                self.circ_form_layout.addWidget(self.circ_max_renew_label, 3, 1)
+                self.circ_form_layout.addWidget(self.spin_student_max_books, 4, 0)
+                self.circ_form_layout.addWidget(self.spin_max_renewals, 4, 1)
+                self.circ_form_layout.addWidget(self.circ_student_max_desc, 5, 0)
+                self.circ_form_layout.addWidget(self.circ_max_renew_desc, 5, 1)
+                self.circ_form_layout.addWidget(self.chk_allow_overdue_row, 6, 0, 1, 2)
                 self.circ_form_layout.setColumnStretch(0, 1)
                 self.circ_form_layout.setColumnStretch(1, 1)
 

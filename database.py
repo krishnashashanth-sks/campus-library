@@ -336,6 +336,7 @@ class LocalDatabase:
                 [
                     ("max_renewals", "2"),
                     ("allow_overdue_renewal", "1"),
+                    ("student_max_books", "3"),
                     ("email_complaint_import_enabled", "1"),
                     ("email_complaint_auto_reply", "1"),
                     ("email_complaint_filter_mode", "keywords"),
@@ -1535,12 +1536,56 @@ class LocalDatabase:
             return False, self._parse_db_error(exc, "default department restore")
 
     # LOAN POLICIES
+    def get_student_max_books(self, default=3):
+        """Retrieve the configured maximum concurrent book borrowing limit for students."""
+        try:
+            row = self.conn.execute("""
+                SELECT max_books_allowed FROM loan_policies WHERE role = 'Student' COLLATE NOCASE
+            """).fetchone()
+            if row and row[0] is not None:
+                return max(0, int(row[0]))
+        except (sqlite3.Error, TypeError, ValueError):
+            pass
+        try:
+            val = self.get_setting("student_max_books")
+            if val is not None:
+                return max(0, int(val))
+        except (TypeError, ValueError):
+            pass
+        return default
+
+    def set_student_max_books(self, max_books):
+        """Persist the maximum concurrent borrowing limit for students across settings & policies."""
+        try:
+            val = max(0, int(max_books))
+            with self._transaction():
+                self.conn.execute("""
+                    INSERT INTO settings(key, value) VALUES ('student_max_books', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """, (str(val),))
+                existing = self.conn.execute("""
+                    SELECT default_loan_days, fine_per_day FROM loan_policies WHERE role = 'Student' COLLATE NOCASE
+                """).fetchone()
+                days = existing[0] if existing else 14
+                fine = existing[1] if existing else 2.0
+                self.conn.execute("""
+                    INSERT INTO loan_policies(role, max_books_allowed, default_loan_days, fine_per_day)
+                    VALUES ('Student', ?, ?, ?)
+                    ON CONFLICT(role) DO UPDATE SET
+                        max_books_allowed = excluded.max_books_allowed
+                """, (val, days, fine))
+            return True, f"Student maximum borrowing limit set to {val} books."
+        except Exception as exc:
+            return False, self._parse_db_error(exc, "student book limit update")
+
     def get_loan_policy(self, role):
+        cleaned_role = self._clean(role)
+        is_student = (cleaned_role.casefold() == "student")
         try:
             row = self.conn.execute("""
                 SELECT max_books_allowed, default_loan_days, fine_per_day
                 FROM loan_policies WHERE role = ? COLLATE NOCASE
-            """, (self._clean(role),)).fetchone()
+            """, (cleaned_role,)).fetchone()
             if row:
                 return {
                     "max_books": int(row[0]),
@@ -1554,7 +1599,8 @@ class LocalDatabase:
         except (ValueError, TypeError):
             days = 14
         fine = self._money(self.get_setting("daily_fine", 2.0), 2.0)
-        return {"max_books": 3, "default_days": days, "fine_rate": fine}
+        default_max = self.get_student_max_books(3) if is_student else 3
+        return {"max_books": default_max, "default_days": days, "fine_rate": fine}
 
     def get_all_loan_policies(self):
         try:
@@ -1583,9 +1629,73 @@ class LocalDatabase:
                         default_loan_days = excluded.default_loan_days,
                         fine_per_day = excluded.fine_per_day
                 """, (role, max_books, default_days, fine))
+                if role.casefold() == "student":
+                    self.conn.execute("""
+                        INSERT INTO settings(key, value) VALUES ('student_max_books', ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """, (str(max_books),))
             return True, f"Loan policy for '{role}' updated."
         except Exception as exc:
             return False, self._parse_db_error(exc, "loan policy update")
+
+    def get_user_borrowing_status(self, user_id):
+        """
+        Comprehensive borrowing quota & active loan details for a user.
+        Returns a dict with borrowing status and active loan list or None if user not found.
+        """
+        uid = self._clean(user_id)
+        if not uid:
+            return None
+        try:
+            user = self.conn.execute(
+                "SELECT id, full_name, role, department, email FROM users WHERE id = ?", (uid,)
+            ).fetchone()
+            if not user:
+                return None
+            uid_val, full_name, role, department, email = user
+            policy = self.get_loan_policy(role)
+            max_books = int(policy.get("max_books", 3))
+
+            active_loans = self.conn.execute("""
+                SELECT l.id, l.book_id, b.title, l.due_date, l.checkout_date
+                FROM circulation_logs l
+                LEFT JOIN books b ON b.id = l.book_id
+                WHERE l.user_id = ? AND l.status = 'ISSUED'
+                ORDER BY l.id DESC
+            """, (uid_val,)).fetchall()
+
+            active_count = len(active_loans)
+            remaining_slots = max(0, max_books - active_count)
+            can_borrow = (active_count < max_books)
+            pending_fines = self.get_user_pending_fines_total(uid_val)
+
+            return {
+                "user_id": uid_val,
+                "full_name": full_name or "",
+                "role": role or "",
+                "department": department or "",
+                "email": email or "",
+                "active_count": active_count,
+                "max_books": max_books,
+                "remaining_slots": remaining_slots,
+                "can_borrow": can_borrow,
+                "active_books": [
+                    {
+                        "log_id": r[0],
+                        "book_id": r[1],
+                        "title": r[2] or f"Book {r[1]}",
+                        "due_date": r[3] or "",
+                        "checkout_date": r[4] or "",
+                    }
+                    for r in active_loans
+                ],
+                "pending_fines": pending_fines,
+                "default_days": int(policy.get("default_days", 14)),
+                "fine_rate": float(policy.get("fine_rate", 2.0)),
+            }
+        except sqlite3.Error:
+            logging.exception("Could not determine user borrowing status")
+            return None
 
     # USERS
     def insert_user(
@@ -1812,10 +1922,17 @@ class LocalDatabase:
                 active_count = self.conn.execute("""
                     SELECT COUNT(*) FROM circulation_logs WHERE user_id = ? AND status = 'ISSUED'
                 """, (uid,)).fetchone()[0]
-                if int(active_count) >= int(policy["max_books"]):
+                max_books = int(policy["max_books"])
+                if int(active_count) >= max_books:
+                    if role.strip().casefold() == "student":
+                        return False, (
+                            f"Issue denied: Student '{uid}' has reached the maximum allowed limit of "
+                            f"{max_books} issued books ({active_count}/{max_books} currently borrowed). "
+                            f"Please return an issued book before borrowing another."
+                        )
                     return False, (
-                        f"Issue denied: User has reached the maximum allowed limit of "
-                        f"{policy['max_books']} issued books for role '{role}'."
+                        f"Issue denied: User '{uid}' has reached the maximum allowed limit of "
+                        f"{max_books} issued books for role '{role}' ({active_count}/{max_books} currently borrowed)."
                     )
 
                 now = datetime.datetime.now().replace(second=0, microsecond=0)

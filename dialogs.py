@@ -6269,7 +6269,7 @@ class DepartmentManagerDialog(QDialog):
 # ============================================================
 
 class IssueBookDialog(QDialog):
-    """Dialog for collecting book issue information."""
+    """Dialog for collecting book issue information with live borrowing quota enforcement."""
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
@@ -6280,10 +6280,10 @@ class IssueBookDialog(QDialog):
         configure_dialog(
             self,
             "Issue Book",
-            470,
-            370,
+            490,
+            420,
             min_width=360,
-            min_height=300,
+            min_height=320,
         )
 
         layout = QVBoxLayout(self)
@@ -6306,6 +6306,11 @@ class IssueBookDialog(QDialog):
         self.input_book.setPlaceholderText(
             "Enter Book ID or scan barcode"
         )
+        self.input_book.textChanged.connect(self._update_book_hint)
+
+        self.lbl_book_hint = QLabel("")
+        self.lbl_book_hint.setWordWrap(True)
+        self.lbl_book_hint.setVisible(False)
 
         self.input_user = QLineEdit()
         self.input_user.setPlaceholderText(
@@ -6329,6 +6334,7 @@ class IssueBookDialog(QDialog):
         self.spin_days.valueChanged.connect(self._on_spin_days_edited)
 
         form.addRow("Book ID:", self.input_book)
+        form.addRow("", self.lbl_book_hint)
         form.addRow("User ID:", self.input_user)
         form.addRow("Loan Duration:", self.spin_days)
 
@@ -6336,7 +6342,7 @@ class IssueBookDialog(QDialog):
 
         c_hint = get_dialog_colors(self)
         self.lbl_policy_hint = QLabel(
-            "Loan duration automatically adopts the member's role policy when User ID is entered."
+            "Loan duration and concurrent book limit automatically adapt to the member's role policy when User ID is entered."
         )
         self.lbl_policy_hint.setWordWrap(True)
         self.lbl_policy_hint.setStyleSheet(
@@ -6355,13 +6361,12 @@ class IssueBookDialog(QDialog):
             create_button("Cancel", self.reject, variant="SecondaryButton")
         )
 
-        buttons.addWidget(
-            create_button(
-                "📤 Issue Book",
-                self.validate_and_accept,
-                variant="PrimaryButton",
-            )
+        self.btn_issue = create_button(
+            "📤 Issue Book",
+            self.validate_and_accept,
+            variant="PrimaryButton",
         )
+        buttons.addWidget(self.btn_issue)
 
         layout.addLayout(buttons)
 
@@ -6369,47 +6374,149 @@ class IssueBookDialog(QDialog):
         if not self.spin_days.signalsBlocked():
             self._user_edited_days = True
 
+    def _update_book_hint(self, *_):
+        bid = self.input_book.text().strip()
+        if not bid:
+            self.lbl_book_hint.setVisible(False)
+            return
+
+        c = get_dialog_colors(self)
+        try:
+            row = self.db.conn.execute(
+                "SELECT title, available_copies, total_copies FROM books WHERE id = ?", (bid,)
+            ).fetchone()
+            if not row:
+                self.lbl_book_hint.setText("⚠️ Book ID not found in library inventory.")
+                self.lbl_book_hint.setStyleSheet(
+                    f"color: {c['warning']}; font-size: 11px; font-weight: 600;"
+                )
+            elif int(row[1]) <= 0:
+                self.lbl_book_hint.setText(f"❌ '{row[0]}' has 0 available copies (0/{row[2]} in stock).")
+                self.lbl_book_hint.setStyleSheet(
+                    f"color: {c['danger']}; font-size: 11px; font-weight: 600;"
+                )
+            else:
+                self.lbl_book_hint.setText(f"📗 '{row[0]}' ({row[1]}/{row[2]} copies available)")
+                self.lbl_book_hint.setStyleSheet(
+                    f"color: {c['success']}; font-size: 11px; font-weight: 600;"
+                )
+            self.lbl_book_hint.setVisible(True)
+        except Exception:
+            self.lbl_book_hint.setVisible(False)
+
     def _update_user_policy_hint(self, *_):
         c = get_dialog_colors(self)
         uid = self.input_user.text().strip()
         if not uid:
             self.lbl_policy_hint.setText(
-                "Loan duration automatically adopts the member's role policy when User ID is entered."
+                "Loan duration and concurrent book limit automatically adapt to the member's role policy when User ID is entered."
             )
             self.lbl_policy_hint.setStyleSheet(
                 f"background: {c['surface_alt']}; color: {c['muted']}; "
                 f"border: 1px solid {c['border']}; border-radius: 7px; padding: 7px 10px;"
             )
+            if hasattr(self, "btn_issue"):
+                self.btn_issue.setEnabled(True)
+                self.btn_issue.setToolTip("")
             return
-        ok, user = self.db.get_user_details(uid)
-        if not ok or not user:
-            self.lbl_policy_hint.setText("Member ID not found in directory.")
-            self.lbl_policy_hint.setStyleSheet(
-                f"background: {c['danger_soft']}; color: {c['danger']}; "
-                f"border: 1px solid {c['danger']}; border-radius: 7px; padding: 7px 10px; font-weight: 600;"
-            )
-            return
-        role = user[3]
-        policy = self.db.get_loan_policy(role)
-        role_days = max(1, min(int(policy.get("default_days", 14)), 365))
+
+        status = None
+        if hasattr(self.db, "get_user_borrowing_status"):
+            status = self.db.get_user_borrowing_status(uid)
+
+        if not status:
+            ok, user = self.db.get_user_details(uid)
+            if not ok or not user:
+                self.lbl_policy_hint.setText("❌ Member ID not found in directory.")
+                self.lbl_policy_hint.setStyleSheet(
+                    f"background: {c['danger_soft']}; color: {c['danger']}; "
+                    f"border: 1px solid {c['danger']}; border-radius: 7px; padding: 7px 10px; font-weight: 600;"
+                )
+                if hasattr(self, "btn_issue"):
+                    self.btn_issue.setEnabled(True)
+                    self.btn_issue.setToolTip("")
+                return
+            role = user[3]
+            policy = self.db.get_loan_policy(role)
+            max_books = int(policy.get("max_books", 3))
+            default_days = int(policy.get("default_days", 14))
+            fine_rate = float(policy.get("fine_rate", 2.0))
+            name = user[1]
+            active_count = 0
+            remaining_slots = max_books
+            can_borrow = True
+            active_books = []
+            pending_fines = self.db.get_user_pending_fines_total(user[0])
+        else:
+            role = status["role"]
+            name = status["full_name"]
+            max_books = status["max_books"]
+            default_days = status["default_days"]
+            fine_rate = status["fine_rate"]
+            active_count = status["active_count"]
+            remaining_slots = status["remaining_slots"]
+            can_borrow = status["can_borrow"]
+            active_books = status["active_books"]
+            pending_fines = status["pending_fines"]
+
+        role_days = max(1, min(default_days, 365))
         if not self._user_edited_days:
             self.spin_days.blockSignals(True)
             self.spin_days.setValue(role_days)
             self.spin_days.blockSignals(False)
-        pending_fines = self.db.get_user_pending_fines_total(user[0])
-        fine_note = f" · Unpaid fines: {money(pending_fines)}" if pending_fines > 0 else ""
-        self.lbl_policy_hint.setText(
-            f"{user[1]} ({role}) · Max {policy.get('max_books', 3)} books · "
-            f"Default {role_days} days · ₹{policy.get('fine_rate', 2.0):.2f}/day{fine_note}"
-        )
-        banner_key = "warning" if pending_fines > 0 else "primary"
-        self.lbl_policy_hint.setStyleSheet(
-            f"background: {c[banner_key + '_soft']}; color: {c[banner_key]}; "
-            f"border: 1px solid {c[banner_key]}; border-radius: 7px; padding: 7px 10px; font-weight: 600;"
-        )
+
+        fine_note = f" · ⚠️ Unpaid fines: {money(pending_fines)}" if pending_fines > 0 else ""
+
+        if not can_borrow:
+            book_lines = ""
+            if active_books:
+                book_lines = "\nCurrently issued books:\n" + "\n".join(
+                    f"  • {b['title']} ({b['book_id']}) — Due: {b['due_date']}"
+                    for b in active_books[:3]
+                )
+                if len(active_books) > 3:
+                    book_lines += f"\n  • ... and {len(active_books)-3} more"
+
+            msg = (
+                f"🚫 Borrowing Limit Reached: {name} ({role})\n"
+                f"Active loans: {active_count} of {max_books} books allowed (0 slots remaining).\n"
+                f"Cannot issue additional books. Please return a book before issuing a new one."
+                f"{fine_note}{book_lines}"
+            )
+            self.lbl_policy_hint.setText(msg)
+            self.lbl_policy_hint.setStyleSheet(
+                f"background: {c['danger_soft']}; color: {c['danger']}; "
+                f"border: 1px solid {c['danger']}; border-radius: 7px; padding: 7px 10px; font-weight: 600;"
+            )
+            if hasattr(self, "btn_issue"):
+                self.btn_issue.setEnabled(False)
+                self.btn_issue.setToolTip(f"User has reached the maximum borrowing limit of {max_books} books.")
+        else:
+            active_info = f" · Quota: {active_count}/{max_books} issued ({remaining_slots} slot{'s' if remaining_slots != 1 else ''} open)"
+            if active_books:
+                loan_titles = ", ".join(f"{b['title']} ({b['book_id']})" for b in active_books[:2])
+                if len(active_books) > 2:
+                    loan_titles += f" +{len(active_books)-2} more"
+                active_info += f"\nCurrent: {loan_titles}"
+
+            self.lbl_policy_hint.setText(
+                f"👤 {name} ({role}){active_info}\n"
+                f"Default loan: {role_days} days · Overdue fine: ₹{fine_rate:.2f}/day{fine_note}"
+            )
+            banner_key = "warning" if pending_fines > 0 else "primary"
+            self.lbl_policy_hint.setStyleSheet(
+                f"background: {c[banner_key + '_soft']}; color: {c[banner_key]}; "
+                f"border: 1px solid {c[banner_key]}; border-radius: 7px; padding: 7px 10px; font-weight: 600;"
+            )
+            if hasattr(self, "btn_issue"):
+                self.btn_issue.setEnabled(True)
+                self.btn_issue.setToolTip("")
 
     def validate_and_accept(self):
-        if not self.input_book.text().strip():
+        bid = self.input_book.text().strip()
+        uid = self.input_user.text().strip()
+
+        if not bid:
             show_warning(
                 self,
                 "Missing Book ID",
@@ -6418,7 +6525,7 @@ class IssueBookDialog(QDialog):
             self.input_book.setFocus()
             return
 
-        if not self.input_user.text().strip():
+        if not uid:
             show_warning(
                 self,
                 "Missing User ID",
@@ -6426,6 +6533,64 @@ class IssueBookDialog(QDialog):
             )
             self.input_user.setFocus()
             return
+
+        # Pre-validate user status & quota
+        if hasattr(self.db, "get_user_borrowing_status"):
+            status = self.db.get_user_borrowing_status(uid)
+            if status is None:
+                show_warning(
+                    self,
+                    "Unregistered Member",
+                    f"User ID '{uid}' is not registered in the system."
+                )
+                self.input_user.setFocus()
+                return
+
+            if not status["can_borrow"]:
+                role_label = f"Student '{status['full_name']}'" if status["role"].casefold() == "student" else f"User '{status['full_name']}' ({status['role']})"
+                show_warning(
+                    self,
+                    "Borrowing Limit Reached",
+                    f"{role_label} has already reached the maximum borrowing limit of "
+                    f"{status['max_books']} books ({status['active_count']}/{status['max_books']} currently issued).\n\n"
+                    f"Please return an issued book before borrowing another."
+                )
+                return
+
+        # Pre-validate book availability
+        try:
+            book = self.db.conn.execute(
+                "SELECT available_copies, title FROM books WHERE id = ?", (bid,)
+            ).fetchone()
+            if not book:
+                show_warning(
+                    self,
+                    "Unregistered Book",
+                    f"Book ID '{bid}' is not registered in the system."
+                )
+                self.input_book.setFocus()
+                return
+            if int(book[0]) <= 0:
+                show_warning(
+                    self,
+                    "No Copies Available",
+                    f"Book '{book[1]}' (ID: {bid}) has no available copies to issue."
+                )
+                return
+
+            duplicate = self.db.conn.execute("""
+                SELECT 1 FROM circulation_logs
+                WHERE book_id = ? AND user_id = ? AND status = 'ISSUED' LIMIT 1
+            """, (bid, uid)).fetchone()
+            if duplicate:
+                show_warning(
+                    self,
+                    "Duplicate Loan",
+                    f"User '{uid}' already has Book ID '{bid}' currently issued."
+                )
+                return
+        except Exception:
+            pass
 
         self.accept()
 
