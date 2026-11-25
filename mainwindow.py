@@ -42,6 +42,9 @@ from email_queue import EmailQueueManager
 from help_dialog import HelpDialog
 from app_version import get_app_version
 from ui_responsive import active_screen_geometry
+import logging
+import html
+from cloud_backup_service import CloudBackupScheduler, read_sync_status
 
 
 class MainWindow(QMainWindow):
@@ -127,6 +130,35 @@ class MainWindow(QMainWindow):
             self._on_emailed_complaints_imported
         )
         self.email_sync_manager.start()
+
+        # Cloud backup & disaster recovery scheduler
+        self.cloud_backup_scheduler = CloudBackupScheduler(
+            self.db,
+            self,
+        )
+        self.cloud_backup_scheduler.sync_status_changed.connect(
+            self._on_cloud_sync_status_changed
+        )
+        if hasattr(self, "settings_view"):
+            self.cloud_backup_scheduler.sync_status_changed.connect(
+                lambda _status: self.settings_view.refresh_drive_status_ui()
+            )
+        self.cloud_backup_scheduler.start()
+        self.db.cloud_backup_scheduler = self.cloud_backup_scheduler
+
+        # External DB change watcher (PRAGMA data_version) for live UI auto-refresh
+        self._last_db_data_version = None
+        try:
+            self._last_db_data_version = self.db.get_data_stamp()[1]
+        except Exception:
+            pass
+
+        self._db_watcher_timer = QTimer(self)
+        self._db_watcher_timer.setInterval(3000)
+        self._db_watcher_timer.timeout.connect(
+            self._check_external_db_updates
+        )
+        self._db_watcher_timer.start()
 
     # ========================================================
     # THEME INTEGRATION
@@ -643,6 +675,24 @@ class MainWindow(QMainWindow):
                     border: none;
                 }}
 
+                /* Footer */
+
+                QFrame#AppFooter {{
+                    background-color: {surface};
+                    border-top: 1px solid {border};
+                }}
+
+                QLabel#CloudSyncFooterLabel {{
+                    color: {text};
+                    font-size: 11px;
+                    font-weight: 500;
+                }}
+
+                QLabel#DbModeFooterLabel {{
+                    color: {muted};
+                    font-size: 11px;
+                }}
+
             """)
 
             if hasattr(self, "theme_button"):
@@ -723,6 +773,7 @@ class MainWindow(QMainWindow):
 
         self.create_topbar(main_layout)
         self.create_content_area(main_layout)
+        self.create_footer(main_layout)
         self._init_quick_actions_fab()
         self._init_quick_actions_popup()
         search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
@@ -1429,7 +1480,11 @@ class MainWindow(QMainWindow):
         self.quick_actions_fab.setFixedSize(fab_w, fab_h)
         min_y = (self.topbar.height() + 6) if hasattr(self, "topbar") else 66
         x = max(12, self.width() - fab_w - margin_right)
-        y = max(min_y, self.height() - fab_h - margin_bottom)
+        footer_height = self.footer.height() if hasattr(self, "footer") else 0
+        y = max(
+            min_y,
+            self.height() - fab_h - margin_bottom - footer_height,
+        )
         self.quick_actions_fab.move(x, y)
         self.quick_actions_fab.raise_()
 
@@ -1943,6 +1998,116 @@ class MainWindow(QMainWindow):
             content_widget,
             1
         )
+
+    # ========================================================
+    # FOOTER & CLOUD SYNC STATUS
+    # ========================================================
+
+    def create_footer(self, parent_layout):
+        self.footer = QFrame()
+        self.footer.setObjectName("AppFooter")
+        self.footer.setFixedHeight(24)
+
+        footer_layout = QHBoxLayout(self.footer)
+        footer_layout.setContentsMargins(14, 1, 14, 1)
+        footer_layout.setSpacing(10)
+
+        # Keep the status concise here; the tooltip and Settings carry details.
+        self.cloud_sync_label = QLabel("● Waiting for Firestore sync")
+        self.cloud_sync_label.setObjectName("CloudSyncFooterLabel")
+        self.cloud_sync_label.setMinimumWidth(0)
+        self.cloud_sync_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        footer_layout.addWidget(self.cloud_sync_label, 1)
+
+        # Local SQLite WAL mode & safety indicator
+        self.db_mode_label = QLabel("SQLite WAL")
+        self.db_mode_label.setObjectName("DbModeFooterLabel")
+        self.db_mode_label.setToolTip("SQLite WAL mode • Concurrent safe")
+        footer_layout.addWidget(self.db_mode_label)
+
+        parent_layout.addWidget(self.footer)
+
+        # Initial status populate
+        self._on_cloud_sync_status_changed(
+            read_sync_status(getattr(self.db, "database_path", None))
+        )
+
+    def _check_external_db_updates(self):
+        """Poll SQLite PRAGMA data_version to detect cloud-sync writes and reload the active view."""
+        try:
+            stamp = self.db.get_data_stamp()
+            current_version = stamp[1]
+            if hasattr(self, "_last_db_data_version") and self._last_db_data_version is not None:
+                if current_version != self._last_db_data_version:
+                    self._last_db_data_version = current_version
+                    # Automatically refresh active page
+                    if hasattr(self, "pages") and hasattr(self, "refresh_page"):
+                        curr_idx = self.pages.currentIndex()
+                        self.refresh_page(curr_idx, force=True)
+                    # Notify scheduler to recheck status
+                    if hasattr(self, "cloud_backup_scheduler"):
+                        self.cloud_backup_scheduler._check_sync_status()
+            else:
+                self._last_db_data_version = current_version
+        except Exception:
+            pass
+
+    def _on_cloud_sync_status_changed(self, status: dict):
+        """Update read-only cloud sync badge and warning indicator in footer."""
+        if not hasattr(self, "cloud_sync_label"):
+            return
+
+        local_count = getattr(self.db, "get_total_books_count", lambda: 0)()
+        book_count = local_count if local_count > 0 else (status.get("book_count") or 0)
+
+        is_offline = status.get("is_offline", False)
+        safety_lock = status.get("safety_lock", False)
+        safety_reason = str(status.get("safety_lock_reason", "Safety lock triggered"))
+        state_str = str(status.get("status", "synced")).lower()
+        detail = str(
+            status.get("safety_lock_reason")
+            or status.get("last_error")
+            or status.get("message")
+            or "Firestore sync status"
+        )
+        count_text = f" ({book_count:,} books)" if book_count else ""
+
+        if safety_lock:
+            bullet_color = "#EF4444"
+            label = "Sync locked"
+        elif state_str == "setup_required":
+            bullet_color = "#F59E0B"
+            label = "Cloud sync setup required"
+        elif state_str == "pending":
+            bullet_color = "#F59E0B"
+            label = "Books waiting to sync"
+        elif state_str == "verification_required":
+            bullet_color = "#F59E0B"
+            label = "Cloud sync paused"
+        elif state_str == "error":
+            bullet_color = "#EF4444"
+            label = "Cloud sync needs attention"
+        elif is_offline:
+            bullet_color = "#F59E0B"
+            label = "Cloud sync overdue"
+        elif state_str == "syncing":
+            bullet_color = "#3B82F6"
+            label = "Syncing with Firestore"
+        elif state_str == "warning":
+            bullet_color = "#F59E0B"
+            label = "Sync status unavailable"
+        else:
+            bullet_color = "#10B981"
+            label = "Firestore sync active"
+
+        self.cloud_sync_label.setText(
+            f"<span style='color:{bullet_color};'>●</span> "
+            f"{html.escape(label)}{count_text}"
+        )
+        self.cloud_sync_label.setToolTip(detail)
 
     # ========================================================
     # SIDEBAR
@@ -2486,6 +2651,23 @@ class MainWindow(QMainWindow):
                 timer.stop()
             except (RuntimeError, AttributeError):
                 pass
+
+        db_watcher = getattr(self, "_db_watcher_timer", None)
+        if db_watcher is not None:
+            try:
+                db_watcher.stop()
+            except (RuntimeError, AttributeError):
+                pass
+
+        backup_sched = getattr(self, "cloud_backup_scheduler", None)
+        if backup_sched is not None:
+            try:
+                if backup_sched.stop():
+                    backup_sched.trigger_immediate_backup(reason="app_exit")
+                else:
+                    logging.error("Skipped shutdown snapshot because an earlier backup is still running.")
+            except Exception as error:
+                logging.warning("App shutdown backup error: %s", error)
 
         if self.theme_manager:
             signal = getattr(self.theme_manager, "themeChanged", None)

@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import datetime
+import html
 import shutil
 import sys
 from pathlib import Path
@@ -157,6 +158,67 @@ class _GoogleDriveSetupDialog(QDialog):
             QMessageBox.warning(self, "Invalid Client JSON", str(error))
             return
         self.client_json_text = raw_text
+        self.accept()
+
+
+class _FirebaseSyncSetupDialog(QDialog):
+    """Collect a verified Firebase staff account for the desktop sync client."""
+
+    def __init__(self, email="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Connect Cloud Firestore")
+        self.setModal(True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        title = QLabel("Connect the library's Firebase staff account")
+        title.setStyleSheet("font-size: 16px; font-weight: 800;")
+        configure_wrapped_label(title)
+        root.addWidget(title)
+
+        guide = QLabel(
+            "Use a verified Firebase Authentication account with an active "
+            "Admin or Librarian role in the hosted library website. The password "
+            "is saved in this Windows user's Credential Manager, exchanged for a "
+            "revocable Firebase session, and removed after the first successful sync."
+        )
+        configure_wrapped_label(guide)
+        root.addWidget(guide)
+
+        root.addWidget(QLabel("Firebase account email"))
+        self.email_input = QLineEdit(email)
+        self.email_input.setPlaceholderText("librarian@example.com")
+        root.addWidget(self.email_input)
+
+        root.addWidget(QLabel("Firebase account password"))
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.setPlaceholderText("Required to connect or re-authorize")
+        root.addWidget(self.password_input)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        connect = QPushButton("Save and Connect")
+        connect.setDefault(True)
+        connect.clicked.connect(self._accept_credentials)
+        buttons.addWidget(cancel)
+        buttons.addWidget(connect)
+        root.addLayout(buttons)
+        clamp_widget_to_screen(self, 520, 360, min_width=360, min_height=300)
+
+    def _accept_credentials(self):
+        email = self.email_input.text().strip().casefold()
+        password = self.password_input.text()
+        if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+            QMessageBox.warning(self, "Invalid Email", "Enter a valid Firebase account email.")
+            return
+        if not password:
+            QMessageBox.warning(self, "Password Required", "Enter the Firebase account password.")
+            return
         self.accept()
 
 
@@ -2184,109 +2246,177 @@ class SettingsView(QWidget):
             QTimer.singleShot(400, application.quit)
 
     def build_cloud_backup_section(self):
+        from cloud_backup_service import get_default_backup_watch_folder
+
         header = self.create_section_header(
-            "Cloud & Synced Folder Backup",
-            "Back up your library database with AES-256 encryption to "
-            "Google Drive or a synced desktop folder.",
+            "Cloud Sync & Disaster Recovery Architecture",
+            "High-speed real-time catalog synchronization via Google Cloud Firestore "
+            "complemented by automated off-site AES-256 disaster recovery backups on Google Drive.",
             accent_role="success",
         )
         self.content_layout.addWidget(header)
 
-        card = self.create_card_frame(accent_role="success")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 11, 14, 11)
-        layout.setSpacing(9)
+        # ---------------------------------------------------------
+        # Card 1: Google Drive Cloud Backup (AES-256 Disaster Recovery)
+        # ---------------------------------------------------------
+        card_drive = self.create_card_frame(accent_role="primary")
+        drive_layout = QVBoxLayout(card_drive)
+        drive_layout.setContentsMargins(14, 11, 14, 11)
+        drive_layout.setSpacing(9)
 
-        description = QLabel(
-            "Backups are encrypted before saving. The encryption key is kept "
-            "in this Windows account's Credential Manager; export a Recovery "
-            "Key once and store it safely offline so backups can be restored "
-            "on another computer."
+        drive_title = self.create_field_label("Google Drive Disaster Recovery (Off-site Cloud Storage)")
+        drive_layout.addWidget(drive_title)
+
+        drive_desc = QLabel(
+            "Full SQLite database snapshots are encrypted locally with AES-256-GCM and uploaded "
+            "directly to your institutional Google Drive storage via the Google Drive API. Restoring on "
+            "a new workstation requires your offline Recovery Key."
         )
-        description.setObjectName("MutedLabel")
-        configure_wrapped_label(description)
-        layout.addWidget(description)
+        drive_desc.setObjectName("MutedLabel")
+        configure_wrapped_label(drive_desc)
+        drive_layout.addWidget(drive_desc)
 
-        self.drive_status_label = QLabel("Google Drive: Checking status...")
-        self.drive_status_label.setObjectName("FieldLabel")
-        configure_wrapped_label(self.drive_status_label)
-        layout.addWidget(self.drive_status_label)
+        self.google_drive_status_label = QLabel("Google Drive: Checking status...")
+        self.google_drive_status_label.setObjectName("FieldLabel")
+        configure_wrapped_label(self.google_drive_status_label)
+        drive_layout.addWidget(self.google_drive_status_label)
 
-        self.drive_actions_host = QWidget()
-        self.drive_actions_host.setMinimumWidth(0)
-        actions = FlowLayout(self.drive_actions_host, margin=0, h_spacing=8, v_spacing=8)
+        self.google_drive_actions_host = QWidget()
+        self.google_drive_actions_host.setMinimumWidth(0)
+        gdrive_actions = FlowLayout(self.google_drive_actions_host, margin=0, h_spacing=8, v_spacing=8)
 
         self.drive_connect_btn = self.create_button(
             "Connect Google Drive",
             "PrimaryButton",
         )
-        self.drive_connect_btn.clicked.connect(
-            self.connect_google_drive
-        )
-        actions.addWidget(self.drive_connect_btn)
+        self.drive_connect_btn.clicked.connect(self.connect_google_drive)
+        gdrive_actions.addWidget(self.drive_connect_btn)
 
         self.drive_backup_btn = self.create_button(
-            "Back Up to Google Drive",
-            "InfoButton",
+            "Back Up to Google Drive Now",
+            "SuccessButton",
         )
-        self.drive_backup_btn.clicked.connect(
-            self.backup_to_google_drive
-        )
-        actions.addWidget(self.drive_backup_btn)
+        self.drive_backup_btn.clicked.connect(self.backup_to_google_drive)
+        gdrive_actions.addWidget(self.drive_backup_btn)
 
         self.drive_restore_btn = self.create_button(
-            "Restore Encrypted Backup",
+            "Restore from Google Drive",
             "SecondaryButton",
         )
-        self.drive_restore_btn.clicked.connect(
-            self.restore_from_google_drive
+        self.drive_restore_btn.clicked.connect(self.restore_from_google_drive)
+        gdrive_actions.addWidget(self.drive_restore_btn)
+
+        self.drive_disconnect_btn = self.create_button(
+            "Disconnect Drive",
+            "SecondaryButton",
         )
-        actions.addWidget(self.drive_restore_btn)
+        self.drive_disconnect_btn.clicked.connect(self.disconnect_google_drive)
+        gdrive_actions.addWidget(self.drive_disconnect_btn)
 
         self.drive_key_btn = self.create_button(
             "Export Recovery Key",
             "WarningButton",
         )
-        self.drive_key_btn.clicked.connect(
-            self.export_drive_recovery_key
-        )
-        actions.addWidget(self.drive_key_btn)
+        self.drive_key_btn.clicked.connect(self.export_drive_recovery_key)
+        gdrive_actions.addWidget(self.drive_key_btn)
 
-        self.drive_disconnect_btn = self.create_button(
-            "Disconnect Drive",
-            "DangerButton",
-        )
-        self.drive_disconnect_btn.clicked.connect(
-            self.disconnect_google_drive
-        )
-        actions.addWidget(self.drive_disconnect_btn)
+        drive_layout.addWidget(self.google_drive_actions_host)
 
-        auto_drive_row, self.auto_drive_backup_checkbox = self.create_wrapped_checkbox(
+        row_drive_chk, self.auto_drive_backup_checkbox = self.create_wrapped_checkbox(
             "Automatically upload one encrypted backup to Google Drive per day while open"
         )
-        layout.addWidget(self.drive_actions_host)
-        layout.addWidget(auto_drive_row)
-        layout.addWidget(self.create_separator())
+        auto_drive_enabled = self.db.get_setting("google_drive_auto_backup_enabled", "0")
+        self.auto_drive_backup_checkbox.setChecked(
+            str(auto_drive_enabled).casefold() in ("1", "true", "yes")
+        )
+        self.auto_drive_backup_checkbox.stateChanged.connect(
+            lambda state: self.db.set_setting(
+                "google_drive_auto_backup_enabled", "1" if state else "0"
+            )
+        )
+        drive_layout.addWidget(row_drive_chk)
+        self.content_layout.addWidget(card_drive)
 
-        sync_title = self.create_field_label(
-            "Synced Folder Backup (Zero Client JSON Needed)"
+        # ---------------------------------------------------------
+        # Card 2: Google Firebase Firestore (Real-Time Catalog Sync)
+        # ---------------------------------------------------------
+        card_firestore = self.create_card_frame(accent_role="success")
+        fs_layout = QVBoxLayout(card_firestore)
+        fs_layout.setContentsMargins(14, 11, 14, 11)
+        fs_layout.setSpacing(9)
+
+        fs_title = self.create_field_label("Cloud Firestore Live Catalog & Circulation Sync")
+        fs_layout.addWidget(fs_title)
+
+        fs_desc = QLabel(
+            "Continuous bi-directional catalog and circulation synchronization with Google Firebase Firestore "
+            "every 30 seconds. Guarantees that online patron catalog searches reflect real-time availability "
+            "while local operations run at microsecond SQLite WAL speed."
         )
-        sync_desc = QLabel(
-            "Recommended for librarians: choose a folder synced by Google Drive "
-            "for Desktop, OneDrive, a shared campus drive, or a USB drive. No "
-            "Google Cloud client.json setup is required."
+        fs_desc.setObjectName("MutedLabel")
+        configure_wrapped_label(fs_desc)
+        fs_layout.addWidget(fs_desc)
+
+        self.drive_status_label = QLabel("Cloud Firestore: Checking status...")
+        self.drive_status_label.setObjectName("FieldLabel")
+        configure_wrapped_label(self.drive_status_label)
+        fs_layout.addWidget(self.drive_status_label)
+
+        self.drive_actions_host = QWidget()
+        self.drive_actions_host.setMinimumWidth(0)
+        fs_actions = FlowLayout(self.drive_actions_host, margin=0, h_spacing=8, v_spacing=8)
+
+        self.cloud_sync_now_btn = self.create_button(
+            "Sync with Cloud Now",
+            "PrimaryButton",
         )
-        sync_desc.setObjectName("MutedLabel")
-        configure_wrapped_label(sync_desc)
-        layout.addWidget(sync_title)
-        layout.addWidget(sync_desc)
+        self.cloud_sync_now_btn.clicked.connect(self.sync_with_cloud_now)
+        fs_actions.addWidget(self.cloud_sync_now_btn)
+
+        self.firebase_sync_account_btn = self.create_button(
+            "Connect Firebase Staff Account",
+            "SuccessButton",
+        )
+        self.firebase_sync_account_btn.clicked.connect(self.connect_firebase_sync_account)
+        fs_actions.addWidget(self.firebase_sync_account_btn)
+
+        self.import_service_account_btn = self.create_button(
+            "Import Service Account Key",
+            "SecondaryButton",
+        )
+        self.import_service_account_btn.clicked.connect(self.import_service_account_key)
+        fs_actions.addWidget(self.import_service_account_btn)
+
+        fs_layout.addWidget(self.drive_actions_host)
+        self.content_layout.addWidget(card_firestore)
+
+        # ---------------------------------------------------------
+        # Card 3: Local Recovery Snapshot & Synced Folder (.clbk)
+        # ---------------------------------------------------------
+        card_local = self.create_card_frame(accent_role="info")
+        local_layout = QVBoxLayout(card_local)
+        local_layout.setContentsMargins(14, 11, 14, 11)
+        local_layout.setSpacing(9)
+
+        local_title = self.create_field_label("Local Recovery Snapshot & Synced Folder (.clbk)")
+        local_layout.addWidget(local_title)
+
+        local_desc = QLabel(
+            "Saves atomic AES-256 encrypted .clbk disaster recovery snapshots locally or into a folder "
+            "synchronized by Google Drive for Desktop, OneDrive, or an external USB backup drive without needing API keys. "
+            "Default: %APPDATA%\\Library\\Backups"
+        )
+        local_desc.setObjectName("MutedLabel")
+        configure_wrapped_label(local_desc)
+        local_layout.addWidget(local_desc)
 
         self.sync_folder_input = QLineEdit()
         self.sync_folder_input.setMinimumWidth(0)
-        self.sync_folder_input.setPlaceholderText(
-            "Select folder (e.g. G:\\My Drive\\Library Backups or C:\\LibraryBackups)"
-        )
-        layout.addWidget(self.sync_folder_input)
+        default_folder = get_default_backup_watch_folder()
+        self.sync_folder_input.setPlaceholderText(default_folder)
+        saved_folder = self.db.get_setting("sync_backup_folder")
+        self.sync_folder_input.setText(saved_folder or default_folder)
+        local_layout.addWidget(self.sync_folder_input)
 
         self.sync_actions_host = QWidget()
         self.sync_actions_host.setMinimumWidth(0)
@@ -2296,38 +2426,49 @@ class SettingsView(QWidget):
             "Choose Folder...",
             "SecondaryButton",
         )
-        self.browse_sync_folder_btn.clicked.connect(
-            self.choose_sync_backup_folder
-        )
+        self.browse_sync_folder_btn.clicked.connect(self.choose_sync_backup_folder)
         sync_actions.addWidget(self.browse_sync_folder_btn)
 
-        self.sync_folder_backup_btn = self.create_button(
-            "Back Up to Folder Now",
-            "InfoButton",
-        )
-        self.sync_folder_backup_btn.clicked.connect(
-            self.backup_to_selected_sync_folder
-        )
-        sync_actions.addWidget(self.sync_folder_backup_btn)
-
-        layout.addWidget(self.sync_actions_host)
-
-        auto_folder_row, self.auto_folder_backup_checkbox = self.create_wrapped_checkbox(
-            "Automatically save one encrypted backup per day to this folder while open"
-        )
-        layout.addWidget(auto_folder_row)
-
         self.save_drive_settings_btn = self.create_button(
-            "Save Backup Settings",
+            "Save Folder Path",
             "SuccessButton",
         )
-        self.save_drive_settings_btn.clicked.connect(
-            self.save_drive_backup_settings
+        self.save_drive_settings_btn.clicked.connect(self.save_drive_backup_settings)
+        sync_actions.addWidget(self.save_drive_settings_btn)
+
+        self.clbk_backup_btn = self.create_button(
+            "Create Local Snapshot (.clbk)",
+            "SecondaryButton",
         )
-        layout.addWidget(self.save_drive_settings_btn)
+        self.clbk_backup_btn.clicked.connect(self.backup_to_clbk_now)
+        sync_actions.addWidget(self.clbk_backup_btn)
+
+        self.clbk_restore_btn = self.create_button(
+            "Restore from Local .clbk",
+            "SecondaryButton",
+        )
+        self.clbk_restore_btn.clicked.connect(self.restore_from_clbk)
+        sync_actions.addWidget(self.clbk_restore_btn)
+
+        local_layout.addWidget(self.sync_actions_host)
+
+        row_folder_chk, self.auto_folder_backup_checkbox = self.create_wrapped_checkbox(
+            "Automatically create one local encrypted snapshot per day"
+        )
+        auto_folder_enabled = self.db.get_setting("sync_auto_backup_enabled", "0")
+        self.auto_folder_backup_checkbox.setChecked(
+            str(auto_folder_enabled).casefold() in ("1", "true", "yes")
+        )
+        self.auto_folder_backup_checkbox.stateChanged.connect(
+            lambda state: self.db.set_setting(
+                "sync_auto_backup_enabled", "1" if state else "0"
+            )
+        )
+        local_layout.addWidget(row_folder_chk)
+
+        self.content_layout.addWidget(card_local)
 
         self.refresh_drive_status_ui()
-        self.content_layout.addWidget(card)
 
     def save_email_settings(self, show_confirmation=True):
         sender = self.email_sender_input.text().strip().casefold()
@@ -2548,43 +2689,6 @@ class SettingsView(QWidget):
                 str(error),
             )
 
-    def refresh_drive_status_ui(self):
-        if not hasattr(self, "drive_status_label"):
-            return
-        try:
-            from google_drive_backup import get_drive_status
-
-            status = get_drive_status()
-        except Exception:
-            status = {
-                "connected": False,
-                "has_client_config": False,
-                "client_source": "",
-            }
-
-        connected = bool(status.get("connected"))
-        has_cfg = bool(status.get("has_client_config"))
-        source = status.get("client_source") or "saved configuration"
-
-        if connected:
-            self.drive_status_label.setText(
-                "Google Drive Status: Connected (ready — no client.json needed again)"
-            )
-            self.drive_connect_btn.setText("Reconnect Drive")
-        elif has_cfg:
-            self.drive_status_label.setText(
-                f"Google Drive Status: Ready to sign in ({source}) — click Connect Google Drive once."
-            )
-            self.drive_connect_btn.setText("Connect Google Drive")
-        else:
-            self.drive_status_label.setText(
-                "Google Drive Status: Not connected — use Connect Google Drive (one-time) "
-                "or Synced Folder Backup below."
-            )
-            self.drive_connect_btn.setText("Connect Google Drive")
-
-        self.drive_disconnect_btn.setEnabled(connected or has_cfg)
-
     def _obtain_drive_client_json_once(self):
         dialog = _GoogleDriveSetupDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -2603,10 +2707,9 @@ class SettingsView(QWidget):
                 answer = QMessageBox.question(
                     self,
                     "Google Drive Already Connected",
-                    "Google Drive is already signed in. Do you want to sign in "
+                    "Google Drive is already connected. Do you want to sign in "
                     "again with another Google account?",
-                    QMessageBox.StandardButton.Yes
-                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
                 if answer != QMessageBox.StandardButton.Yes:
@@ -2626,11 +2729,12 @@ class SettingsView(QWidget):
             QMessageBox.information(
                 self,
                 "Google Drive Connected",
-                "Google Drive is connected and saved in Windows Credential "
-                "Manager. You will not need to select client.json again.",
+                "Google Drive connected successfully. Your authorization is saved "
+                "securely in Windows Credential Manager.",
             )
             return True
         except Exception as error:
+            self.refresh_drive_status_ui()
             QMessageBox.critical(
                 self,
                 "Google Drive Connection Failed",
@@ -2642,68 +2746,24 @@ class SettingsView(QWidget):
         answer = QMessageBox.question(
             self,
             "Disconnect Google Drive",
-            "Sign out of the connected Google Drive account?\n\n"
-            "Your saved encryption recovery key will be kept so previously "
-            "created backups can still be restored.",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
+            "Are you sure you want to sign out of Google Drive? "
+            "Automatic and manual Google Drive backups will be paused until you sign in again.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-
         try:
             from google_drive_backup import disconnect_drive
-
             disconnect_drive(clear_client_config=False)
             self.refresh_drive_status_ui()
             QMessageBox.information(
                 self,
                 "Google Drive Disconnected",
-                "Google Drive sign-in was removed from Windows Credential Manager.",
+                "You have signed out of Google Drive. Your backup encryption key remains intact.",
             )
         except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Google Drive Error",
-                str(error),
-            )
-
-    def choose_sync_backup_folder(self):
-        start_dir = self.sync_folder_input.text().strip() or os.path.expanduser("~")
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Synced Backup Folder (Google Drive Desktop / OneDrive / USB)",
-            start_dir,
-        )
-        if folder:
-            self.sync_folder_input.setText(folder)
-
-    def backup_to_selected_sync_folder(self):
-        folder = self.sync_folder_input.text().strip()
-        if not folder:
-            self.choose_sync_backup_folder()
-            folder = self.sync_folder_input.text().strip()
-        if not folder:
-            return
-
-        try:
-            from google_drive_backup import backup_to_sync_folder
-
-            result = backup_to_sync_folder(self.db, folder)
-            self.db.set_setting("sync_backup_folder", folder)
-            self.db.set_setting("sync_last_backup", datetime.date.today().isoformat())
-            QMessageBox.information(
-                self,
-                "Folder Backup Complete",
-                f"Encrypted backup saved successfully:\n{result.get('path', '')}",
-            )
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Folder Backup Failed",
-                str(error),
-            )
+            QMessageBox.critical(self, "Disconnect Failed", str(error))
 
     def backup_to_google_drive(self):
         try:
@@ -2721,63 +2781,29 @@ class SettingsView(QWidget):
                 connect_drive(client_json_text=client_json_text)
 
             result = upload_encrypted_database_backup(self.db)
-            self.db.set_setting(
-                "google_drive_last_backup",
-                datetime.date.today().isoformat(),
-            )
+            today_str = datetime.date.today().isoformat()
+            self.db.set_setting("google_drive_last_backup", today_str)
             self.refresh_drive_status_ui()
             QMessageBox.information(
                 self,
                 "Google Drive Backup Complete",
-                f"Encrypted backup uploaded:\n{result.get('name', 'Library backup')}",
+                f"Encrypted database backup uploaded successfully to Google Drive:\n\n"
+                f"File: {result.get('name', 'library-backup.clbk')}\n"
+                f"File ID: {result.get('id', '')}\n\n"
+                "The backup is protected with AES-256 encryption. Your recovery key is stored securely in Windows Credential Manager.",
             )
         except Exception as error:
             self.refresh_drive_status_ui()
             QMessageBox.critical(
                 self,
                 "Google Drive Backup Failed",
-                str(error),
-            )
-
-    def save_drive_backup_settings(self):
-        try:
-            sync_folder = self.sync_folder_input.text().strip()
-            if self.auto_folder_backup_checkbox.isChecked() and not sync_folder:
-                raise RuntimeError(
-                    "Choose a synced backup folder before enabling automatic folder backups."
-                )
-            for key, value in (
-                (
-                    "google_drive_auto_backup_enabled",
-                    "1" if self.auto_drive_backup_checkbox.isChecked() else "0",
-                ),
-                ("sync_backup_folder", sync_folder),
-                (
-                    "sync_auto_backup_enabled",
-                    "1" if self.auto_folder_backup_checkbox.isChecked() else "0",
-                ),
-            ):
-                if not self.db.set_setting(key, value):
-                    raise RuntimeError(f"Unable to save backup setting '{key}'.")
-            QMessageBox.information(
-                self,
-                "Backup Settings Saved",
-                "Automatic backup settings were saved. Backups run once per day "
-                "while the application is open for Google Drive (when connected) "
-                "and for any configured synced folder.",
-            )
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Backup Settings Error",
-                str(error),
+                f"Could not upload backup to Google Drive:\n\n{error}",
             )
 
     def restore_from_google_drive(self):
         try:
             from google_drive_backup import (
                 connect_drive,
-                decrypt_backup_file,
                 download_and_decrypt_backup,
                 get_drive_status,
                 has_backup_encryption_key,
@@ -2785,77 +2811,14 @@ class SettingsView(QWidget):
             )
 
             status = get_drive_status()
-            source_box = QMessageBox(self)
-            source_box.setWindowTitle("Restore Encrypted Backup")
-            source_box.setIcon(QMessageBox.Icon.Question)
-            source_box.setText("Where would you like to restore the encrypted backup from?")
-            drive_btn = source_box.addButton(
-                "Google Drive Cloud",
-                QMessageBox.ButtonRole.AcceptRole,
-            )
-            local_btn = source_box.addButton(
-                "Local / Synced Folder (.clbk)",
-                QMessageBox.ButtonRole.ActionRole,
-            )
-            source_box.addButton(QMessageBox.StandardButton.Cancel)
-            source_box.exec()
-            clicked = source_box.clickedButton()
-            if clicked not in (drive_btn, local_btn):
-                return
-
-            if clicked is local_btn:
-                start_folder = self.sync_folder_input.text().strip() or ""
-                clbk_path, _ = QFileDialog.getOpenFileName(
-                    self,
-                    "Select Encrypted Library Backup (.clbk)",
-                    start_folder,
-                    "Encrypted Library Backup (*.clbk);;All Files (*)",
-                )
-                if not clbk_path:
-                    return
-
-                destination, _ = QFileDialog.getSaveFileName(
-                    self,
-                    "Restore Backup to a Separate File",
-                    str(os.path.expanduser("~/library_restored.db")),
-                    "SQLite Database (*.db)",
-                )
-                if not destination:
-                    return
-                if not destination.lower().endswith(".db"):
-                    destination += ".db"
-
-                recovery_key_file = None
-                if not has_backup_encryption_key():
-                    recovery_key_file, _ = QFileDialog.getOpenFileName(
-                        self,
-                        "Select Backup Recovery Key (.txt)",
-                        "",
-                        "Recovery Key (*.txt);;All Files (*)",
-                    )
-                    if not recovery_key_file:
+            if not status["connected"]:
+                if not status["has_client_config"]:
+                    client_json_text = self._obtain_drive_client_json_once()
+                    if not client_json_text:
                         return
-
-                restored_path = decrypt_backup_file(
-                    clbk_path,
-                    destination,
-                    recovery_key_file or None,
-                    getattr(self.db, "database_path", None),
-                )
-                QMessageBox.information(
-                    self,
-                    "Backup Restored",
-                    "The backup was decrypted and integrity-checked.\n\n"
-                    f"Restored database:\n{restored_path}\n\n"
-                    "The running application was not changed.",
-                )
-                return
-
-            if not status["connected"] and not status["has_client_config"]:
-                client_json_text = self._obtain_drive_client_json_once()
-                if not client_json_text:
-                    return
-                connect_drive(client_json_text=client_json_text)
+                    connect_drive(client_json_text=client_json_text)
+                else:
+                    connect_drive()
 
             backups = list_drive_backups()
             self.refresh_drive_status_ui()
@@ -2863,7 +2826,7 @@ class SettingsView(QWidget):
                 QMessageBox.information(
                     self,
                     "No Backups Found",
-                    "No encrypted library backups were found in this Drive.",
+                    "No encrypted library backups were found in your Google Drive.",
                 )
                 return
 
@@ -2873,19 +2836,19 @@ class SettingsView(QWidget):
             ]
             selected, accepted = QInputDialog.getItem(
                 self,
-                "Choose a Backup",
-                "Google Drive backup:",
+                "Choose a Google Drive Backup",
+                "Select a backup snapshot to restore:",
                 choices,
                 0,
                 False,
             )
-            if not accepted:
+            if not accepted or not selected:
                 return
 
             backup = backups[choices.index(selected)]
             destination, _ = QFileDialog.getSaveFileName(
                 self,
-                "Restore Backup to a Separate File",
+                "Restore Backup to a Separate Database File",
                 str(os.path.expanduser("~/library_restored.db")),
                 "SQLite Database (*.db)",
             )
@@ -2935,16 +2898,75 @@ class SettingsView(QWidget):
 
             QMessageBox.information(
                 self,
-                "Backup Restored",
-                "The backup was downloaded, decrypted, and integrity-checked.\n\n"
-                f"Restored database:\n{restored_path}\n\n"
-                "The running application was not changed.",
+                "Google Drive Restore Complete",
+                "The backup was downloaded, decrypted, and integrity-checked successfully.\n\n"
+                f"Restored Database:\n{restored_path}\n\n"
+                "The running active library database was not modified.",
             )
         except Exception as error:
             self.refresh_drive_status_ui()
             QMessageBox.critical(
                 self,
                 "Google Drive Restore Failed",
+                str(error),
+            )
+
+    def restore_from_clbk(self):
+        try:
+            from google_drive_backup import (
+                decrypt_backup_file,
+                has_backup_encryption_key,
+            )
+
+            start_folder = self.sync_folder_input.text().strip() if hasattr(self, "sync_folder_input") else ""
+            clbk_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Encrypted Disaster Recovery Backup (.clbk)",
+                start_folder,
+                "Encrypted Library Backup (*.clbk);;All Files (*)",
+            )
+            if not clbk_path:
+                return
+
+            destination, _ = QFileDialog.getSaveFileName(
+                self,
+                "Restore Backup to a Separate Database File",
+                str(os.path.expanduser("~/library_restored.db")),
+                "SQLite Database (*.db)",
+            )
+            if not destination:
+                return
+            if not destination.lower().endswith(".db"):
+                destination += ".db"
+
+            recovery_key_file = None
+            if not has_backup_encryption_key():
+                recovery_key_file, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Select Backup Recovery Key (.txt)",
+                    "",
+                    "Recovery Key (*.txt);;All Files (*)",
+                )
+                if not recovery_key_file:
+                    return
+
+            restored_path = decrypt_backup_file(
+                clbk_path,
+                destination,
+                recovery_key_file or None,
+                getattr(self.db, "database_path", None),
+            )
+            QMessageBox.information(
+                self,
+                "Local Backup Restored",
+                "The backup was decrypted and verified successfully.\n\n"
+                f"Restored Database:\n{restored_path}\n\n"
+                "The running active library database was not modified.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Restore Failed",
                 str(error),
             )
 
@@ -2969,8 +2991,8 @@ class SettingsView(QWidget):
                 "Protect Your Recovery Key",
                 "The recovery key was exported. Keep it offline in a "
                 "secure location separate from this computer and Google "
-                "Drive. Anyone with both a backup and this key can read "
-                "the database.",
+                "Drive. Anyone with both a backup and this key can decrypt "
+                "and read the database.",
             )
         except Exception as error:
             QMessageBox.critical(
@@ -2978,6 +3000,314 @@ class SettingsView(QWidget):
                 "Recovery Key Export Failed",
                 str(error),
             )
+
+    def choose_sync_backup_folder(self):
+        start_dir = self.sync_folder_input.text().strip() or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Local Recovery Snapshot Folder",
+            start_dir,
+        )
+        if folder:
+            self.sync_folder_input.setText(folder)
+
+    def backup_to_selected_sync_folder(self):
+        return self.backup_to_clbk_now()
+
+    def save_drive_backup_settings(self):
+        try:
+            sync_folder = self.sync_folder_input.text().strip() if hasattr(self, "sync_folder_input") else ""
+            self.db.set_setting("sync_backup_folder", sync_folder)
+            QMessageBox.information(
+                self,
+                "Backup Settings Saved",
+                "Local recovery snapshot folder updated. Firestore book synchronization and Google Drive backups run independently of this folder.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Backup Settings Error",
+                str(error),
+            )
+
+    def backup_to_clbk_now(self):
+        try:
+            from cloud_backup_service import (
+                export_atomic_clbk_backup,
+                get_sync_status_file_path,
+                write_sync_status,
+            )
+            folder = self.sync_folder_input.text().strip() if hasattr(self, "sync_folder_input") else None
+            result = export_atomic_clbk_backup(self.db, folder)
+            today_str = datetime.date.today().isoformat()
+            self.db.set_setting("last_daily_backup_date", today_str)
+            self.db.set_setting("last_backup_file", result.get("filename", ""))
+            write_sync_status(
+                get_sync_status_file_path(getattr(self.db, "database_path", None)),
+                None,
+                None,
+                {
+                    "last_daily_backup_date": today_str,
+                    "last_backup_text": result.get("filename", ""),
+                    "last_backup_at": result.get("timestamp", ""),
+                    "book_count": result.get("book_count"),
+                },
+            )
+            self.refresh_drive_status_ui()
+            QMessageBox.information(
+                self,
+                "Disaster Recovery Backup Complete",
+                f"Atomic encrypted disaster recovery backup (.clbk) created successfully:\n\n"
+                f"File: {result.get('filename')}\n"
+                f"Books Cataloged: {result.get('book_count'):,}\n"
+                f"Registered Users: {result.get('user_count'):,}\n"
+                f"Location: {result.get('path')}\n"
+                f"SHA-256 Checksum: {result.get('sha256')[:24]}...\n\n"
+                "This encrypted recovery snapshot is stored locally. Book data syncs separately to Firestore.",
+            )
+        except Exception as error:
+            self.refresh_drive_status_ui()
+            QMessageBox.critical(
+                self,
+                "Backup Failed",
+                f"Could not create disaster recovery backup:\n\n{error}",
+            )
+
+    def sync_with_cloud_now(self):
+        try:
+            scheduler = getattr(self.db, "cloud_backup_scheduler", None)
+            if not scheduler:
+                raise RuntimeError("The automatic Firestore sync service is not available.")
+            if not self.db.get_setting("firebase_sync_email", ""):
+                QMessageBox.warning(
+                    self,
+                    "Firebase Account Required",
+                    "Connect a verified Firebase Admin or Librarian account before syncing.",
+                )
+                self.connect_firebase_sync_account()
+                return
+            scheduler.trigger_async_sync(force=True)
+            self.refresh_drive_status_ui()
+            QMessageBox.information(
+                self,
+                "Firestore Sync Started",
+                "Book synchronization is running in the desktop app. The hosted website will receive Firestore updates automatically.",
+            )
+        except Exception as error:
+            self.refresh_drive_status_ui()
+            QMessageBox.critical(
+                self,
+                "Sync Failed",
+                f"Could not initiate cloud synchronization:\n\n{error}",
+            )
+
+    def import_service_account_key(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Google Cloud Service Account Key (.json)",
+            "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("type") != "service_account" or not data.get("private_key"):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Key File",
+                    "The selected file is not a valid Google Cloud service account private key JSON.",
+                )
+                return
+
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            app_data = os.getenv("APPDATA") or os.path.expanduser("~")
+            dest_repo = os.path.join(base_dir, "serviceAccountKey.json")
+            dest_appdata = os.path.join(app_data, "Library", "serviceAccountKey.json")
+
+            os.makedirs(os.path.dirname(dest_appdata), exist_ok=True)
+            shutil.copy2(file_path, dest_repo)
+            shutil.copy2(file_path, dest_appdata)
+
+            self.refresh_drive_status_ui()
+            scheduler = getattr(self.db, "cloud_backup_scheduler", None)
+            if scheduler:
+                scheduler.trigger_async_sync(force=True)
+
+            QMessageBox.information(
+                self,
+                "Service Account Connected",
+                "Google Cloud Service Account connected successfully! Full synchronization authority is active. "
+                "The background worker is now syncing book catalog changes with Cloud Firestore.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Import Failed",
+                f"Could not import service account key: {exc}",
+            )
+
+    def connect_firebase_sync_account(self):
+        from firestore_sync import (
+            FIREBASE_SYNC_PASSWORD_TARGET,
+            FIREBASE_SYNC_REFRESH_TOKEN_TARGET,
+        )
+
+        dialog = _FirebaseSyncSetupDialog(
+            self.db.get_setting("firebase_sync_email", ""),
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        email = dialog.email_input.text().strip().casefold()
+        password = dialog.password_input.text()
+        try:
+            delete_secret(FIREBASE_SYNC_REFRESH_TOKEN_TARGET)
+            store_secret(FIREBASE_SYNC_PASSWORD_TARGET, password, email)
+            self.db.set_setting("firebase_sync_email", email)
+            self.refresh_drive_status_ui()
+            scheduler = getattr(self.db, "cloud_backup_scheduler", None)
+            if scheduler:
+                scheduler.trigger_async_sync(force=True)
+            QMessageBox.information(
+                self,
+                "Firebase Account Saved",
+                "The desktop app is validating the account and starting book synchronization. "
+                "The password is protected by Windows Credential Manager.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Could Not Save Firebase Account",
+                str(error),
+            )
+
+    def refresh_drive_status_ui(self):
+        # 1. Update Google Drive Status
+        if hasattr(self, "google_drive_status_label"):
+            try:
+                from google_drive_backup import get_drive_status
+                drive_status = get_drive_status()
+                connected = drive_status.get("connected", False)
+                has_cfg = drive_status.get("has_client_config", False)
+                source = drive_status.get("client_source", "")
+                last_gdrive = self.db.get_setting("google_drive_last_backup", "None recorded yet")
+
+                if connected:
+                    gdrive_text = (
+                        f"● <span style='color:#10B981;'><b>Connected to Google Drive</b></span> "
+                        f"({html.escape(source)})<br>"
+                        f"Last Google Drive backup: {html.escape(last_gdrive)}"
+                    )
+                    if hasattr(self, "drive_connect_btn"):
+                        self.drive_connect_btn.setText("Change Google Account")
+                    if hasattr(self, "drive_disconnect_btn"):
+                        self.drive_disconnect_btn.setEnabled(True)
+                elif has_cfg:
+                    gdrive_text = (
+                        f"⚠ <span style='color:#F59E0B;'><b>Google OAuth Client Configured</b></span> "
+                        f"({html.escape(source)}) — Click 'Connect Google Drive' to complete Google sign-in."
+                    )
+                    if hasattr(self, "drive_connect_btn"):
+                        self.drive_connect_btn.setText("Connect Google Drive")
+                    if hasattr(self, "drive_disconnect_btn"):
+                        self.drive_disconnect_btn.setEnabled(False)
+                else:
+                    gdrive_text = (
+                        "○ <span style='color:#94A3B8;'><b>Not Connected</b></span> — "
+                        "Click 'Connect Google Drive' to authorize your institutional Google Drive storage."
+                    )
+                    if hasattr(self, "drive_connect_btn"):
+                        self.drive_connect_btn.setText("Connect Google Drive")
+                    if hasattr(self, "drive_disconnect_btn"):
+                        self.drive_disconnect_btn.setEnabled(False)
+
+                self.google_drive_status_label.setText(gdrive_text)
+            except Exception as err:
+                self.google_drive_status_label.setText(f"Google Drive: Status check failed ({err})")
+
+        # 2. Update Cloud Firestore Status
+        if hasattr(self, "drive_status_label"):
+            from cloud_backup_service import read_sync_status
+            status = read_sync_status(getattr(self.db, "database_path", None))
+
+            last_file = (
+                status.get("last_backup_text")
+                or self.db.get_setting("last_backup_file")
+                or "None yet"
+            )
+            last_date = (
+                status.get("last_daily_backup_date")
+                or self.db.get_setting("last_daily_backup_date")
+                or "None"
+            )
+            from firestore_sync import find_service_account_path
+            sa_path = find_service_account_path()
+            if hasattr(self, "import_service_account_btn"):
+                self.import_service_account_btn.setText(
+                    "Replace Service Account Key" if sa_path
+                    else "Import Service Account Key"
+                )
+
+            account_email = self.db.get_setting("firebase_sync_email", "")
+            if hasattr(self, "firebase_sync_account_btn"):
+                self.firebase_sync_account_btn.setText(
+                    "Change Firebase Staff Account" if account_email
+                    else "Connect Firebase Staff Account"
+                )
+
+            if status.get("safety_lock"):
+                text = (
+                    f"⛔ <span style='color:#EF4444;'><b>SAFETY LOCK ACTIVE</b></span>: {status.get('safety_lock_reason', 'Safety guard triggered')}<br>"
+                    "Automatic sync is locked to protect your data. Local transactions continue normally."
+                )
+            elif status.get("status") == "setup_required":
+                text = (
+                    "⚠ <span style='color:#F59E0B;'><b>Cloud account setup required</b></span><br>"
+                    "Connect a verified Firebase Admin or Librarian account. Local transactions and backups continue."
+                )
+            elif status.get("status") == "pending":
+                text = (
+                    "● <span style='color:#F59E0B;'><b>Local book changes waiting to sync</b></span><br>"
+                    "The app will send them to Firestore automatically when a network connection is available."
+                )
+            elif status.get("status") == "syncing":
+                text = "● <span style='color:#3B82F6;'><b>Syncing books with Firestore...</b></span>"
+            elif status.get("status") == "verification_required":
+                verification_message = html.escape(
+                    str(
+                        status.get("message")
+                        or "Complete email verification, then sync again."
+                    )
+                )
+                text = (
+                    "⚠ <span style='color:#F59E0B;'><b>Firebase account verification required</b></span><br>"
+                    f"{verification_message}<br>"
+                    "Local transactions and backups continue while cloud sync is paused."
+                )
+            elif status.get("status") == "error":
+                error = html.escape(str(status.get("last_error") or status.get("message") or "Unknown sync error"))
+                text = (
+                    f"⚠ <span style='color:#EF4444;'><b>Firestore sync needs attention</b></span><br>"
+                    f"{error}<br>Local changes are retained and the app will retry automatically."
+                )
+            elif status.get("is_offline"):
+                text = (
+                    f"⚠ <span style='color:#F59E0B;'><b>Firestore has not confirmed a sync for over 24 hours</b></span><br>"
+                    f"Last successful sync: {status.get('last_check_in') or 'Never'}. "
+                    "The desktop will retry when connected."
+                )
+            else:
+                text = (
+                    f"● <span style='color:#10B981;'><b>Firestore sync confirmed</b></span>: "
+                    f"{html.escape(str(status.get('message', 'Active')))}<br>"
+                    f"Last local snapshot: {html.escape(str(last_file))} ({html.escape(str(last_date))})"
+                )
+
+            self.drive_status_label.setText(text)
 
     # =========================================================
     # 5. DATABASE MAINTENANCE
@@ -3566,10 +3896,11 @@ class SettingsView(QWidget):
                     or self.email_import_complaints_checkbox.isChecked()
                 )
             )
-            self.auto_drive_backup_checkbox.setChecked(
-                str(auto_backup_enabled).casefold()
-                in ("1", "true", "yes")
-            )
+            if hasattr(self, "auto_drive_backup_checkbox"):
+                self.auto_drive_backup_checkbox.setChecked(
+                    str(auto_backup_enabled).casefold()
+                    in ("1", "true", "yes")
+                )
             if hasattr(self, "sync_folder_input"):
                 self.sync_folder_input.setText(sync_folder or "")
             if hasattr(self, "auto_folder_backup_checkbox"):

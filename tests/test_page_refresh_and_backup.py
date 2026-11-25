@@ -108,6 +108,49 @@ class PageSwitchCachingTests(unittest.TestCase):
         stamp2 = self.db.get_data_stamp()
         self.assertNotEqual(stamp1, stamp2)
 
+    def test_unverified_firebase_status_does_not_show_footer_error(self):
+        win = MainWindow(self.db)
+        try:
+            win._on_cloud_sync_status_changed(
+                {
+                    "status": "verification_required",
+                    "message": (
+                        "Verify the Firebase account email, then click Sync with Cloud Now."
+                    ),
+                    "book_count": 1,
+                }
+            )
+
+            footer_text = win.cloud_sync_label.text()
+            self.assertIn("Cloud sync paused", footer_text)
+            self.assertNotIn("Verify", footer_text)
+            self.assertIn("Verify the Firebase account", win.cloud_sync_label.toolTip())
+        finally:
+            win._shutdown_background_workers()
+            win.close()
+            win.deleteLater()
+            _pump(2)
+
+    def test_footer_stays_visible_and_clear_of_floating_quick_actions(self):
+        win = MainWindow(self.db)
+        try:
+            win.show()
+            for size in ((1092, 614), (1366, 768)):
+                win.resize(*size)
+                _pump(2)
+                self.assertTrue(win.footer.isVisible())
+                self.assertTrue(win.cloud_sync_label.isVisible())
+                self.assertGreater(win.cloud_sync_label.width(), 200)
+                self.assertFalse(
+                    win.quick_actions_fab.geometry().intersects(win.footer.geometry()),
+                    f"Quick Actions covers the footer at {size}",
+                )
+        finally:
+            win._shutdown_background_workers()
+            win.close()
+            win.deleteLater()
+            _pump(2)
+
     def test_switch_page_skips_unchanged_reloads_and_forces_when_requested(self):
         win = MainWindow(self.db)
         _pump(3)
@@ -456,23 +499,13 @@ class GoogleDriveAndSyncBackupTests(unittest.TestCase):
                 _pump(2)
 
                 self.assertEqual(view.settings_tabs.count(), 4)
-                self.assertIn("Not connected", view.drive_status_label.text())
-
-                # Enabling auto folder backup without choosing a folder shows friendly error
-                view.sync_folder_input.setText("")
-                view.auto_folder_backup_checkbox.setChecked(True)
-                view.save_drive_backup_settings()
-                mock_crit.assert_called_once()
-                self.assertEqual(db.get_setting("sync_auto_backup_enabled", "0"), "0")
+                self.assertIn("Cloud account setup required", view.drive_status_label.text())
 
                 sync_target = self.tmp_path / "DesktopDriveSync"
                 view.sync_folder_input.setText(os.fspath(sync_target))
-                view.auto_folder_backup_checkbox.setChecked(True)
-                view.auto_drive_backup_checkbox.setChecked(False)
                 view.save_drive_backup_settings()
                 mock_info.assert_called_once()
                 self.assertEqual(db.get_setting("sync_backup_folder", ""), os.fspath(sync_target))
-                self.assertEqual(db.get_setting("sync_auto_backup_enabled", "0"), "1")
 
                 # Guided one-time client.json setup dialog validates & fits screen
                 dlg = _GoogleDriveSetupDialog(view)
@@ -497,11 +530,9 @@ class GoogleDriveAndSyncBackupTests(unittest.TestCase):
                     dlg.deleteLater()
                     _pump(2)
 
-                # Connected status label reflects Credential Manager saved state
-                self.vault.store_secret(google_drive_backup.DRIVE_TOKEN_TARGET, '{"token":"ok"}')
+                # Status label reflects sync daemon state
                 view.refresh_drive_status_ui()
-                self.assertIn("Connected", view.drive_status_label.text())
-                self.assertIn("Reconnect", view.drive_connect_btn.text())
+                self.assertIn("Cloud account setup required", view.drive_status_label.text())
         finally:
             if view is not None:
                 view.stop_workers()

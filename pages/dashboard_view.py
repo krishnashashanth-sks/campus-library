@@ -2251,7 +2251,7 @@ class DashboardView(QWidget):
         outer_layout.addWidget(self.dashboard_scroll)
 
         self.main_layout = QVBoxLayout(self.dashboard_content)
-        self.main_layout.setContentsMargins(16, 6, 16, 40)
+        self.main_layout.setContentsMargins(16, 6, 16, 10)
         self.main_layout.setSpacing(6)
 
         self.dashboard_header_layout = QGridLayout()
@@ -3109,7 +3109,10 @@ class DashboardView(QWidget):
         )
         avail_w = max(320, self.width() - sb_w) if self.width() > 0 else 1080
         margin = 12 if avail_w < 840 else 16
-        self.main_layout.setContentsMargins(margin, 6, margin, 40)
+        win = self.window()
+        win_h = win.height() if win and win.height() > 0 else (self.height() if self.height() > 0 else 720)
+        bottom_margin = 12 if win_h < 660 else 34
+        self.main_layout.setContentsMargins(margin, 6, margin, bottom_margin)
 
         header_stacked = avail_w < 740
         if header_stacked != self._header_stacked and hasattr(self, "dashboard_header_layout"):

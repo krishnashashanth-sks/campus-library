@@ -28,6 +28,9 @@ client_secret*.json
 *client_secret*.json
 assets/google_drive_client.json
 assets/*client_secret*.json
+serviceAccountKey.json
+*serviceAccount*.json
+assets/serviceAccountKey.json
 
 # Local code-signing certificates & private keys (never commit private keys)
 certs/
@@ -37,3 +40,11 @@ certs/
 *.key
 
 .vscode/
+
+# Runtime sync state
+sync_status.json
+
+# Temporary Word / Office artifacts
+~$*
+~*.tmp
+extracted_media/

@@ -22,6 +22,15 @@ from utils import (
 )
 
 
+class SecurityTamperError(RuntimeError):
+    """Raised when database credentials fail cryptographic integrity verification or tampering is detected."""
+    pass
+
+
+_ADMIN_VAULT_TARGET = "LibraryManagementSystem_AdminSecurity_Vault"
+
+
+
 class LocalDatabase:
     """
     SQLite data-access layer for the Library Management System.
@@ -39,13 +48,13 @@ class LocalDatabase:
 
         self.conn = sqlite3.connect(
             self.database_path,
-            timeout=15,
+            timeout=5,
             check_same_thread=False,
             isolation_level="DEFERRED",
         )
         self.conn.row_factory = None
         self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA busy_timeout = 15000")
+        self.conn.execute("PRAGMA busy_timeout = 5000")
         try:
             self.conn.execute("PRAGMA journal_mode = WAL")
             self.conn.execute("PRAGMA synchronous = NORMAL")
@@ -125,6 +134,14 @@ class LocalDatabase:
         logging.exception("Database error [%s]: %s", context, error)
         return f"An unexpected error occurred while processing {context or 'the request'}."
 
+    def _trigger_cloud_sync(self, reason="data_change"):
+        """Notify the background auto-sync scheduler of database changes."""
+        if hasattr(self, "cloud_backup_scheduler") and self.cloud_backup_scheduler:
+            try:
+                self.cloud_backup_scheduler.schedule_debounced_backup(reason=reason)
+            except Exception:
+                logging.exception("Could not schedule background sync after %s", reason)
+
     def create_tables(self):
         """Create tables, indexes, and seed data without deleting existing records."""
         with self._transaction():
@@ -150,6 +167,8 @@ class LocalDatabase:
                     total_copies INTEGER NOT NULL DEFAULT 1 CHECK(total_copies >= 0),
                     available_copies INTEGER NOT NULL DEFAULT 1
                         CHECK(available_copies >= 0 AND available_copies <= total_copies),
+                    category TEXT NOT NULL DEFAULT 'General',
+                    shelf_location TEXT NOT NULL DEFAULT 'Main Stack',
                     created_at TIMESTAMP
                 )
             """)
@@ -283,6 +302,10 @@ class LocalDatabase:
 
             # Lightweight additive migrations for databases created by earlier versions.
             self._ensure_column("books", "isbn", "TEXT")
+            self._ensure_column("books", "updated_at", "TEXT")
+            self._ensure_column("books", "last_modified_by", "TEXT DEFAULT 'desktop'")
+            self._ensure_column("books", "category", "TEXT NOT NULL DEFAULT 'General'")
+            self._ensure_column("books", "shelf_location", "TEXT NOT NULL DEFAULT 'Main Stack'")
             self._ensure_column("circulation_logs", "log_code", "TEXT")
             self._ensure_column("circulation_logs", "status", "TEXT DEFAULT 'ISSUED'")
             self._ensure_column("circulation_logs", "fine_amount", "DECIMAL(10, 2) DEFAULT 0.00")
@@ -292,28 +315,141 @@ class LocalDatabase:
             self._ensure_column("circulation_logs", "fine_settled_at", "TIMESTAMP")
             self._ensure_column("circulation_logs", "fine_settlement_action", "TEXT")
             self._ensure_column("circulation_logs", "fine_settlement_note", "TEXT")
+            self._ensure_column("circulation_logs", "updated_at", "TEXT")
+            self._ensure_column("circulation_logs", "last_modified_by", "TEXT DEFAULT 'desktop'")
             self._ensure_column("users", "email", "TEXT")
+            self._ensure_column("users", "updated_at", "TEXT")
+            self._ensure_column("users", "last_modified_by", "TEXT DEFAULT 'desktop'")
             self._ensure_column("departments", "branch_code", "TEXT DEFAULT ''")
             self._ensure_column("complaints", "source", "TEXT DEFAULT 'DESK'")
             self._ensure_column("complaints", "reporter_name", "TEXT")
             self._ensure_column("complaints", "reporter_email", "TEXT")
             self._ensure_column("complaints", "email_message_id", "TEXT")
             self._ensure_column("complaints", "staff_notes", "TEXT")
+            self._ensure_column("email_queue", "dedupe_key", "TEXT")
+            self._ensure_column("email_queue", "reminder_loan_id", "INTEGER")
+            self._ensure_column("email_queue", "reminder_type", "TEXT")
+            self._ensure_column("email_queue", "next_attempt_at", "REAL NOT NULL DEFAULT 0")
+
+            # Backfill updated_at and last_modified_by for legacy records
+            cur.execute("UPDATE books SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE updated_at IS NULL")
+            cur.execute("UPDATE books SET last_modified_by = 'desktop' WHERE last_modified_by IS NULL")
+            cur.execute("UPDATE users SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE updated_at IS NULL")
+            cur.execute("UPDATE users SET last_modified_by = 'desktop' WHERE last_modified_by IS NULL")
+            cur.execute("UPDATE circulation_logs SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE updated_at IS NULL")
+            cur.execute("UPDATE circulation_logs SET last_modified_by = 'desktop' WHERE last_modified_by IS NULL")
 
             self._backfill_circulation_log_codes(cur)
 
             cur.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
                 CREATE INDEX IF NOT EXISTS idx_users_department ON users(department);
+                CREATE INDEX IF NOT EXISTS idx_users_updated ON users(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
+                CREATE INDEX IF NOT EXISTS idx_books_updated ON books(updated_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_logs_log_code ON circulation_logs(log_code COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_logs_user_status ON circulation_logs(user_id, status);
+                CREATE INDEX IF NOT EXISTS idx_logs_book_status ON circulation_logs(book_id, status);
+                CREATE INDEX IF NOT EXISTS idx_logs_due_status ON circulation_logs(due_date, status);
+                CREATE INDEX IF NOT EXISTS idx_logs_checkout ON circulation_logs(checkout_date);
+                CREATE INDEX IF NOT EXISTS idx_logs_updated ON circulation_logs(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_renewal_logs_loan ON renewal_logs(loan_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_fine_payments_loan ON fine_payments(loan_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_fine_payments_user ON fine_payments(user_id, id DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_email_queue_dedupe ON email_queue(dedupe_key);
+                CREATE INDEX IF NOT EXISTS idx_email_queue_pending ON email_queue(status, next_attempt_at);
+                CREATE INDEX IF NOT EXISTS idx_email_queue_status_created
+                    ON email_queue(status, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_complaints_email_message_id
+                    ON complaints(email_message_id)
+                    WHERE email_message_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_complaints_status_created
+                    ON complaints(status, created_at DESC, id DESC);
+
+                -- Triggers to maintain updated_at and last_modified_by on changes
+                CREATE TRIGGER IF NOT EXISTS trg_books_insert_meta
+                AFTER INSERT ON books
+                FOR EACH ROW
+                WHEN NEW.updated_at IS NULL OR NEW.last_modified_by IS NULL
+                BEGIN
+                    UPDATE books
+                    SET updated_at = COALESCE(NEW.updated_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        last_modified_by = COALESCE(NEW.last_modified_by, 'desktop')
+                    WHERE id = NEW.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_books_update_meta
+                AFTER UPDATE ON books
+                FOR EACH ROW
+                WHEN (NEW.updated_at IS OLD.updated_at OR NEW.updated_at IS NULL)
+                BEGIN
+                    UPDATE books
+                    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                        last_modified_by = CASE
+                            WHEN NEW.last_modified_by = 'web' THEN 'web'
+                            ELSE 'desktop'
+                        END
+                    WHERE id = NEW.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_users_insert_meta
+                AFTER INSERT ON users
+                FOR EACH ROW
+                WHEN NEW.updated_at IS NULL OR NEW.last_modified_by IS NULL
+                BEGIN
+                    UPDATE users
+                    SET updated_at = COALESCE(NEW.updated_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        last_modified_by = COALESCE(NEW.last_modified_by, 'desktop')
+                    WHERE id = NEW.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_users_update_meta
+                AFTER UPDATE ON users
+                FOR EACH ROW
+                WHEN (NEW.updated_at IS OLD.updated_at OR NEW.updated_at IS NULL)
+                BEGIN
+                    UPDATE users
+                    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                        last_modified_by = CASE
+                            WHEN NEW.last_modified_by = 'web' THEN 'web'
+                            ELSE 'desktop'
+                        END
+                    WHERE id = NEW.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_circ_insert_meta
+                AFTER INSERT ON circulation_logs
+                FOR EACH ROW
+                WHEN NEW.updated_at IS NULL OR NEW.last_modified_by IS NULL
+                BEGIN
+                    UPDATE circulation_logs
+                    SET updated_at = COALESCE(NEW.updated_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        last_modified_by = COALESCE(NEW.last_modified_by, 'desktop')
+                    WHERE id = NEW.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_circ_update_meta
+                AFTER UPDATE ON circulation_logs
+                FOR EACH ROW
+                WHEN (NEW.updated_at IS OLD.updated_at OR NEW.updated_at IS NULL)
+                BEGIN
+                    UPDATE circulation_logs
+                    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                        last_modified_by = CASE
+                            WHEN NEW.last_modified_by = 'web' THEN 'web'
+                            ELSE 'desktop'
+                        END
+                    WHERE id = NEW.id;
+                END;
+
                 CREATE INDEX IF NOT EXISTS idx_logs_book_status ON circulation_logs(book_id, status);
                 CREATE INDEX IF NOT EXISTS idx_logs_due_status ON circulation_logs(due_date, status);
                 CREATE INDEX IF NOT EXISTS idx_logs_checkout ON circulation_logs(checkout_date);
                 CREATE INDEX IF NOT EXISTS idx_renewal_logs_loan ON renewal_logs(loan_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_fine_payments_loan ON fine_payments(loan_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_fine_payments_user ON fine_payments(user_id, id DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_email_queue_dedupe ON email_queue(dedupe_key);
+                CREATE INDEX IF NOT EXISTS idx_email_queue_pending ON email_queue(status, next_attempt_at);
                 CREATE INDEX IF NOT EXISTS idx_email_queue_status_created
                     ON email_queue(status, created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_complaints_email_message_id
@@ -384,7 +520,10 @@ class LocalDatabase:
     def _ensure_column(self, table, column, declaration):
         existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
-            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            try:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            except sqlite3.OperationalError:
+                pass
 
     _LOG_CODE_PATTERN = re.compile(r"^CIR-(\d{6})-(\d+)$", re.IGNORECASE)
     _LOG_CODE_SQL = "COALESCE(NULLIF(log_code, ''), CAST(id AS TEXT))"
@@ -588,9 +727,9 @@ class LocalDatabase:
         cursor = self.conn.execute("""
             INSERT INTO email_queue(
                 recipient_email, subject, body, trigger_type, dedupe_key,
-                reminder_loan_id, reminder_type
+                reminder_loan_id, reminder_type, created_at, next_attempt_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), 0)
             ON CONFLICT(dedupe_key) DO NOTHING
         """, (
             self._clean(recipient_email),
@@ -894,13 +1033,124 @@ class LocalDatabase:
         normalized = re.sub(r"[\s-]", "", str(code or "")).upper()
         return normalized if re.fullmatch(r"[0-9A-F]{32}", normalized) else ""
 
+    def _get_admin_security_vault(self):
+        """Retrieve the Windows DPAPI-protected admin credential vault."""
+        try:
+            from secure_storage import read_secret
+            raw = read_secret(_ADMIN_VAULT_TARGET)
+            if raw:
+                import json
+                return json.loads(raw)
+        except Exception as error:
+            logging.debug("Windows Credential Vault read note: %s", error)
+        return None
+
+    def _save_admin_security_vault(self, vault_data: dict):
+        """Save the Windows DPAPI-protected admin credential vault."""
+        try:
+            from secure_storage import store_secret
+            import json
+            store_secret(
+                _ADMIN_VAULT_TARGET,
+                json.dumps(vault_data),
+                username="administrator",
+            )
+            return True
+        except Exception as error:
+            logging.warning("Unable to update Windows credential vault: %s", error)
+            return False
+
+    def _compute_admin_vault_signature(self, vault_key_bytes: bytes, secret_hash: str) -> str:
+        """Calculate HMAC-SHA256 signature for a database secret hash."""
+        return hmac.new(
+            vault_key_bytes,
+            str(secret_hash or "").encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _sync_admin_vault(self, password_hash: str = None, recovery_hash: str = None) -> bool:
+        """Create or update the DPAPI-protected vault signatures for the given hashes."""
+        vault = self._get_admin_security_vault() or {}
+        vault_key_hex = vault.get("vault_key")
+        if not vault_key_hex or len(vault_key_hex) < 32:
+            vault_key_bytes = secrets.token_bytes(32)
+            vault_key_hex = vault_key_bytes.hex()
+        else:
+            try:
+                vault_key_bytes = bytes.fromhex(vault_key_hex)
+            except ValueError:
+                vault_key_bytes = secrets.token_bytes(32)
+                vault_key_hex = vault_key_bytes.hex()
+
+        current_pwd_hash = password_hash if password_hash is not None else self.get_setting("admin_password_hash")
+        current_rec_hash = recovery_hash if recovery_hash is not None else self.get_setting("admin_recovery_code_hash")
+
+        password_sig = self._compute_admin_vault_signature(vault_key_bytes, current_pwd_hash) if current_pwd_hash else ""
+        recovery_sig = self._compute_admin_vault_signature(vault_key_bytes, current_rec_hash) if current_rec_hash else ""
+
+        vault_payload = {
+            "version": 2,
+            "vault_key": vault_key_hex,
+            "password_sig": password_sig,
+            "recovery_sig": recovery_sig,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        return self._save_admin_security_vault(vault_payload)
+
     def verify_admin_password(self, password):
+        """
+        Verify administrator password with dual-anchor protection:
+          1. Cryptographic PBKDF2-SHA256 hash comparison.
+          2. Windows DPAPI-anchored HMAC signature validation to prevent external database tampering.
+        """
         password = str(password or "")
         password_hash = self.get_setting("admin_password_hash")
 
         if password_hash:
+            # Check for external database tampering via Windows Credential Vault
+            vault = self._get_admin_security_vault()
+            if vault and vault.get("vault_key") and vault.get("password_sig"):
+                try:
+                    vault_key = bytes.fromhex(vault["vault_key"])
+                    expected_sig = self._compute_admin_vault_signature(vault_key, password_hash)
+                    if not hmac.compare_digest(vault["password_sig"], expected_sig):
+                        raise SecurityTamperError(
+                            "Database Integrity Violation: The administrator password hash in the database "
+                            "file was altered externally outside this application. "
+                            "External database tampering detected! Access is blocked."
+                        )
+                except ValueError:
+                    pass
+            elif vault is None:
+                # Vault not yet anchored (seamless first-run upgrade):
+                # Verify password against hash first; if valid, anchor immediately to Windows Credential Manager.
+                if self._verify_admin_secret(password, password_hash):
+                    rec_hash = self.get_setting("admin_recovery_code_hash")
+                    self._sync_admin_vault(password_hash, rec_hash)
+                    return True
+                return False
+
             return self._verify_admin_secret(password, password_hash)
 
+        # In an active database, missing password hash is a tampering / corruption event.
+        # Fallback to hardcoded 'admin123' is strictly disallowed if the database already has records.
+        has_active_data = False
+        try:
+            book_count = self.conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+            user_count = self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            if book_count > 0 or user_count > 0:
+                has_active_data = True
+        except Exception:
+            pass
+
+        if has_active_data:
+            raise SecurityTamperError(
+                "Security Alert: Administrator credentials were removed from the active database. "
+                "Default password fallback is blocked for security. "
+                "Please use your Administrator Recovery Code to restore access."
+            )
+
+        # Fresh empty database first-launch only
         legacy_password = self.get_setting("admin_password", "admin123")
         if not hmac.compare_digest(password, str(legacy_password)):
             return False
@@ -910,11 +1160,18 @@ class LocalDatabase:
         return True
 
     def set_admin_password(self, password):
+        """Set administrator password, hashing with PBKDF2 and anchoring to Windows Credential Vault."""
         password = str(password or "")
         if len(password) < 8:
             raise ValueError("The administrator password must contain at least 8 characters.")
 
         password_hash = self._hash_admin_secret(password)
+        rec_hash = self.get_setting("admin_recovery_code_hash")
+
+        # 1. Update Windows Credential Manager vault with HMAC signature
+        self._sync_admin_vault(password_hash=password_hash, recovery_hash=rec_hash)
+
+        # 2. Update SQLite database
         with self._transaction(immediate=True):
             self.conn.execute(
                 """
@@ -933,11 +1190,18 @@ class LocalDatabase:
         return bool(self.get_setting("admin_recovery_code_hash"))
 
     def set_admin_recovery_code(self, code):
+        """Set administrator recovery code, hashing with PBKDF2 and anchoring to Windows Credential Vault."""
         normalized = self._normalize_recovery_code(code)
         if not normalized:
             raise ValueError("The recovery code is invalid.")
 
         code_hash = self._hash_admin_secret(normalized)
+        pwd_hash = self.get_setting("admin_password_hash")
+
+        # 1. Update Windows Credential Manager vault with recovery HMAC signature
+        self._sync_admin_vault(password_hash=pwd_hash, recovery_hash=code_hash)
+
+        # 2. Update SQLite database
         with self._transaction(immediate=True):
             self.conn.execute(
                 """
@@ -951,11 +1215,24 @@ class LocalDatabase:
 
     def _verify_admin_recovery_code_hash(self, code, encoded_hash):
         normalized = self._normalize_recovery_code(code)
-        return bool(
-            normalized
-            and encoded_hash
-            and self._verify_admin_secret(normalized, encoded_hash)
-        )
+        if not normalized or not encoded_hash:
+            return False
+
+        # Verify against Windows Credential Vault if vault is anchored
+        vault = self._get_admin_security_vault()
+        if vault and vault.get("vault_key") and vault.get("recovery_sig"):
+            try:
+                vault_key = bytes.fromhex(vault["vault_key"])
+                expected_sig = self._compute_admin_vault_signature(vault_key, encoded_hash)
+                if not hmac.compare_digest(vault["recovery_sig"], expected_sig):
+                    raise SecurityTamperError(
+                        "Database Integrity Violation: The recovery code hash in the database was "
+                        "modified externally outside this application. Tampering detected!"
+                    )
+            except ValueError:
+                pass
+
+        return self._verify_admin_secret(normalized, encoded_hash)
 
     def verify_admin_recovery_code(self, code):
         return self._verify_admin_recovery_code_hash(
@@ -969,10 +1246,9 @@ class LocalDatabase:
         new_password,
         new_recovery_code,
     ):
+        """Reset administrator password using verified recovery code, updating both DB and Windows Vault."""
         new_password = str(new_password or "")
-        normalized_recovery = self._normalize_recovery_code(
-            new_recovery_code
-        )
+        normalized_recovery = self._normalize_recovery_code(new_recovery_code)
         if len(new_password) < 8:
             raise ValueError("The administrator password must contain at least 8 characters.")
         if not normalized_recovery:
@@ -993,6 +1269,9 @@ class LocalDatabase:
                 stored_hash[0],
             ):
                 return False
+
+            # Update Windows Credential Manager vault with new key & signatures
+            self._sync_admin_vault(password_hash=new_password_hash, recovery_hash=new_recovery_hash)
 
             self.conn.executemany(
                 """
@@ -1728,6 +2007,7 @@ class LocalDatabase:
                     name,
                     email,
                 )
+            self._trigger_cloud_sync("insert_user")
             return True, "User created successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "user registration")
@@ -1786,6 +2066,7 @@ class LocalDatabase:
                 ))
                 if cur.rowcount == 0:
                     return False, "User not found."
+            self._trigger_cloud_sync("edit_user")
             return True, "User details updated successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "user update")
@@ -1802,6 +2083,7 @@ class LocalDatabase:
                 cur = self.conn.execute("DELETE FROM users WHERE id = ?", (uid,))
                 if cur.rowcount == 0:
                     return False, "User not found."
+            self._trigger_cloud_sync("delete_user")
             return True, "User has been removed successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "user deletion")
@@ -1819,6 +2101,7 @@ class LocalDatabase:
                     INSERT INTO books(id, title, author, publisher, total_copies, available_copies, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (bid, title, author, publisher, total, available, datetime.date.today().isoformat()))
+            self._trigger_cloud_sync("insert_book")
             return True, "Book added successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "book entry")
@@ -1867,6 +2150,7 @@ class LocalDatabase:
                     WHERE id = ?
                 """, (self._clean(title), self._clean(author), self._clean(publisher),
                       total, available, self._clean(book_id)))
+            self._trigger_cloud_sync("edit_book")
             return True, "Book details updated successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "book update")
@@ -1883,6 +2167,7 @@ class LocalDatabase:
                 cur = self.conn.execute("DELETE FROM books WHERE id = ?", (bid,))
                 if cur.rowcount == 0:
                     return False, "Book not found."
+            self._trigger_cloud_sync("delete_book")
             return True, f"Successfully deleted book ({bid})."
         except Exception as exc:
             return False, self._parse_db_error(exc, "book deletion")
@@ -1970,6 +2255,7 @@ class LocalDatabase:
                         "ISSUE",
                         dedupe_key=f"issue:{log_code}",
                     )
+            self._trigger_cloud_sync("issue_book")
             return True, f"Book issued successfully! Transaction ID: {log_code} · Due Date: {due_text}"
         except Exception as exc:
             return False, self._parse_db_error(exc, "book issue")
@@ -2442,6 +2728,7 @@ class LocalDatabase:
                 "notes": final_notes,
                 "renewed_at": renewed_at,
             }
+            self._trigger_cloud_sync("renew_book")
             return True, details, f"Loan {format_log_id_display(display_id)} renewed successfully! New Due Date: {new_due}"
         except Exception as exc:
             return False, {}, self._parse_db_error(exc, "loan renewal")
@@ -2549,6 +2836,7 @@ class LocalDatabase:
                         "RETURN",
                         dedupe_key=f"return:{log_code}",
                     )
+            self._trigger_cloud_sync("return_book")
             return True, fine, f"Book returned successfully. Transaction ID: {log_code}"
         except Exception as exc:
             return False, 0.0, self._parse_db_error(exc, "book return")
@@ -2580,6 +2868,11 @@ class LocalDatabase:
                 self.conn.execute("DELETE FROM circulation_logs")
                 self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'circulation_logs'")
                 self.conn.execute("UPDATE books SET available_copies = total_copies")
+            if hasattr(self, "cloud_backup_scheduler") and self.cloud_backup_scheduler:
+                try:
+                    self.cloud_backup_scheduler.schedule_debounced_backup(reason="clear_logs")
+                except Exception:
+                    pass
             return True, "Circulation logs cleared successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "clearing logs")
@@ -3399,6 +3692,7 @@ class LocalDatabase:
                     """, (lid, bid, row_uid, amt, action_key, clean_note, now_text))
 
             verb = "collected" if action_key == "PAID" else "waived"
+            self._trigger_cloud_sync("settle_fines")
             return True, f"{len(rows)} fine(s) totaling ₹{total:.2f} marked as {verb} for {uid}."
         except Exception as exc:
             return False, self._parse_db_error(exc, "bulk fine settlement")
@@ -3775,6 +4069,11 @@ class LocalDatabase:
                             books.available_copies + excluded.available_copies,
                         isbn = COALESCE(excluded.isbn, books.isbn)
                 """, normalized)
+            if hasattr(self, "cloud_backup_scheduler") and self.cloud_backup_scheduler:
+                try:
+                    self.cloud_backup_scheduler.schedule_debounced_backup(reason="bulk_books_import")
+                except Exception:
+                    pass
             return True, len(normalized)
         except Exception as exc:
             self.conn.rollback()
@@ -3845,6 +4144,11 @@ class LocalDatabase:
                             user[0],
                             user[1],
                         )
+            if hasattr(self, "cloud_backup_scheduler") and self.cloud_backup_scheduler:
+                try:
+                    self.cloud_backup_scheduler.schedule_debounced_backup(reason="bulk_users_import")
+                except Exception:
+                    pass
             return True, len(normalized)
         except Exception as exc:
             self.conn.rollback()
@@ -3959,6 +4263,13 @@ class LocalDatabase:
         except sqlite3.Error:
             logging.exception("Could not read database statistics")
             return {}
+
+    def get_total_books_count(self) -> int:
+        """Returns the total number of book catalog items."""
+        try:
+            return int(self.conn.execute("SELECT COUNT(*) FROM books").fetchone()[0])
+        except Exception:
+            return 0
 
     def close(self):
         """Close the SQLite connection cleanly. Safe to call more than once."""

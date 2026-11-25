@@ -37,6 +37,7 @@ from PyQt6.QtGui import (
 )
 
 from app_version import APP_DEVELOPER_CREDIT, APP_NAME
+from database import SecurityTamperError
 from barcode_scanner import BarcodeDecoder, BarcodeScanResult, decode_image_file
 from update_service import RELEASES_PAGE_URL, is_newer_version
 from utils import (
@@ -4558,6 +4559,10 @@ class LoginDialog(QDialog):
 
         self.db = db
         self._verification_in_progress = False
+        self._failed_attempts = 0
+        self._lockout_until = None
+        self._lockout_timer = QTimer(self)
+        self._lockout_timer.timeout.connect(self._tick_lockout)
 
         configure_dialog(
             self,
@@ -4624,8 +4629,41 @@ class LoginDialog(QDialog):
 
         self.input_admin_password.setFocus()
 
+    def _tick_lockout(self):
+        if not self._lockout_until:
+            self._lockout_timer.stop()
+            self.btn_login.setEnabled(True)
+            self.btn_login.setText("Verify Password →")
+            return
+
+        remaining = int(self._lockout_until - time.time())
+        if remaining <= 0:
+            self._lockout_until = None
+            self._lockout_timer.stop()
+            self.btn_login.setEnabled(True)
+            self.btn_login.setText("Verify Password →")
+        else:
+            self.btn_login.setEnabled(False)
+            self.btn_login.setText(f"Locked ({remaining}s) →")
+
+    def closeEvent(self, event):
+        if hasattr(self, "_lockout_timer") and self._lockout_timer.isActive():
+            self._lockout_timer.stop()
+        super().closeEvent(event)
+
     def verify_password(self):
         if self._verification_in_progress:
+            return
+
+        if self._lockout_until and time.time() < self._lockout_until:
+            remaining = int(self._lockout_until - time.time())
+            show_warning(
+                self,
+                "Account Temporarily Locked",
+                f"Too many failed password attempts.\n\n"
+                f"Please wait {remaining} seconds before trying again, "
+                f"or click 'Forgot password?' to use your Administrator Recovery Code."
+            )
             return
 
         self._verification_in_progress = True
@@ -4634,15 +4672,32 @@ class LoginDialog(QDialog):
             entered = self.input_admin_password.text()
 
             if not self.db.verify_admin_password(entered):
-                show_error(
-                    self,
-                    "Access Denied",
-                    "Incorrect administrator password."
-                )
+                self._failed_attempts += 1
+                if self._failed_attempts >= 5:
+                    self._lockout_until = time.time() + 30
+                    self._lockout_timer.start(1000)
+                    self._tick_lockout()
+                    show_warning(
+                        self,
+                        "Account Locked",
+                        "Incorrect administrator password.\n\n"
+                        "Account locked for 30 seconds due to 5 consecutive failed attempts.\n"
+                        "You may wait for the countdown or use your Administrator Recovery Code."
+                    )
+                else:
+                    remaining_attempts = 5 - self._failed_attempts
+                    show_error(
+                        self,
+                        "Access Denied",
+                        f"Incorrect administrator password.\n\n"
+                        f"({remaining_attempts} attempt{'s' if remaining_attempts > 1 else ''} remaining before temporary lockout)"
+                    )
 
                 self.input_admin_password.clear()
                 self.input_admin_password.setFocus()
                 return
+
+            self._failed_attempts = 0
 
             if not self.db.has_admin_recovery_code():
                 setup_dialog = RecoveryCodeSetupDialog(self)
@@ -4662,6 +4717,16 @@ class LoginDialog(QDialog):
 
             self.accept()
 
+        except SecurityTamperError as error:
+            show_error(
+                self,
+                "Security Tamper Alert",
+                f"{error}\n\n"
+                "To restore legitimate access, please use your offline "
+                "Administrator Recovery Code via 'Forgot password?'."
+            )
+            self.input_admin_password.clear()
+            self.input_admin_password.setFocus()
         except Exception as error:
             show_error(self, "Authentication Error", error)
         finally:

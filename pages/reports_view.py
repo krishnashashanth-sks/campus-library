@@ -416,9 +416,8 @@ class ReportsView(QWidget):
 
             QFrame#ControlPanel {{
                 background: {c["surface"]};
-                border: 1.5px solid {c["border"]};
-                border-left: 4px solid {c["indigo"]};
-                border-radius: 12px;
+                border: 1px solid {c["border"]};
+                border-radius: 10px;
             }}
 
             QFrame#GraphField {{
@@ -467,9 +466,11 @@ class ReportsView(QWidget):
             QLabel#ControlLabel {{
                 color: {c["muted"]};
                 font-size: 11px;
-                font-weight: 700;
+                font-weight: 800;
+                letter-spacing: 0.5px;
                 background: transparent;
                 border: none;
+                padding: 0px 2px;
             }}
 
             QLabel#Readout {{
@@ -485,11 +486,13 @@ class ReportsView(QWidget):
             QDateEdit {{
                 background: {c["input"]};
                 color: {c["text"]};
-                border: 1.5px solid {c["border"]};
+                border: 1px solid {c["border_bright"]};
                 border-radius: 8px;
-                padding: 5px 7px;
-                min-width: 86px;
+                padding: 0px 8px;
+                min-height: 30px;
+                max-height: 30px;
                 font-size: 12px;
+                font-weight: 600;
             }}
 
             QDateEdit:focus {{
@@ -498,12 +501,14 @@ class ReportsView(QWidget):
 
             QDateEdit::drop-down {{
                 border: none;
-                width: 24px;
+                width: 22px;
             }}
 
             QPushButton {{
                 border-radius: 8px;
-                padding: 6px 11px;
+                padding: 0px 14px;
+                min-height: 30px;
+                max-height: 30px;
                 font-size: 11px;
                 font-weight: 700;
             }}
@@ -577,7 +582,7 @@ class ReportsView(QWidget):
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(16, 8, 16, 40)
+        main_layout.setContentsMargins(16, 8, 16, 10)
         main_layout.setSpacing(8)
         self.main_layout = main_layout
 
@@ -632,15 +637,18 @@ class ReportsView(QWidget):
         panel.setObjectName("ControlPanel")
         panel.setMinimumWidth(0)
 
-        layout = FlowLayout(panel, margin=8, h_spacing=7, v_spacing=6)
+        layout = FlowLayout(panel, margin=10, h_spacing=8, v_spacing=8)
 
-        from_pair = QWidget()
-        from_layout = QHBoxLayout(from_pair)
-        from_layout.setContentsMargins(0, 0, 0, 0)
-        from_layout.setSpacing(6)
+        date_range_box = QWidget()
+        date_range_box.setFixedHeight(32)
+        dr_layout = QHBoxLayout(date_range_box)
+        dr_layout.setContentsMargins(0, 0, 0, 0)
+        dr_layout.setSpacing(8)
+
         from_label = QLabel("FROM")
         from_label.setObjectName("ControlLabel")
-        from_layout.addWidget(from_label)
+        from_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        dr_layout.addWidget(from_label)
 
         self.start_date = QDateEdit()
         self.start_date.setCalendarPopup(True)
@@ -648,29 +656,27 @@ class ReportsView(QWidget):
         self.start_date.setDate(
             QDate.currentDate().addDays(-29)
         )
+        self.start_date.setFixedSize(128, 32)
         self.start_date.dateChanged.connect(
             self._on_date_changed
         )
-        from_layout.addWidget(self.start_date)
-        layout.addWidget(from_pair)
+        dr_layout.addWidget(self.start_date)
 
-        to_pair = QWidget()
-        to_layout = QHBoxLayout(to_pair)
-        to_layout.setContentsMargins(0, 0, 0, 0)
-        to_layout.setSpacing(6)
         to_label = QLabel("TO")
         to_label.setObjectName("ControlLabel")
-        to_layout.addWidget(to_label)
+        to_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        dr_layout.addWidget(to_label)
 
         self.end_date = QDateEdit()
         self.end_date.setCalendarPopup(True)
         self.end_date.setDisplayFormat("dd MMM yyyy")
         self.end_date.setDate(QDate.currentDate())
+        self.end_date.setFixedSize(128, 32)
         self.end_date.dateChanged.connect(
             self._on_date_changed
         )
-        to_layout.addWidget(self.end_date)
-        layout.addWidget(to_pair)
+        dr_layout.addWidget(self.end_date)
+        layout.addWidget(date_range_box)
 
         self.preset_buttons = {}
         for label, days in (
@@ -682,6 +688,7 @@ class ReportsView(QWidget):
             button.setObjectName("PresetBtn")
             button.setCheckable(True)
             button.setChecked(days == 30)
+            button.setFixedHeight(32)
             button.setCursor(
                 Qt.CursorShape.PointingHandCursor
             )
@@ -694,6 +701,7 @@ class ReportsView(QWidget):
         all_button = QPushButton("ALL TIME")
         all_button.setObjectName("PresetBtn")
         all_button.setCheckable(True)
+        all_button.setFixedHeight(32)
         all_button.setCursor(Qt.CursorShape.PointingHandCursor)
         all_button.clicked.connect(self.set_all_time)
         self.preset_buttons[36500] = all_button
@@ -701,12 +709,14 @@ class ReportsView(QWidget):
 
         refresh = QPushButton("↻  Refresh")
         refresh.setObjectName("PrimaryBtn")
+        refresh.setFixedHeight(32)
         refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         refresh.clicked.connect(self.load_analytics)
         layout.addWidget(refresh)
 
         export = QPushButton("↓  Export CSV")
         export.setObjectName("ExportBtn")
+        export.setFixedHeight(32)
         export.setCursor(Qt.CursorShape.PointingHandCursor)
         export.clicked.connect(self.export_csv)
         layout.addWidget(export)
@@ -857,7 +867,10 @@ class ReportsView(QWidget):
             return
         avail_w = max(320, self.width()) if self.width() > 0 else 1080
         margin = 12 if avail_w < 840 else 16
-        self.main_layout.setContentsMargins(margin, 6, margin, 40)
+        win = self.window()
+        win_h = win.height() if win and win.height() > 0 else (self.height() if self.height() > 0 else 720)
+        bottom_margin = 10 if win_h < 660 else 44
+        self.main_layout.setContentsMargins(margin, 6, margin, bottom_margin)
 
         cols = (
             5 if avail_w >= 960
