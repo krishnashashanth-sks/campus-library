@@ -164,6 +164,40 @@ class FirestoreBookSyncTests(unittest.TestCase):
         self.database.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def test_batch_get_uses_relative_firestore_document_names(self):
+        class BatchGetResponse(FakeResponse):
+            def __init__(self):
+                super().__init__([], 200)
+
+        class BatchGetSession:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                return BatchGetResponse()
+
+        session = BatchGetSession()
+        client = FirestoreRestClient(session=session)
+
+        self.assertEqual(client.get_books_by_ids(["BK-10001"]), {})
+        method, url, kwargs = session.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith(":batchGet"))
+        document_name = kwargs["json"]["documents"][0]
+        self.assertTrue(document_name.startswith("projects/"))
+        self.assertIn("/documents/books/BK-10001", document_name)
+        self.assertFalse(document_name.startswith("http"))
+
+    def test_batch_get_rejects_invalid_document_ids_before_request(self):
+        client = FirestoreRestClient(session=object())
+
+        with self.assertRaisesRegex(
+            FirestoreSyncError,
+            "Cannot look up invalid Firestore book ID",
+        ):
+            client.get_books_by_ids(["invalid/book/id"])
+
     def test_create_write_uses_server_timestamps_and_precondition(self):
         client = FirestoreRestClient(session=object())
         book = {

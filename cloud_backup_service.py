@@ -54,6 +54,9 @@ def _verification_email_was_sent_recently(path, email):
         except (OSError, json.JSONDecodeError):
             return False
 
+    if not isinstance(status, dict):
+        return False
+
     sent_email = str(status.get("verification_email_address", "")).casefold()
     sent_at = status.get("verification_email_sent_at")
     if sent_email != str(email or "").casefold() or not sent_at:
@@ -192,6 +195,19 @@ def read_sync_status(db_path: str = None) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+
+        if not isinstance(data, dict):
+            logger.warning("Ignoring malformed sync status JSON: root is not an object")
+            return {
+                "status": "warning",
+                "message": "Status unavailable",
+                "last_check_in": None,
+                "is_offline": False,
+                "safety_lock": False,
+                "book_count": None,
+                "last_error": "",
+                "last_backup_text": "",
+            }
 
         last_check_in_str = data.get("last_check_in") or data.get("last_synced_at")
         is_offline = False

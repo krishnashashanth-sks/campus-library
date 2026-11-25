@@ -228,6 +228,17 @@ class TestAtomicCLBKBackup(unittest.TestCase):
         self.assertTrue(status["safety_lock"])
         self.assertIn("Excessive remote deletions", status["safety_lock_reason"])
 
+    def test_malformed_sync_status_roots_are_handled_safely(self):
+        status_file = os.path.join(self.temp_dir, "sync_status.json")
+
+        with open(status_file, "w", encoding="utf-8") as f:
+            json.dump("syncing", f)
+
+        status = read_sync_status(self.db_path)
+        self.assertEqual(status["status"], "warning")
+        self.assertEqual(status["message"], "Status unavailable")
+        self.assertFalse(_verification_email_was_sent_recently(status_file, "staff@example.com"))
+
 
 class TestCloudBackupScheduler(unittest.TestCase):
     def setUp(self):

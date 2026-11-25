@@ -248,7 +248,7 @@ class FirestoreRestClient:
             data = response.json()
         except ValueError:
             data = {}
-        raw_error = data.get("error")
+        raw_error = data.get("error") if isinstance(data, dict) else None
         message = raw_error.get("message") if isinstance(raw_error, dict) else raw_error
         if raw_error == "invalid_grant":
             message = "The saved Firebase session expired or was revoked. Reconnect the staff account."
@@ -274,9 +274,12 @@ class FirestoreRestClient:
         if not response.ok:
             self._raise_response_error(response, operation)
         try:
-            return response.json()
+            data = response.json()
         except ValueError as exc:
             raise FirestoreSyncError(f"{operation} returned invalid JSON.") from exc
+        if not isinstance(data, dict):
+            raise FirestoreSyncError(f"{operation} returned an invalid response.")
+        return data
 
     def _ensure_email_verified(self, email):
         if not self.id_token:
@@ -566,8 +569,22 @@ class FirestoreRestClient:
         documents = {}
         ids = list(book_ids)
         for start in range(0, len(ids), _MAX_WRITES_PER_COMMIT):
+            invalid_ids = [
+                str(book_id)
+                for book_id in ids[start:start + _MAX_WRITES_PER_COMMIT]
+                if not _BOOK_ID_RE.fullmatch(str(book_id))
+            ]
+            if invalid_ids:
+                raise FirestoreSyncError(
+                    "Cannot look up invalid Firestore book ID(s): "
+                    + ", ".join(repr(book_id) for book_id in invalid_ids)
+                )
             names = [
-                f"{self._database_root}/books/{quote(book_id, safe='')}"
+                (
+                    f"projects/{FIREBASE_PROJECT_ID}/databases/"
+                    f"{FIRESTORE_DATABASE_ID}/documents/books/"
+                    f"{quote(str(book_id), safe='')}"
+                )
                 for book_id in ids[start:start + _MAX_WRITES_PER_COMMIT]
             ]
             response = self._request_json(
