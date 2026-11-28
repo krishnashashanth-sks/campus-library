@@ -1681,16 +1681,16 @@ class CatalogView(QWidget):
 
     def select_book_by_id(self, book_id):
 
-        target = str(book_id)
+        target = str(book_id).strip().casefold()
 
         for row in range(self.table.rowCount()):
 
             item = self.table.item(row, 0)
 
-            if item and item.text() == target:
+            if item and item.text().strip().casefold() == target:
 
                 self.table.selectRow(row)
-                self.current_book_id = target
+                self.current_book_id = item.text()
 
                 return True
 

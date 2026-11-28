@@ -2345,13 +2345,13 @@ class SettingsView(QWidget):
         fs_layout.setContentsMargins(14, 11, 14, 11)
         fs_layout.setSpacing(9)
 
-        fs_title = self.create_field_label("Cloud Firestore Live Catalog & Circulation Sync")
+        fs_title = self.create_field_label("Cloud Firestore Book Catalog Sync")
         fs_layout.addWidget(fs_title)
 
         fs_desc = QLabel(
-            "Continuous bi-directional catalog and circulation synchronization with Google Firebase Firestore "
-            "every 30 seconds. Guarantees that online patron catalog searches reflect real-time availability "
-            "while local operations run at microsecond SQLite WAL speed."
+            "The desktop app synchronizes the book catalog with Google Firebase Firestore. "
+            "Member records and circulation transactions remain in the desktop SQLite database "
+            "and are not synchronized to the website."
         )
         fs_desc.setObjectName("MutedLabel")
         configure_wrapped_label(fs_desc)
@@ -3091,7 +3091,8 @@ class SettingsView(QWidget):
             QMessageBox.information(
                 self,
                 "Firestore Sync Started",
-                "Book synchronization is running in the desktop app. The hosted website will receive Firestore updates automatically.",
+                "Book catalog synchronization is running. Member records and issue/return transactions "
+                "remain local to this desktop app and are not synchronized to the website.",
             )
         except Exception as error:
             self.refresh_drive_status_ui()

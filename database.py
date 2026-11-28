@@ -96,6 +96,10 @@ class LocalDatabase:
     def _clean(value):
         return str(value).strip() if value is not None else ""
 
+    @classmethod
+    def _normalize_identifier(cls, value):
+        return cls._clean(value).upper()
+
     @staticmethod
     def _money(value, default=0.0):
         try:
@@ -1922,12 +1926,13 @@ class LocalDatabase:
         Comprehensive borrowing quota & active loan details for a user.
         Returns a dict with borrowing status and active loan list or None if user not found.
         """
-        uid = self._clean(user_id)
+        uid = self._normalize_identifier(user_id)
         if not uid:
             return None
         try:
             user = self.conn.execute(
-                "SELECT id, full_name, role, department, email FROM users WHERE id = ?", (uid,)
+                "SELECT id, full_name, role, department, email "
+                "FROM users WHERE id = ? COLLATE NOCASE", (uid,)
             ).fetchone()
             if not user:
                 return None
@@ -1938,8 +1943,8 @@ class LocalDatabase:
             active_loans = self.conn.execute("""
                 SELECT l.id, l.book_id, b.title, l.due_date, l.checkout_date
                 FROM circulation_logs l
-                LEFT JOIN books b ON b.id = l.book_id
-                WHERE l.user_id = ? AND l.status = 'ISSUED'
+                LEFT JOIN books b ON b.id = l.book_id COLLATE NOCASE
+                WHERE l.user_id = ? COLLATE NOCASE AND l.status = 'ISSUED'
                 ORDER BY l.id DESC
             """, (uid_val,)).fetchall()
 
@@ -1986,7 +1991,7 @@ class LocalDatabase:
         department,
         email="",
     ):
-        uid, name = self._clean(user_id).upper(), self._clean(full_name)
+        uid, name = self._normalize_identifier(user_id), self._clean(full_name)
         phone = self._clean(phone_number) or None
         role, dept = self._clean(role), self._clean(department)
         email = self._clean(email).casefold() or None
@@ -1995,6 +2000,10 @@ class LocalDatabase:
         created = datetime.date.today().isoformat()
         try:
             with self._transaction():
+                if self.conn.execute(
+                    "SELECT 1 FROM users WHERE id = ? COLLATE NOCASE LIMIT 1", (uid,)
+                ).fetchone():
+                    return False, "A user with this ID / PIN already exists."
                 self.conn.execute("""
                     INSERT INTO users(
                         id, full_name, phone_number, role, department,
@@ -2029,7 +2038,7 @@ class LocalDatabase:
             row = self.conn.execute("""
                 SELECT id, full_name, COALESCE(phone_number, ''), role,
                     department, created_at, COALESCE(email, '')
-                FROM users WHERE id = ?
+                FROM users WHERE id = ? COLLATE NOCASE
             """, (self._clean(user_id),)).fetchone()
             return True, row
         except sqlite3.Error:
@@ -2055,14 +2064,14 @@ class LocalDatabase:
                 cur = self.conn.execute("""
                     UPDATE users SET full_name = ?, phone_number = ?,
                         role = ?, department = ?, email = ?
-                    WHERE id = ?
+                    WHERE id = ? COLLATE NOCASE
                 """, (
                     name,
                     phone,
                     role,
                     self._clean(dept),
                     email,
-                    self._clean(user_id),
+                    self._normalize_identifier(user_id),
                 ))
                 if cur.rowcount == 0:
                     return False, "User not found."
@@ -2072,15 +2081,18 @@ class LocalDatabase:
             return False, self._parse_db_error(exc, "user update")
 
     def delete_user(self, user_id):
-        uid = self._clean(user_id)
+        uid = self._normalize_identifier(user_id)
         try:
             with self._transaction(immediate=True):
                 active = self.conn.execute("""
-                    SELECT 1 FROM circulation_logs WHERE user_id = ? AND status = 'ISSUED' LIMIT 1
+                    SELECT 1 FROM circulation_logs
+                    WHERE user_id = ? COLLATE NOCASE AND status = 'ISSUED' LIMIT 1
                 """, (uid,)).fetchone()
                 if active:
                     return False, f"Cannot delete User ID ({uid}): They currently have active checked-out books."
-                cur = self.conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+                cur = self.conn.execute(
+                    "DELETE FROM users WHERE id = ? COLLATE NOCASE", (uid,)
+                )
                 if cur.rowcount == 0:
                     return False, "User not found."
             self._trigger_cloud_sync("delete_user")
@@ -2090,13 +2102,17 @@ class LocalDatabase:
 
     # BOOKS
     def insert_book(self, book_id, title, author, publisher, total, available):
-        bid, title = self._clean(book_id), self._clean(title)
+        bid, title = self._normalize_identifier(book_id), self._clean(title)
         author, publisher = self._clean(author), self._clean(publisher)
         try:
             total, available = int(total), int(available)
             if not bid or not title or total < 1 or available < 0 or available > total:
                 return False, "Enter a valid Book ID, title, total copies, and available copies."
             with self._transaction():
+                if self.conn.execute(
+                    "SELECT 1 FROM books WHERE id = ? COLLATE NOCASE LIMIT 1", (bid,)
+                ).fetchone():
+                    return False, "A book with this ID or ISBN already exists."
                 self.conn.execute("""
                     INSERT INTO books(id, title, author, publisher, total_copies, available_copies, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2121,7 +2137,7 @@ class LocalDatabase:
         try:
             row = self.conn.execute("""
                 SELECT id, title, author, publisher, total_copies, available_copies, created_at
-                FROM books WHERE id = ?
+                FROM books WHERE id = ? COLLATE NOCASE
             """, (self._clean(book_id),)).fetchone()
             return True, row
         except sqlite3.Error:
@@ -2135,8 +2151,9 @@ class LocalDatabase:
                 return False, "Invalid book details or copy counts."
             with self._transaction(immediate=True):
                 row = self.conn.execute("""
-                    SELECT total_copies, available_copies FROM books WHERE id = ?
-                """, (self._clean(book_id),)).fetchone()
+                    SELECT total_copies, available_copies FROM books
+                    WHERE id = ? COLLATE NOCASE
+                """, (self._normalize_identifier(book_id),)).fetchone()
                 if not row:
                     return False, "Book not found."
                 currently_issued = int(row[0]) - int(row[1])
@@ -2147,24 +2164,27 @@ class LocalDatabase:
                 self.conn.execute("""
                     UPDATE books SET title = ?, author = ?, publisher = ?,
                         total_copies = ?, available_copies = ?
-                    WHERE id = ?
+                    WHERE id = ? COLLATE NOCASE
                 """, (self._clean(title), self._clean(author), self._clean(publisher),
-                      total, available, self._clean(book_id)))
+                      total, available, self._normalize_identifier(book_id)))
             self._trigger_cloud_sync("edit_book")
             return True, "Book details updated successfully."
         except Exception as exc:
             return False, self._parse_db_error(exc, "book update")
 
     def delete_book(self, book_id):
-        bid = self._clean(book_id)
+        bid = self._normalize_identifier(book_id)
         try:
             with self._transaction(immediate=True):
                 active = self.conn.execute("""
-                    SELECT 1 FROM circulation_logs WHERE book_id = ? AND status = 'ISSUED' LIMIT 1
+                    SELECT 1 FROM circulation_logs
+                    WHERE book_id = ? COLLATE NOCASE AND status = 'ISSUED' LIMIT 1
                 """, (bid,)).fetchone()
                 if active:
                     return False, f"Cannot delete Book ID ({bid}): Copies of this book are currently issued."
-                cur = self.conn.execute("DELETE FROM books WHERE id = ?", (bid,))
+                cur = self.conn.execute(
+                    "DELETE FROM books WHERE id = ? COLLATE NOCASE", (bid,)
+                )
                 if cur.rowcount == 0:
                     return False, "Book not found."
             self._trigger_cloud_sync("delete_book")
@@ -2174,13 +2194,21 @@ class LocalDatabase:
 
     # CIRCULATION
     def issue_book(self, book_id, user_id, days_allowed=None):
-        bid, uid = self._clean(book_id), self._clean(user_id)
+        bid, uid = self._normalize_identifier(book_id), self._normalize_identifier(user_id)
         try:
             with self._transaction(immediate=True):
-                user = self.conn.execute("SELECT role FROM users WHERE id = ?", (uid,)).fetchone()
-                if not user:
+                users = self.conn.execute(
+                    "SELECT id, role FROM users WHERE id = ? COLLATE NOCASE", (uid,)
+                ).fetchall()
+                if not users:
                     return False, f"User ID '{uid}' is not registered in the system."
-                role = user[0]
+                if len(users) != 1:
+                    return False, (
+                        f"Multiple user records differ only by letter case for ID '{uid}'. "
+                        "Resolve the duplicate records before issuing books."
+                    )
+                user = users[0]
+                uid, role = user
                 policy = self.get_loan_policy(role)
                 try:
                     days = int(days_allowed) if days_allowed is not None else int(policy["default_days"])
@@ -2189,23 +2217,34 @@ class LocalDatabase:
                 if days < 1:
                     return False, "Loan duration must be at least one day."
 
-                book = self.conn.execute(
-                    "SELECT available_copies FROM books WHERE id = ?", (bid,)
-                ).fetchone()
-                if not book:
+                books = self.conn.execute(
+                    "SELECT id, available_copies FROM books "
+                    "WHERE id = ? COLLATE NOCASE", (bid,)
+                ).fetchall()
+                if not books:
                     return False, f"Book ID '{bid}' is not registered in the system."
-                if int(book[0]) <= 0:
+                if len(books) != 1:
+                    return False, (
+                        f"Multiple book records differ only by letter case for ID '{bid}'. "
+                        "Resolve the duplicate records before issuing books."
+                    )
+                book = books[0]
+                bid, available_copies = book
+                if int(available_copies) <= 0:
                     return False, f"Book ID '{bid}' has no available copies to issue."
 
                 duplicate = self.conn.execute("""
                     SELECT 1 FROM circulation_logs
-                    WHERE book_id = ? AND user_id = ? AND status = 'ISSUED' LIMIT 1
+                    WHERE book_id = ? COLLATE NOCASE
+                      AND user_id = ? COLLATE NOCASE
+                      AND status = 'ISSUED' LIMIT 1
                 """, (bid, uid)).fetchone()
                 if duplicate:
                     return False, f"User '{uid}' already has Book ID '{bid}' issued."
 
                 active_count = self.conn.execute("""
-                    SELECT COUNT(*) FROM circulation_logs WHERE user_id = ? AND status = 'ISSUED'
+                    SELECT COUNT(*) FROM circulation_logs
+                    WHERE user_id = ? COLLATE NOCASE AND status = 'ISSUED'
                 """, (uid,)).fetchone()[0]
                 max_books = int(policy["max_books"])
                 if int(active_count) >= max_books:
@@ -2233,13 +2272,13 @@ class LocalDatabase:
                 """, (log_code, bid, uid, checkout_text, due_text))
                 self.conn.execute("""
                     UPDATE books SET available_copies = available_copies - 1
-                    WHERE id = ? AND available_copies > 0
+                    WHERE id = ? COLLATE NOCASE AND available_copies > 0
                 """, (bid,))
                 details = self.conn.execute("""
                     SELECT u.email, u.full_name, b.title
                     FROM users u
-                    JOIN books b ON b.id = ?
-                    WHERE u.id = ?
+                    JOIN books b ON b.id = ? COLLATE NOCASE
+                    WHERE u.id = ? COLLATE NOCASE
                 """, (bid, uid)).fetchone()
                 if details and details[0]:
                     email, full_name, title = details
@@ -2349,11 +2388,13 @@ class LocalDatabase:
             return []
 
     def get_active_loan_id(self, book_id, user_id):
-        bid, uid = self._clean(book_id), self._clean(user_id)
+        bid, uid = self._normalize_identifier(book_id), self._normalize_identifier(user_id)
         try:
             row = self.conn.execute(f"""
                 SELECT {self._LOG_CODE_SQL} FROM circulation_logs
-                WHERE book_id = ? AND user_id = ? AND status = 'ISSUED'
+                WHERE book_id = ? COLLATE NOCASE
+                  AND user_id = ? COLLATE NOCASE
+                  AND status = 'ISSUED'
                 ORDER BY id DESC LIMIT 1
             """, (bid, uid)).fetchone()
             return str(row[0]) if row else None
@@ -2389,8 +2430,8 @@ class LocalDatabase:
                    COALESCE(u.full_name, 'Unknown User'), COALESCE(u.role, 'Student'),
                    COALESCE(u.department, ''), COALESCE(u.email, '')
             FROM circulation_logs c
-            LEFT JOIN books b ON b.id = c.book_id
-            LEFT JOIN users u ON u.id = c.user_id
+            LEFT JOIN books b ON b.id = c.book_id COLLATE NOCASE
+            LEFT JOIN users u ON u.id = c.user_id COLLATE NOCASE
             WHERE c.id = ?
         """, (lid,)).fetchone()
         if not row:
@@ -2416,7 +2457,7 @@ class LocalDatabase:
 
         active_loans_count = int(self.conn.execute("""
             SELECT COUNT(*) FROM circulation_logs
-            WHERE user_id = ? AND status = 'ISSUED'
+            WHERE user_id = ? COLLATE NOCASE AND status = 'ISSUED'
         """, (user_id,)).fetchone()[0])
 
         try:
@@ -2743,7 +2784,7 @@ class LocalDatabase:
         notes="",
         allow_limit_override=False,
     ):
-        bid, uid = self._clean(book_id), self._clean(user_id)
+        bid, uid = self._normalize_identifier(book_id), self._normalize_identifier(user_id)
         loan_id = self.get_active_loan_id(bid, uid)
         if loan_id is None:
             return False, {}, (
@@ -2759,23 +2800,40 @@ class LocalDatabase:
         )
 
     def return_book(self, book_id, user_id):
-        bid, uid = self._clean(book_id), self._clean(user_id)
+        bid, uid = self._normalize_identifier(book_id), self._normalize_identifier(user_id)
         try:
             with self._transaction(immediate=True):
-                book = self.conn.execute("""
-                    SELECT total_copies, available_copies FROM books WHERE id = ?
-                """, (bid,)).fetchone()
-                if not book:
+                books = self.conn.execute("""
+                    SELECT id FROM books
+                    WHERE id = ? COLLATE NOCASE
+                """, (bid,)).fetchall()
+                if not books:
                     return False, 0.0, f"Book ID '{bid}' was not found in the library database."
-                user = self.conn.execute("SELECT role FROM users WHERE id = ?", (uid,)).fetchone()
-                if not user:
+                if len(books) != 1:
+                    return False, 0.0, (
+                        f"Multiple book records differ only by letter case for ID '{bid}'. "
+                        "Resolve the duplicate records before returning books."
+                    )
+                bid = books[0][0]
+                users = self.conn.execute(
+                    "SELECT id, role FROM users WHERE id = ? COLLATE NOCASE", (uid,)
+                ).fetchall()
+                if not users:
                     return False, 0.0, f"User ID '{uid}' was not found in the library database."
+                if len(users) != 1:
+                    return False, 0.0, (
+                        f"Multiple user records differ only by letter case for ID '{uid}'. "
+                        "Resolve the duplicate records before returning books."
+                    )
+                uid, role = users[0]
 
-                policy = self.get_loan_policy(user[0])
+                policy = self.get_loan_policy(role)
                 record = self.conn.execute(f"""
                     SELECT id, {self._LOG_CODE_SQL}, due_date, COALESCE(fine_amount, 0)
                     FROM circulation_logs
-                    WHERE book_id = ? AND user_id = ? AND status = 'ISSUED'
+                    WHERE book_id = ? COLLATE NOCASE
+                      AND user_id = ? COLLATE NOCASE
+                      AND status = 'ISSUED'
                     ORDER BY id DESC LIMIT 1
                 """, (bid, uid)).fetchone()
                 if not record:
@@ -2809,13 +2867,13 @@ class LocalDatabase:
                 """, (returned_text, fine, fine, fine, fine, fine, log_id))
                 self.conn.execute("""
                     UPDATE books SET available_copies = MIN(total_copies, available_copies + 1)
-                    WHERE id = ?
+                    WHERE id = ? COLLATE NOCASE
                 """, (bid,))
                 details = self.conn.execute("""
                     SELECT u.email, u.full_name, b.title
                     FROM users u
-                    JOIN books b ON b.id = ?
-                    WHERE u.id = ?
+                    JOIN books b ON b.id = ? COLLATE NOCASE
+                    WHERE u.id = ? COLLATE NOCASE
                 """, (bid, uid)).fetchone()
                 if details and details[0]:
                     email, full_name, title = details
@@ -2882,9 +2940,10 @@ class LocalDatabase:
             return self.conn.execute("""
                 SELECT b.id, b.title, b.author, b.publisher, c.status,
                        c.checkout_date, c.due_date, c.return_date, c.fine_amount
-                FROM circulation_logs c JOIN books b ON c.book_id = b.id
-                WHERE c.user_id = ? ORDER BY c.id DESC
-            """, (self._clean(user_id),)).fetchall()
+                FROM circulation_logs c
+                JOIN books b ON c.book_id = b.id COLLATE NOCASE
+                WHERE c.user_id = ? COLLATE NOCASE ORDER BY c.id DESC
+            """, (self._normalize_identifier(user_id),)).fetchall()
         except sqlite3.Error:
             logging.exception("Error getting user books status")
             return []
@@ -2941,14 +3000,15 @@ class LocalDatabase:
         try:
             return self.conn.execute("""
                 SELECT user_id, due_date FROM circulation_logs
-                WHERE book_id = ? AND status = 'ISSUED' ORDER BY id DESC LIMIT 1
-            """, (self._clean(book_id),)).fetchone()
+                WHERE book_id = ? COLLATE NOCASE
+                  AND status = 'ISSUED' ORDER BY id DESC LIMIT 1
+            """, (self._normalize_identifier(book_id),)).fetchone()
         except sqlite3.Error:
             logging.exception("Could not get book circulation status")
             return None
 
     def get_active_loans_for_book(self, book_id: str):
-        bid = self._clean(book_id)
+        bid = self._normalize_identifier(book_id)
         if not bid:
             return []
         try:
@@ -2960,8 +3020,8 @@ class LocalDatabase:
                        COALESCE(c.checkout_date, ''),
                        COALESCE(c.due_date, '')
                 FROM circulation_logs c
-                LEFT JOIN users u ON c.user_id = u.id
-                WHERE c.book_id = ? AND c.status = 'ISSUED'
+                LEFT JOIN users u ON c.user_id = u.id COLLATE NOCASE
+                WHERE c.book_id = ? COLLATE NOCASE AND c.status = 'ISSUED'
                 ORDER BY c.id DESC
             """, (bid,)).fetchall()
             return [
@@ -2991,8 +3051,8 @@ class LocalDatabase:
                         ELSE 'overdue'
                     END
                 FROM circulation_logs c
-                JOIN users u ON u.id = c.user_id
-                JOIN books b ON b.id = c.book_id
+                JOIN users u ON u.id = c.user_id COLLATE NOCASE
+                JOIN books b ON b.id = c.book_id COLLATE NOCASE
                 WHERE c.status = 'ISSUED'
                     AND COALESCE(u.email, '') != ''
                     AND substr(c.due_date, 1, 10) <= ?
@@ -3213,7 +3273,7 @@ class LocalDatabase:
                         COALESCE(NULLIF(u.email, ''), NULLIF(c.reporter_email, ''), ''),
                         c.subject, c.body, c.created_at
                     FROM complaints c
-                    LEFT JOIN users u ON u.id = c.user_id
+                    LEFT JOIN users u ON u.id = c.user_id COLLATE NOCASE
                     WHERE c.id = ?
                 """, (complaint_id,)).fetchone()
             return True, row
@@ -3323,7 +3383,7 @@ class LocalDatabase:
                         COALESCE(NULLIF(u.email, ''), NULLIF(c.reporter_email, ''), ''),
                         c.subject, c.body, c.created_at
                     FROM complaints c
-                    LEFT JOIN users u ON u.id = c.user_id
+                    LEFT JOIN users u ON u.id = c.user_id COLLATE NOCASE
                     WHERE c.id = ?
                 """, (complaint_id,)).fetchone()
             return True, "IMPORTED", row
@@ -3340,7 +3400,7 @@ class LocalDatabase:
                     c.subject, c.body, c.status,
                     c.created_at, c.updated_at
                 FROM complaints c
-                LEFT JOIN users u ON u.id = c.user_id
+                LEFT JOIN users u ON u.id = c.user_id COLLATE NOCASE
             """
             parameters = ()
             if status and status != "ALL":
@@ -3366,7 +3426,7 @@ class LocalDatabase:
                     COALESCE(c.email_message_id, ''),
                     COALESCE(c.staff_notes, '')
                 FROM complaints c
-                LEFT JOIN users u ON u.id = c.user_id
+                LEFT JOIN users u ON u.id = c.user_id COLLATE NOCASE
             """
             clauses = []
             params = []
@@ -3543,8 +3603,8 @@ class LocalDatabase:
                    COALESCE(c.return_date, ''),
                    COALESCE(c.renewal_count, 0)
             FROM circulation_logs c
-            LEFT JOIN users u ON u.id = c.user_id
-            LEFT JOIN books b ON b.id = c.book_id
+            LEFT JOIN users u ON u.id = c.user_id COLLATE NOCASE
+            LEFT JOIN books b ON b.id = c.book_id COLLATE NOCASE
             WHERE c.fine_amount > 0
               AND COALESCE(c.fine_settled, 0) = 0
               AND UPPER(COALESCE(c.status, '')) != 'PAID'
@@ -3580,7 +3640,7 @@ class LocalDatabase:
             row = self.conn.execute("""
                 SELECT COALESCE(SUM(fine_amount), 0)
                 FROM circulation_logs
-                WHERE user_id = ?
+                WHERE user_id = ? COLLATE NOCASE
                   AND fine_amount > 0
                   AND COALESCE(fine_settled, 0) = 0
                   AND UPPER(COALESCE(status, '')) != 'PAID'
@@ -3663,7 +3723,7 @@ class LocalDatabase:
                 rows = self.conn.execute("""
                     SELECT id, book_id, user_id, COALESCE(fine_amount, 0)
                     FROM circulation_logs
-                    WHERE user_id = ?
+                    WHERE user_id = ? COLLATE NOCASE
                       AND fine_amount > 0
                       AND COALESCE(fine_settled, 0) = 0
                       AND UPPER(COALESCE(status, '')) != 'PAID'
@@ -3862,8 +3922,8 @@ class LocalDatabase:
                        COALESCE(c.fine_settled_at, ''),
                        COALESCE(c.fine_settlement_note, '')
                 FROM circulation_logs c
-                LEFT JOIN books b ON b.id = c.book_id
-                LEFT JOIN users u ON u.id = c.user_id
+                LEFT JOIN books b ON b.id = c.book_id COLLATE NOCASE
+                LEFT JOIN users u ON u.id = c.user_id COLLATE NOCASE
                 WHERE c.id = ?
             """, (lid,)).fetchone()
             if not row:
@@ -4034,7 +4094,7 @@ class LocalDatabase:
                     raise ValueError("Each book import row must contain 7 or 8 values.")
                 bid, title, author, publisher, total, available, created = row[:7]
                 isbn = row[7] if len(row) == 8 else None
-                bid, title = self._clean(bid), self._clean(title)
+                bid, title = self._normalize_identifier(bid), self._clean(title)
                 total, available = int(total), int(available)
                 if not bid or not title or total < 0 or available < 0 or available > total:
                     raise ValueError(f"Invalid book import data for ID '{bid}'.")
@@ -4054,21 +4114,33 @@ class LocalDatabase:
                                    total, available, created or datetime.date.today().isoformat(),
                                    normalized_isbn))
             with self._transaction(immediate=True):
-                self.conn.executemany("""
-                    INSERT INTO books(
-                        id, title, author, publisher, total_copies,
-                        available_copies, created_at, isbn
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        title = excluded.title,
-                        author = excluded.author,
-                        publisher = excluded.publisher,
-                        total_copies = books.total_copies + excluded.total_copies,
-                        available_copies =
-                            books.available_copies + excluded.available_copies,
-                        isbn = COALESCE(excluded.isbn, books.isbn)
-                """, normalized)
+                for row in normalized:
+                    bid = row[0]
+                    existing = self.conn.execute(
+                        "SELECT id FROM books WHERE id = ? COLLATE NOCASE", (bid,)
+                    ).fetchall()
+                    if len(existing) > 1:
+                        raise ValueError(
+                            f"Multiple existing books differ only by ID letter case: '{bid}'."
+                        )
+                    if existing:
+                        self.conn.execute("""
+                            UPDATE books SET
+                                title = ?, author = ?, publisher = ?,
+                                total_copies = total_copies + ?,
+                                available_copies = available_copies + ?,
+                                isbn = COALESCE(?, isbn)
+                            WHERE id = ? COLLATE NOCASE
+                        """, (
+                            row[1], row[2], row[3], row[4], row[5], row[7], existing[0][0]
+                        ))
+                    else:
+                        self.conn.execute("""
+                            INSERT INTO books(
+                                id, title, author, publisher, total_copies,
+                                available_copies, created_at, isbn
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, row)
             if hasattr(self, "cloud_backup_scheduler") and self.cloud_backup_scheduler:
                 try:
                     self.cloud_backup_scheduler.schedule_debounced_backup(reason="bulk_books_import")
@@ -4113,30 +4185,35 @@ class LocalDatabase:
                                    department, self._clean(email).casefold() or None,
                                    created or datetime.date.today().isoformat()))
             with self._transaction(immediate=True):
-                new_user_ids = {
-                    row[0]
-                    for row in normalized
-                    if not self.conn.execute(
-                        "SELECT 1 FROM users WHERE id = ?",
-                        (row[0],),
-                    ).fetchone()
-                }
-                self.conn.executemany("""
-                    INSERT INTO users(
-                        id, full_name, phone_number, role, department,
-                        email, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        full_name = excluded.full_name,
-                        phone_number = excluded.phone_number,
-                        role = excluded.role,
-                        department = excluded.department,
-                        email = COALESCE(excluded.email, users.email)
-                """, normalized)
+                new_user_ids = set()
+                for row in normalized:
+                    uid = row[0]
+                    existing = self.conn.execute(
+                        "SELECT id FROM users WHERE id = ? COLLATE NOCASE", (uid,)
+                    ).fetchall()
+                    if len(existing) > 1:
+                        raise ValueError(
+                            f"Multiple existing users differ only by ID letter case: '{uid}'."
+                        )
+                    if existing:
+                        self.conn.execute("""
+                            UPDATE users SET
+                                full_name = ?, phone_number = ?, role = ?,
+                                department = ?, email = COALESCE(?, email)
+                            WHERE id = ? COLLATE NOCASE
+                        """, (*row[1:6], existing[0][0]))
+                    else:
+                        self.conn.execute("""
+                            INSERT INTO users(
+                                id, full_name, phone_number, role, department,
+                                email, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, row)
+                        new_user_ids.add(uid)
                 for user_id in new_user_ids:
                     user = self.conn.execute("""
-                        SELECT full_name, email FROM users WHERE id = ?
+                        SELECT full_name, email FROM users
+                        WHERE id = ? COLLATE NOCASE
                     """, (user_id,)).fetchone()
                     if user:
                         self._queue_registration_email_in_transaction(

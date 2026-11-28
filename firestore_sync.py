@@ -785,6 +785,7 @@ def sync_books(
     refresh_token=None,
     service_account_path=None,
     send_verification_email=True,
+    force_full_scan=False,
     client=None,
     on_refresh_token=None,
 ):
@@ -841,7 +842,7 @@ def sync_books(
         ).fetchone()
         cursor = cursor_row["value"] if cursor_row else None
         last_full_scan = _parse_time(last_full_row["value"]) if last_full_row else None
-        full_scan = not cursor or not last_full_scan or (
+        full_scan = force_full_scan or not cursor or not last_full_scan or (
             _utc_now() - last_full_scan
         ).total_seconds() >= 86400
 
@@ -877,16 +878,8 @@ def sync_books(
             local_changed = state is None or local_hash != state["local_hash"]
 
             if remote_document is None and state is not None:
-                if local_changed:
-                    remote_document = {
-                        "id": book_id,
-                        "fields": {
-                            "updatedAt": state["remote_updated_at"],
-                        },
-                        "updateTime": state["remote_update_time"],
-                        "name": "",
-                    }
-                    to_push.append((local_book, remote_document))
+                if local_changed or full_scan:
+                    to_push.append((local_book, None))
                 continue
 
             if remote_document is None:

@@ -392,6 +392,42 @@ class FirestoreBookSyncTests(unittest.TestCase):
         self.assertEqual(unchanged["downloaded_books"], 0)
         self.assertEqual(client.write_count, 1)
 
+    def test_forced_full_scan_restores_local_book_missing_from_firestore(self):
+        self.database.insert_book(
+            "BK-RECOVER",
+            "Recovery Test Book",
+            "Author",
+            "Publisher",
+            1,
+            1,
+        )
+        client = FakeFirestoreClient()
+
+        initial = sync_books(
+            self.database_path,
+            "librarian@example.com",
+            password="test-password",
+            client=client,
+        )
+        self.assertEqual(initial["uploaded_books"], 1)
+        self.assertIn("BK-RECOVER", client.documents)
+
+        del client.documents["BK-RECOVER"]
+        client.incremental_documents = {}
+
+        repaired = sync_books(
+            self.database_path,
+            "librarian@example.com",
+            password="test-password",
+            client=client,
+            force_full_scan=True,
+        )
+
+        self.assertTrue(repaired["success"])
+        self.assertEqual(repaired["firestore_book_count"], 1)
+        self.assertEqual(repaired["uploaded_books"], 1)
+        self.assertIn("BK-RECOVER", client.documents)
+
     def test_refresh_token_is_used_for_an_existing_sync_session(self):
         self.database.insert_book(
             "BK-REFRESH",

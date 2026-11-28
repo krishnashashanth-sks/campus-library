@@ -254,13 +254,15 @@ class _BackupWorkerSignals(QObject):
 
 
 class _BackupWorker(QRunnable):
-    def __init__(self, db, target_folder, reason="scheduled", finished_event=None):
+    def __init__(
+        self, db, target_folder, reason="scheduled", finished_event=None, parent=None
+    ):
         super().__init__()
         self.db = db
         self.target_folder = target_folder
         self.reason = reason
         self.finished_event = finished_event
-        self.signals = _BackupWorkerSignals()
+        self.signals = _BackupWorkerSignals(parent)
 
     @pyqtSlot()
     def run(self):
@@ -279,11 +281,12 @@ class _CloudSyncWorkerSignals(QObject):
 
 
 class _CloudSyncWorker(QRunnable):
-    def __init__(self, database_path, email):
+    def __init__(self, database_path, email, force_full_scan=False, parent=None):
         super().__init__()
         self.database_path = database_path
         self.email = email
-        self.signals = _CloudSyncWorkerSignals()
+        self.force_full_scan = force_full_scan
+        self.signals = _CloudSyncWorkerSignals(parent)
 
     @pyqtSlot()
     def run(self):
@@ -333,6 +336,7 @@ class _CloudSyncWorker(QRunnable):
                 send_verification_email=not _verification_email_was_sent_recently(
                     status_path, self.email
                 ),
+                force_full_scan=self.force_full_scan,
                 on_refresh_token=save_refresh_token,
             )
             result["status"] = "synced"
@@ -443,6 +447,8 @@ class CloudBackupScheduler(QObject):
         self._is_syncing = False
         self._sync_blocked = False
         self._stopping = False
+        self._active_backup_worker = None
+        self._active_sync_worker = None
         self._backup_finished_event = threading.Event()
         self._backup_finished_event.set()
 
@@ -538,12 +544,15 @@ class CloudBackupScheduler(QObject):
             folder,
             reason=reason,
             finished_event=self._backup_finished_event,
+            parent=self,
         )
+        self._active_backup_worker = worker
         worker.signals.finished.connect(self._on_worker_finished)
         self.thread_pool.start(worker)
 
     def _on_worker_finished(self, success, message, meta):
         self._is_exporting = False
+        self._active_backup_worker = None
         if success:
             today_str = datetime.date.today().isoformat()
             write_sync_status(
@@ -604,12 +613,16 @@ class CloudBackupScheduler(QObject):
         worker = _CloudSyncWorker(
             database_path,
             self.db.get_setting("firebase_sync_email", ""),
+            force_full_scan=force,
+            parent=self,
         )
+        self._active_sync_worker = worker
         worker.signals.finished.connect(self._on_sync_worker_finished)
         self.thread_pool.start(worker)
 
     def _on_sync_worker_finished(self, success, message, meta):
         self._is_syncing = False
+        self._active_sync_worker = None
         if meta.get("status") == "verification_required":
             self._sync_blocked = True
         elif success:

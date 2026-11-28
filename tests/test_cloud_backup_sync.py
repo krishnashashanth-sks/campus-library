@@ -133,6 +133,30 @@ class TestSQLiteHardeningAndSync(unittest.TestCase):
         new_version = new_stamp[1]
         self.assertNotEqual(initial_version, new_version)
 
+    def test_cloud_sync_worker_is_retained_until_completion(self):
+        class HoldingThreadPool:
+            worker = None
+
+            def start(self, worker):
+                self.worker = worker
+
+        scheduler = CloudBackupScheduler(self.db)
+        scheduler.thread_pool = HoldingThreadPool()
+        scheduler.trigger_async_sync(force=True)
+
+        worker = scheduler.thread_pool.worker
+        self.assertIs(scheduler._active_sync_worker, worker)
+        self.assertIs(worker.signals.parent(), scheduler)
+        self.assertTrue(worker.force_full_scan)
+
+        worker.signals.finished.emit(True, "Sync complete", {"status": "synced"})
+        self.assertIsNone(scheduler._active_sync_worker)
+        self.assertFalse(scheduler._is_syncing)
+
+        scheduler._stopping = True
+        scheduler.poll_timer.stop()
+        scheduler.debounce_timer.stop()
+
 
 class TestAtomicCLBKBackup(unittest.TestCase):
     def setUp(self):

@@ -2894,8 +2894,8 @@ class ViewBooksDialog(QDialog):
                        COALESCE(c.fine_settled, 0),
                        COALESCE(c.fine_settlement_action, '')
                 FROM circulation_logs c
-                JOIN books b ON c.book_id = b.id
-                WHERE c.user_id = ?
+                JOIN books b ON c.book_id = b.id COLLATE NOCASE
+                WHERE c.user_id = ? COLLATE NOCASE
                 ORDER BY c.id DESC
             """, (str(self.user_id).strip(),)).fetchall()
             self._max_renewals = self.db.get_max_renewals()
@@ -5329,7 +5329,7 @@ class BookHistoryDialog(QDialog):
                     COALESCE(fine_settled, 0),
                     COALESCE(fine_settlement_action, '')
                 FROM circulation_logs
-                WHERE book_id = ?
+                WHERE book_id = ? COLLATE NOCASE
                 ORDER BY id DESC
                 """,
                 (self.book_id,)
@@ -6448,7 +6448,8 @@ class IssueBookDialog(QDialog):
         c = get_dialog_colors(self)
         try:
             row = self.db.conn.execute(
-                "SELECT title, available_copies, total_copies FROM books WHERE id = ?", (bid,)
+                "SELECT title, available_copies, total_copies "
+                "FROM books WHERE id = ? COLLATE NOCASE", (bid,)
             ).fetchone()
             if not row:
                 self.lbl_book_hint.setText("⚠️ Book ID not found in library inventory.")
@@ -6625,7 +6626,8 @@ class IssueBookDialog(QDialog):
         # Pre-validate book availability
         try:
             book = self.db.conn.execute(
-                "SELECT available_copies, title FROM books WHERE id = ?", (bid,)
+                "SELECT available_copies, title FROM books "
+                "WHERE id = ? COLLATE NOCASE", (bid,)
             ).fetchone()
             if not book:
                 show_warning(
@@ -6645,7 +6647,9 @@ class IssueBookDialog(QDialog):
 
             duplicate = self.db.conn.execute("""
                 SELECT 1 FROM circulation_logs
-                WHERE book_id = ? AND user_id = ? AND status = 'ISSUED' LIMIT 1
+                WHERE book_id = ? COLLATE NOCASE
+                  AND user_id = ? COLLATE NOCASE
+                  AND status = 'ISSUED' LIMIT 1
             """, (bid, uid)).fetchone()
             if duplicate:
                 show_warning(

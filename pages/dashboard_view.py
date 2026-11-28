@@ -3906,10 +3906,10 @@ class DashboardView(QWidget):
             raise RuntimeError("The search data could not be loaded.")
 
         book_map = {
-            str(row[0]): row for row in books if len(row) >= 2
+            str(row[0]).casefold(): row for row in books if len(row) >= 2
         }
         user_map = {
-            str(row[0]): row for row in users if len(row) >= 2
+            str(row[0]).casefold(): row for row in users if len(row) >= 2
         }
         results = []
         category_counts = {
@@ -3960,8 +3960,8 @@ class DashboardView(QWidget):
             if len(log) < 8:
                 continue
             log_id, book_id, user_id, issue_date, due_date, returned, _fine, status = log
-            book = book_map.get(str(book_id), ())
-            user = user_map.get(str(user_id), ())
+            book = book_map.get(str(book_id).casefold(), ())
+            user = user_map.get(str(user_id).casefold(), ())
             values = [
                 safe_text(value) for value in log
             ] + [

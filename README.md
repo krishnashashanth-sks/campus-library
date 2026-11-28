@@ -55,6 +55,15 @@ A comprehensive desktop application for managing library operations, including b
 - **Barcode Processing**: python-barcode, Pillow, cv2
 - **Scanning**: OpenCV (cv2)
 
+## Cloud Data Synchronization
+
+The desktop application stores its operational data in a local SQLite database. Its
+Firestore sync currently reconciles the **book catalog only**; desktop member records
+and issue/return transactions are not uploaded to Firestore. The website reads its
+own Firestore collections in real time, so desktop circulation or member changes
+will not appear there. A shared backend/API or explicit synchronization for those
+records is required before both applications can show identical live data.
+
 ## Project Structure
 
 ```
